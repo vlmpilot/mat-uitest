@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  公告页的**正确版式**（v09-defect-free 用）。
+
+  带缺陷版根本不加载这个布局（它 `setContentView(new FrameLayout(this))` 渲染空白）。
+  ⇒ 配对臂上这一页**有内容**、截图不可能是"灰度极差 < 6" ⇒ `white-screen` 不该出现。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:id="@+id/announce_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/announce_title"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/announce_body"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:lineSpacingMultiplier="1.4"
+        android:text="@string/announce_body"
+        android:textSize="16sp" />
+</LinearLayout>

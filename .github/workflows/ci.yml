@@ -1,0 +1,38 @@
+name: ci
+on:
+  push:
+    # 长驻特性分支（如 iOS）的提交也要进 CI —— 否则「测试全绿」永远只是本地结论（评审 I6）
+    branches: [main, "feature/**"]
+  pull_request:
+
+# ⚠️ 本文件会**整份对外公开**（发布时按文件放行，不按段落挑），所以里面只能出现
+# 公开侧的东西。闭源侧的服务端目录**不在公开仓里**（边界见 CONTRIBUTING「开放核心边界」），
+# 任何引用它的命令在这里都会**直接失败** ⇒ CI 恒红 —— 而 README 第 3 行正挂着这里的
+# CI 徽章，红徽章比没有徽章更糟。因此服务端侧的门禁拆到了另一份 workflow，那一份不对外公开。
+# 为什么不是"把引用删掉了事"：本地门禁漏掉闭源侧会造出「本地全绿、CI 红」的假绿
+# —— 私有仓的覆盖不该用删来换。
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 声明 requires-python>=3.11 就必须在 3.11 上验证（评审 F4）
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.16.9 pytest
+          # ios extra：装上 facebook-wda，让 test_wda_contract.py 真正生效而非 skip（评审 F5）
+          pip install -e './engine[mcp,ios]'
+      - name: Lint
+        run: ruff check engine scripts
+      - name: Test
+        # 不在这里设覆盖率门禁：原来的 65% 是**两个包合并**的口径，只算本仓这一个包
+        # 会变成另一条（更严或更松）的线。合并门禁原样留在闭源侧那份 workflow。
+        run: pytest engine/tests -q

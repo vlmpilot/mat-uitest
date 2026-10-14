@@ -1,0 +1,95 @@
+{
+  "name": "spike-5",
+  "pass_threshold": 0.8,
+  "comment": "t0 任意 Android 真机可跑；t1~t4 依赖 examples/demo-app 靶场（包名 com.insta.demo）。跑分: python scripts/spike_check.py",
+  "reset_package": "com.insta.demo",
+  "reset_reason": "每个 task 执行前必须先 `adb shell pm clear com.insta.demo`。原因：t1~t4 的**前置状态不同**——t2/t3 要求已登录、t4 要求未登录。若按序跑而不重置，t3 结束时 App 停在列表页，t4 就会在 `username` 上定位失败（**看起来像引擎问题，实际是用例前置没满足**）。用例本身只描述目标流程，前置由重置保证。t0 不依赖本应用，无需重置。",
+  "tasks": [
+    {
+      "id": "t0-launch-settings",
+      "nl": "打开系统设置，回到桌面后再次进入设置",
+      "case": {
+        "caseId": "case_t0",
+        "name": "冒烟：设置冷启动",
+        "target": { "package": "com.android.settings" },
+        "steps": [
+          { "id": "s1", "intent": "启动设置", "action": "launch", "params": { "package": "com.android.settings" } },
+          { "id": "s2", "intent": "回到桌面", "action": "home" },
+          { "id": "s3", "intent": "再次启动设置", "action": "launch", "params": { "package": "com.android.settings" } }
+        ]
+      }
+    },
+    {
+      "id": "t1-demo-login",
+      "nl": "输入账号 alice 和密码 pass1234，点击登录，验证欢迎文案包含账号名",
+      "case": {
+        "caseId": "case_t1",
+        "name": "demo 登录主流程",
+        "target": { "package": "com.insta.demo" },
+        "vars": { "账号": "alice", "密码": "pass1234" },
+        "steps": [
+          { "id": "s1", "intent": "启动 demo 应用", "action": "launch", "params": { "package": "com.insta.demo" } },
+          { "id": "s2", "intent": "输入账号", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/username" }, "params": { "text": "${账号}" } },
+          { "id": "s3", "intent": "输入密码", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/password" }, "params": { "text": "${密码}" } },
+          { "id": "s4", "intent": "点击登录", "action": "tap", "target": { "strategy": "res-id", "value": "com.insta.demo:id/login_btn" } },
+          { "id": "s5", "intent": "校验欢迎文案含账号名", "action": "wait", "params": { "ms": 800 }, "assertions": [ { "type": "text-contains", "target": { "strategy": "res-id", "value": "com.insta.demo:id/welcome_text" }, "expected": "alice" } ] }
+        ]
+      }
+    },
+    {
+      "id": "t2-demo-search",
+      "nl": "先登录（账号 alice、密码 pass1234），然后在搜索框输入蓝牙，验证列表出现蓝牙耳机条目",
+      "case": {
+        "caseId": "case_t2",
+        "name": "demo 搜索过滤",
+        "target": { "package": "com.insta.demo" },
+        "vars": { "账号": "alice", "密码": "pass1234" },
+        "steps": [
+          { "id": "s1", "intent": "启动 demo 应用", "action": "launch", "params": { "package": "com.insta.demo" } },
+          { "id": "s2", "intent": "输入账号（前置）", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/username" }, "params": { "text": "${账号}" } },
+          { "id": "s3", "intent": "输入密码（前置）", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/password" }, "params": { "text": "${密码}" } },
+          { "id": "s4", "intent": "点击登录（前置）", "action": "tap", "target": { "strategy": "res-id", "value": "com.insta.demo:id/login_btn" } },
+          { "id": "s5", "intent": "点搜索框", "action": "tap", "target": { "strategy": "res-id", "value": "com.insta.demo:id/search_box" } },
+          { "id": "s6", "intent": "输入关键词", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/search_box" }, "params": { "text": "蓝牙" } },
+          { "id": "s7", "intent": "校验过滤结果", "action": "wait", "params": { "ms": 800 }, "assertions": [ { "type": "text-contains", "target": { "strategy": "res-id", "value": "com.insta.demo:id/item_text" }, "expected": "蓝牙耳机" } ] }
+        ]
+      }
+    },
+    {
+      "id": "t3-demo-detail",
+      "nl": "先登录（账号 alice、密码 pass1234），从列表进入第一条详情，校验详情页标题存在",
+      "case": {
+        "caseId": "case_t3",
+        "name": "demo 列表到详情",
+        "target": { "package": "com.insta.demo" },
+        "vars": { "账号": "alice", "密码": "pass1234" },
+        "steps": [
+          { "id": "s1", "intent": "启动 demo 应用", "action": "launch", "params": { "package": "com.insta.demo" } },
+          { "id": "s2", "intent": "输入账号（前置）", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/username" }, "params": { "text": "${账号}" } },
+          { "id": "s3", "intent": "输入密码（前置）", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/password" }, "params": { "text": "${密码}" } },
+          { "id": "s4", "intent": "点击登录（前置）", "action": "tap", "target": { "strategy": "res-id", "value": "com.insta.demo:id/login_btn" } },
+          { "id": "s5", "intent": "点击列表第一项", "action": "tap", "target": { "strategy": "res-id", "value": "com.insta.demo:id/item_text" } },
+          { "id": "s6", "intent": "校验详情标题存在", "action": "wait", "params": { "ms": 800 }, "assertions": [ { "type": "exists", "target": { "strategy": "res-id", "value": "com.insta.demo:id/detail_title" } } ] },
+          { "id": "s7", "intent": "返回列表", "action": "back" }
+        ]
+      }
+    },
+    {
+      "id": "t4-demo-login-error",
+      "nl": "输入错误密码登录，验证出现错误提示且未进入欢迎页",
+      "case": {
+        "caseId": "case_t4",
+        "name": "demo 登录异常分支",
+        "target": { "package": "com.insta.demo" },
+        "steps": [
+          { "id": "s1", "intent": "启动 demo 应用", "action": "launch", "params": { "package": "com.insta.demo" } },
+          { "id": "s2", "intent": "输入账号", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/username" }, "params": { "text": "alice" } },
+          { "id": "s3", "intent": "输入错误密码", "action": "input", "target": { "strategy": "res-id", "value": "com.insta.demo:id/password" }, "params": { "text": "wrong-pass" } },
+          { "id": "s4", "intent": "点击登录", "action": "tap", "target": { "strategy": "res-id", "value": "com.insta.demo:id/login_btn" } },
+          { "id": "s5", "intent": "校验错误提示出现", "action": "wait", "params": { "ms": 800 }, "assertions": [ { "type": "exists", "target": { "strategy": "res-id", "value": "com.insta.demo:id/error_text" } } ] },
+          { "id": "s6", "intent": "校验未进入欢迎页", "action": "wait", "params": { "ms": 500 }, "assertions": [ { "type": "not-exists", "target": { "strategy": "res-id", "value": "com.insta.demo:id/welcome_text" } } ] }
+        ]
+      }
+    }
+  ]
+}

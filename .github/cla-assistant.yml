@@ -1,0 +1,24 @@
+name: CLA Assistant
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, reopened, assigned]
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CLA Assistant
+        uses: cla-assistant/github-action@v2.1.2-beta
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 仅当签名文件存放在**另一个**仓库时才需要；本仓库内存储时留空即可
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        with:
+          # 仓库路径与 README / 官网口径一致（vlmpilot/mat）；换仓库时三处要一起改
+          path-to-document: 'https://github.com/vlmpilot/mat/blob/main/CLA.md'
+          # 值为仓库内相对路径（签名文件由该 action 自动创建）
+          path-to-signatures: 'signatures/version1/cla.json'
+          branch: 'main'
+          allowlist: 'bot*,dependabot[bot]'

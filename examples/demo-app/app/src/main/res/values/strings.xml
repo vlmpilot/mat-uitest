@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">InstaDemo</string>
+    <string name="hint_username">账号</string>
+    <string name="hint_password">密码</string>
+    <string name="login">登录</string>
+    <string name="login_error">账号或密码错误</string>
+    <string name="welcome">欢迎，%1$s</string>
+    <string name="hint_search">搜索</string>
+    <string name="empty_hint">没有找到相关结果</string>
+    <string name="ctx_delete">删除</string>
+    <string name="item_count">共 %1$d 项</string>
+    <string name="export_report">导出报表</string>
+    <string name="export_result">已导出 %1$d 条记录</string>
+    <string name="announce">查看公告</string>
+    <string name="announce_title">公告</string>
+    <string name="announce_body">本应用为自动化测试靶场，用于验证 UI 测试工具的定位、断言与异常发现能力。版本 1.0。</string>
+</resources>

@@ -1,0 +1,49 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.tmp_pytest*/
+artifacts/
+.insta/
+
+# 人工复核结论（mat review 写入）。默认不入库：它记的是**你这台机器上被测 App 的页面标识**，
+# 属于本机数据。要留档（团队共享/换机恢复）就把这一行去掉。
+review/
+
+# 报告校准规则（mat calibrate 写入）。同上：规则里带着**被测 App 的错误串与日志标记**。
+calibration/
+
+# 靶场变体工作目录（make_variants.py 产出：变体源码树 / 产物 / 样本报告）
+.variants/
+*.log
+.DS_Store
+
+# 构建产物（python -m build / pip install -e 生成，不入库）
+build/
+dist/
+*.egg-info/
+
+# Android 构建产物与本地配置（gradle wrapper 本身入库，wrapper 的缓存与 sdk.dir 不入库）
+.gradle/
+local.properties
+
+# AI prompt 属闭源资产，任意层级不入库（见 README 的 open-core 边界）
+*.prompt
+.env
+deploy.env
+
+# 本地运行产物（SQLite 单文件 + WAL）
+*.db
+*.db-wal
+*.db-shm
+
+# 前端（console/ 后续启用）
+node_modules/
+console/node_modules/
+console/dist/
+engine/insta_engine/console_dist/
+.coverage
+htmlcov/
+coverage.xml

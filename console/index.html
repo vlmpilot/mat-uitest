@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/assets/mark.svg" />
+    <title>MAT 控制台</title>
+    <style>
+      /* 应用自管滚动（Layout.Content overflowY:auto），body 必须禁滚：
+         无此 reset 时 body 默认 8px margin，document 比视口高——内容区滚到底再上滑
+         会链到 body 整体上移，app 下方露出 html 白底（发起人 2026-10-12 底部白区真根因） */
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      /* 侧栏菜单独立滚动的缺环（发起人 2026-10-12 二次反馈）：antd 的
+         .ant-layout-sider-children 是 Sider(flex column) 的唯一子项，自带 height:100%
+         但 min-height:auto——被菜单内容撑出视口，内部 flex:1+overflowY:auto 的菜单区
+         永不触发。flex 容器必须落到这一层，仅内层 div 加 minHeight:0 无效 */
+      .ant-layout-sider-children { display: flex; flex-direction: column; min-height: 0; }
+      /* 表头短词禁折行（发起人 2026-10-13 反馈报告列表换行）：
+         排序图标与标题同行时 th 默认 white-space:normal，极窄容器下标题会折成两行 */
+      .ant-table-thead > tr > th .ant-table-column-title { white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

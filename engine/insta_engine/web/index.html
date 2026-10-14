@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- 演示壳（spike）：正式配置台见 console/；本页仅当 console_dist 缺失时兜底 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MAT · 控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">M</span><b>MAT</b> <span style="color:var(--muted);font-weight:400">Mobile AI Testing</span> <span class="ver" id="ver"></span></div>
+  <nav id="nav">
+    <a href="#home" data-tab="home" onclick="app.nav('home');return false;">工作台</a>
+    <a href="#devices" data-tab="devices" onclick="app.nav('devices');return false;">设备</a>
+    <a href="#targets" data-tab="targets" onclick="app.nav('targets');return false;">测试目标</a>
+    <a href="#cases" data-tab="cases" onclick="app.nav('cases');return false;">用例</a>
+    <a href="#explore" data-tab="explore" onclick="app.nav('explore');return false;">探索测试</a>
+    <a href="#runs" data-tab="runs" onclick="app.nav('runs');return false;">执行</a>
+    <a href="#reports" data-tab="reports" onclick="app.nav('reports');return false;">报告</a>
+    <a href="#settings" data-tab="settings" onclick="app.nav('settings');return false;">设置</a>
+  </nav>
+  <div id="quota" class="quota-wrap"></div>
+</header>
+<main id="app"><div class="skeleton"></div><div class="skeleton"></div></main>
+<div id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

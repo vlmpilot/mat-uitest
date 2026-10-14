@@ -1,0 +1,74 @@
+name: "MAT UI Test"
+description: "运行 MAT 移动端 UI 自动化测试（需 self-hosted runner + 已连接的 Android 设备）"
+inputs:
+  package:
+    description: "被测 App 包名（批量执行 cases/ 下该应用全部用例）"
+    required: true
+  cases-dir:
+    description: "用例目录（相对仓库根）"
+    required: false
+    default: "cases"
+  serial:
+    description: "设备 serial（多设备时指定；缺省取唯一在线设备）"
+    required: false
+  junit-xml:
+    description: "JUnit XML 输出路径"
+    required: false
+    default: "artifacts/mat-junit.xml"
+  artifact-name:
+    description: "报告 artifact 名称"
+    required: false
+    default: "mat-report"
+outputs:
+  junit-xml:
+    description: "JUnit XML 路径"
+    value: ${{ steps.run.outputs.junit }}
+  report-dir:
+    description: "报告产物目录（含自包含 HTML 报告）"
+    value: ${{ steps.run.outputs.report }}
+  passed:
+    description: "通过的用例数"
+    value: ${{ steps.summary.outputs.passed }}
+  total:
+    description: "用例总数"
+    value: ${{ steps.summary.outputs.total }}
+  summary:
+    description: "PR 评论 Markdown 文件"
+    value: ${{ steps.summary.outputs.summary }}
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: 安装 MAT
+      run: pip install mat-uitest
+      shell: bash
+    - name: 环境自检（adb / 设备 / 驱动）
+      run: mat doctor
+      shell: bash
+    - name: 运行用例
+      id: run
+      run: |
+        mat run "${{ inputs.cases-dir }}" --app "${{ inputs.package }}" \
+          ${serial:+--serial "$serial"} \
+          --artifacts "artifacts/run" --junit-xml "${{ inputs.junit-xml }}" --json
+      shell: bash
+      env:
+        serial: ${{ inputs.serial }}
+    - name: 摘要（JSON + Markdown）
+      id: summary
+      run: |
+        python -m insta_engine.junit_summary "${{ inputs.junit-xml }}" > summary.json
+        python -m insta_engine.junit_summary "${{ inputs.junit-xml }}" --markdown > pr-summary.md
+        echo "junit=${{ inputs.junit-xml }}" >> "$GITHUB_OUTPUT"
+        echo "report=artifacts/run" >> "$GITHUB_OUTPUT"
+        echo "summary=pr-summary.md" >> "$GITHUB_OUTPUT"
+        echo "passed=$(python -c "import json;print(json.load(open('summary.json'))['passed'])")" >> "$GITHUB_OUTPUT"
+        echo "total=$(python -c "import json;print(json.load(open('summary.json'))['total'])")" >> "$GITHUB_OUTPUT"
+      shell: bash
+    - name: 上传报告
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: artifacts/run/

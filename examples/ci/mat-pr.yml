@@ -1,0 +1,48 @@
+# MAT UI 测试接入 PR 门禁（示例）——放在你仓库的 .github/workflows/ 下
+# 前置：一台插着 Android 测试机的 self-hosted runner（labels: [self-hosted, android]）
+name: MAT UI Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # PR 评论需要
+
+jobs:
+  ui-test:
+    runs-on: [self-hosted, android]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: vlmpilot/mat-uitest@main
+        id: mat
+        with:
+          package: com.example.shop     # 你的被测 App 包名
+          cases-dir: cases              # 你的用例目录（MAT DSL JSON）
+          artifact-name: mat-report-${{ github.event.pull_request.number }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mat-report
+          path: artifacts/run/
+
+      - name: PR 评论（测试结果 + 报告链接）
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('pr-summary.md', 'utf8');
+            const body = summary + '\n\n📄 报告 artifact：' +
+              '${{ steps.mat.outputs.artifact-name }}（在本次 run 的 Artifacts 区下载）';
+            if (context.issue.number) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: context.issue.number, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: context.payload.pull_request.number, body,
+              });
+            }

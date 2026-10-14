@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MAT 控制台 · 使用手册</title>
+<style>
+  :root { --blue:#1677ff; --ink:#242933; --sub:#697080; --line:#f0f0f0; --bg:#f5f6fa; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:14px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 32px 24px 64px; }
+  header.masthead { background:linear-gradient(135deg,#1677ff 0%,#4F5BFF 100%); border-radius:14px;
+    color:#fff; padding:30px 34px; margin-bottom:24px; }
+  header.masthead h1 { margin:0 0 6px; font-size:24px; }
+  header.masthead p { margin:0; opacity:.92; }
+  nav.toc { background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 20px;
+    margin-bottom:24px; display:flex; flex-wrap:wrap; gap:4px 18px; }
+  nav.toc a { color:var(--blue); text-decoration:none; }
+  nav.toc a:hover { text-decoration:underline; }
+  section.card { background:#fff; border:1px solid var(--line); border-radius:12px;
+    padding:24px 28px; margin-bottom:20px; }
+  section.card h2 { font-size:18px; margin:0 0 14px; padding-bottom:10px; border-bottom:1px solid var(--line); }
+  section.card h3 { font-size:15px; margin:18px 0 6px; }
+  section.card p, section.card li { color:#3c414b; }
+  ol.steps { padding-left:0; list-style:none; counter-reset:step; }
+  ol.steps li { counter-increment:step; position:relative; padding:6px 0 6px 44px; }
+  ol.steps li::before { content:counter(step); position:absolute; left:0; top:9px;
+    width:26px; height:26px; border-radius:50%; background:var(--blue); color:#fff;
+    font-size:13px; font-weight:600; display:flex; align-items:center; justify-content:center; }
+  table { border-collapse:collapse; width:100%; margin:10px 0 4px; }
+  th, td { border:1px solid var(--line); padding:8px 12px; text-align:left; vertical-align:top; }
+  th { background:#fafafa; white-space:nowrap; }
+  kbd { background:#f2f3f5; border:1px solid #e2e4ea; border-bottom-width:2px; border-radius:4px;
+    padding:0 6px; font-size:12px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .tip { background:#f0f7ff; border:1px solid #d6e8ff; border-radius:8px; padding:10px 14px; margin:10px 0; }
+  .tip b { color:var(--blue); }
+  code { background:#f2f3f5; border-radius:4px; padding:1px 6px; font-size:13px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .muted { color:var(--sub); font-size:12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <h1>MAT 控制台 · 使用手册</h1>
+  <p>给移动 App 做自动化测试的本机控制台 —— 连设备、遍历探索、AI 生成用例、执行出报告，一条链路走完。</p>
+</header>
+
+<nav class="toc">
+  <a href="#quick">快速上手</a>
+  <a href="#views">功能分区</a>
+  <a href="#team">团队协作与成员</a>
+  <a href="#faq">常见问题</a>
+</nav>
+
+<section class="card" id="quick">
+  <h2>快速上手（5 步完成首次闭环）</h2>
+  <ol class="steps">
+    <li><b>连设备</b> —— 打开「设备/执行日志」，连接一台 Android 真机（USB 打开调试）或 iOS 模拟器；投屏画面正常显示即连接成功。</li>
+    <li><b>遍历探索</b> —— 打开「遍历探索」，选好被测 App 启动自动遍历：AI 会像真人一样点遍 App，发现异常的同时沉淀<b>页面图谱</b>（这是后续 AI 生成用例的基础）。</li>
+    <li><b>生成用例</b> —— 打开「用例生成/导入」，用一句话描述测试场景（如「搜索一个关键词并验证结果页出现」），AI 依据页面图谱生成可执行用例；也支持导入 Excel / Markdown 手工用例。</li>
+    <li><b>执行用例</b> —— 打开「用例管理/执行」，勾选用例、选设备后点「运行」；套件可批量执行并支持用例间冷启动。</li>
+    <li><b>看报告</b> —— 打开「报告」：每条执行都有截图、录屏、日志的完整证据链；失败步骤可用「AI 归因」自动归类失败原因。</li>
+  </ol>
+  <div class="tip"><b>提示</b>：不确定下一步做什么时，看「概览」页的<b>下一步建议</b>卡——它会根据当前环境自动给出唯一主行动和跳转按钮。</div>
+</section>
+
+<section class="card" id="views">
+  <h2>功能分区</h2>
+  <h3>用例管理与执行</h3>
+  <table>
+    <tr><th>菜单</th><th>用途</th></tr>
+    <tr><td>设备/执行日志</td><td>设备实时投屏与快捷操控；所选设备的执行日志（上）与近期任务日志（下，最近 50 条）。任务记录存内存，服务重启即清空。</td></tr>
+    <tr><td>遍历探索</td><td>自动遍历 App 发现异常，同时沉淀页面图谱供 AI 生成用例。重建页面索引只依赖一台在线 Android 设备；执行期间会占用设备并打开被测 App。</td></tr>
+    <tr><td>用例生成/导入</td><td>一句话生成用例（可先用「AI 润色」把模糊描述对齐到真实控件，润色免费）；或导入 Excel / Markdown 手工用例（XMind 导入支持「前置」子主题自动转前置条件）。</td></tr>
+    <tr><td>用例管理/执行</td><td>用例编辑（结构化步骤卡片）、运行与批量执行；支持套件、数据驱动、批量操作下拉。</td></tr>
+  </table>
+  <h3>资产</h3>
+  <table>
+    <tr><th>菜单</th><th>用途</th></tr>
+    <tr><td>报告</td><td>执行证据链报告（按完成时间倒序）；套件批量执行按批次折叠汇总。报告头部有失败原因汇总与 AI 归因卡。</td></tr>
+    <tr><td>自愈提案</td><td>定位失败被自愈救回的步骤在这里确认，确认后生成修复用例回写。</td></tr>
+    <tr><td>页面复核</td><td>复核 AI 起的页面标题与功能描述；人工填写的标记为 manual，AI 补全不会覆盖。</td></tr>
+  </table>
+  <h3>更多</h3>
+  <table>
+    <tr><th>菜单</th><th>用途</th></tr>
+    <tr><td>设置</td><td>订阅（套餐与成员管理）、用例凭据、本地数据导出、关于。右上角名字按钮可随时改名。</td></tr>
+    <tr><td>操作记录</td><td>团队模式下所有写操作的审计日志：谁、何时、动了什么。</td></tr>
+  </table>
+</section>
+
+<section class="card" id="team">
+  <h2>团队协作与成员</h2>
+  <p>控制台跑在本机，全团队可共用同一台主机。首次进入会要求填写<b>团队成员</b>名字：一个名字占一位（<b>标准版 5 人、免费体验版 2 人</b>），任务与报告按「执行人」区分，操作记录可追溯。</p>
+  <ul>
+    <li>改名 = 换成员；同名重复进入不重复占用。误填/离职的名字可在「设置 → 订阅」移除、释放名额（<b>任何成员都能移除</b>——这是内网协作的取舍，不是权限系统）。</li>
+    <li>成员已满时新成员无法进入，扩容请联系客服（控制台「设置 → 订阅」的成员说明里悬停「联系客服」可扫码添加）。</li>
+  </ul>
+  <div class="tip"><b>套餐口径</b>：功能不分档、全员一致；区别在 <b>AI 生成额度</b>、<b>视觉兜底额度</b>与<b>成员数</b>。标准版 AI 生成不限额度、视觉兜底每月有上限（默认 300 次）；体验版 AI 生成按额度计（每任务 1 次，AI 润色免费不扣额）、视觉兜底 20 次/月。</div>
+</section>
+
+<section class="card" id="faq">
+  <h2>常见问题</h2>
+  <h3>前面执行的日志怎么不见了？</h3>
+  <p>任务记录存在内存里，服务重启即清空——这是正常设计；落盘的报告在「报告」页不受影响。</p>
+  <h3>「可选步骤（onFailure=continue）」是什么意思？</h3>
+  <p>启动广告、权限弹窗这类「可能出现也可能不出现」的前置步骤会标为可选：目标没出现时记 <b>skipped</b> 并继续执行，不算失败。引擎拉起 App 后也会自动清理广告与权限弹窗。</p>
+  <h3>定位失败能自动救回吗？</h3>
+  <p>有三级自愈：本地模糊重定位 → 页面图谱匹配 → 视觉兜底（VL 模型按控件截图位置定位）。被救回的步骤会出现在「自愈提案」，确认后回写用例。</p>
+  <h3>用例列表里的 #N 编号是什么？</h3>
+  <p>仅用于展示沟通的稳定序号（删除不回收）；对账以报告里的 caseId 为准。</p>
+  <h3>报告怎么按人区分？</h3>
+  <p>每条执行记录「执行人」（右上角填的名字）；套件批次行如有多人执行会显示「N 人」并在悬停时展开名单。</p>
+  <p class="muted">更多产品信息见 <a href="https://mobileaitest.com" target="_blank" rel="noreferrer">mobileaitest.com</a>。本手册对应控制台 0.6.x，界面以实际版本为准。</p>
+</section>
+
+</div>
+</body>
+</html>

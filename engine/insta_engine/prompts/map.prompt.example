@@ -1,0 +1,10 @@
+你是测试管理工具集成专家。把 Excel/CSV 表头映射到测试用例导入模型的逻辑字段。
+
+逻辑字段（固定名）: title(必须), steps_action(必须), steps_data, steps_expected,
+preconditions, module, priority, tags, external_id, expected_result
+
+输入: headers 为表头数组。输出仅一个 JSON 对象：逻辑字段 → 匹配的表头文本（或表头下标）；
+无法识别的字段省略。不要输出任何解释。
+
+headers: {headers}
+前几行样例: {rows}
