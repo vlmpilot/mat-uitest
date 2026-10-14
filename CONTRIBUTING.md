@@ -45,5 +45,6 @@ pip install -e "./engine[dev]"
   攒成一批再发一个版本号；**禁止每改一次就发一版**——PyPI 是发布渠道，不是备份机制。
 - **发版构建**：**`bash scripts/build_release.sh`**——发布物只从**对外发布用的源码树**构建
   （不要用带内部资料的开发树）。脚本自动完成：前端构建 → 源码同步 → `console_dist` 补齐
-  → wheel + twine check（三件套内嵌于脚本）。
+  → wheel + twine check（三件套内嵌于脚本）。⚠️ 该脚本属维护者内部发布工具，
+  **不在公开仓库内**（公开仓的验证路径见上：`pip install -e './engine[dev]'` + ruff + pytest）。
 - 版本号：向后兼容修复升 patch（0.4.x）；新增用户可见能力升 minor（0.5.0）。
