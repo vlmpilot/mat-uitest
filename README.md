@@ -112,10 +112,3 @@ ruff check engine scripts && pytest engine/tests -q    # 全部走 FakeDriver �
 
 AGPL-3.0（[LICENSE](LICENSE)）。贡献请先读 [CONTRIBUTING.md](CONTRIBUTING.md) 并签署 [CLA](CLA.md)。
 
-## 商业授权（Commercial licensing）
-
-默认许可是 AGPL-3.0。下面这些用法在 AGPL 之外，需要一份**书面商业授权**：把 MAT 集成进专有产品对外分发；或把它作为服务提供给第三方，而不愿公开对应源码。
-
-反过来，**自己使用、内部修改、且只在组织内部运行**通常不需要商业授权——AGPL 的网络条款针对的是"向远程用户提供修改后的版本"。
-
-不确定自己的场景属于哪一种，或需要商业授权：在本仓库提交 issue 说明使用场景，或关注公众号「**Mobile AI Test**」、加微信 **lazy_vizen**（备注「商业授权」）。
