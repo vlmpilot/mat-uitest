@@ -63,12 +63,70 @@ def _rule_prior(run: RunResult) -> str:
                       for k, v in run.failed_categories.items()) or "无失败"
 
 
-def build_variables(run: RunResult, artifacts_dir: Path) -> dict:
+def build_variables(run: RunResult, artifacts_dir: Path, case=None,
+                    page_index_dir: Path | None = None) -> dict:
     return {
         "steps_summary": _steps_summary(run),
         "logcat": _failed_logcat(run, artifacts_dir),
         "rule_prior": _rule_prior(run),
+        "graph_evidence": _graph_evidence(run, case, page_index_dir),
     }
+
+
+def _graph_evidence(run: RunResult, case, page_index_dir: Path | None) -> str:
+    """从页面图谱给失败步骤取**存在性证据**（2026-10-15，发起人拍板的增强点①）。
+
+    为什么只做「证据」不做「结论」：`ui-change` 的硬判据是"该 res-id 曾存在、现在找不到"
+    ——图谱里恰好有历史映射，规则层（classify_failure）拿不到、LLM 之前也拿不到。
+    成本近零：**同一次 LLM 调用**，只多注入几十 token（只查失败步骤的 id 定位器）。
+
+    ⚠️ 两个刻意为之的边界：
+    1. **快照时间必须一起注入**：图谱是时点快照，App 改版后图谱过期 ⇒ "res-id 不在图谱里"
+       **不能**单独证明"控件从未存在"。规则里已写明，防止把 ui-change 反向误判成 precondition。
+    2. **任何异常都静默降级**成占位文本——归因的硬约束是"永远有返回"，证据缺失不能让它崩。
+    """
+    if case is None:
+        return "（无用例上下文，未注入页面图谱证据）"
+    package = (case.target or {}).get("package", "")
+    if not package:
+        return "（用例未声明包名，未注入页面图谱证据）"
+    from .dsl import LocatorStrategy
+    from .pkgname import safe_package_name
+
+    try:
+        safe_package_name(package)
+    except ValueError:
+        return "（包名非法，未注入页面图谱证据）"
+    base = page_index_dir or Path.cwd() / "artifacts" / "page_index"
+    index_path = base / f"{package}.json"
+    # 失败步骤里 strategy=id（Android 与 res-id 同义）的定位器；断言 target 一并收
+    failed_ids = {s.step_id for s in run.steps if s.status != "passed"}
+    res_ids: list[str] = []
+    for step in case.steps:
+        if step.id not in failed_ids:
+            continue
+        for loc in (step.target, *(a.target for a in step.assertions)):
+            if loc is None or loc.strategy not in (LocatorStrategy.ID, LocatorStrategy.RES_ID):
+                continue
+            rid = loc.value.strip()
+            if rid and rid not in res_ids:   # 空白定位器按"无 res-id"处理，不进证据
+                res_ids.append(rid)
+    if not res_ids:
+        return "（失败步骤不含 res-id 定位，未注入页面图谱证据）"
+    from .page_index import res_evidence
+
+    ev = res_evidence(index_path, res_ids)
+    if not ev["hits"]:
+        return "（页面图谱不可用——未执行过 mat index/explore，未注入图谱证据）"
+    lines = [f"图谱快照时间: {ev['updated_at'] or '未知'}（时点快照，可能过期——引用前先看时间）"]
+    for rid, hit in ev["hits"].items():
+        if hit["exists"]:
+            labels = "、".join(f"「{t}」" for t in hit["labels"]) or "（图谱里无可见文案记录）"
+            lines.append(f"- res-id `{rid}` 在图谱中**存在**（出现于 {hit['pages']} 页；"
+                         f"历史可见文案: {labels}）")
+        else:
+            lines.append(f"- res-id `{rid}` 未出现在图谱中（可能从未存在、也可能图谱已过期）")
+    return "\n".join(lines)
 
 
 def _parse(content, run: RunResult) -> dict[str, dict] | None:
@@ -131,10 +189,13 @@ def _rule_card(step) -> dict:
             "need_human": True, "source": "rules"}
 
 
-def diagnose_run(run: RunResult, artifacts_dir: Path, client=None) -> dict[str, dict]:
+def diagnose_run(run: RunResult, artifacts_dir: Path, client=None, case=None,
+                 page_index_dir: Path | None = None) -> dict[str, dict]:
     """对 run 的失败步骤做 LLM 归因。返回 {step_id: 归因卡}；**任何失败 → 规则兜底卡**。
 
     client 缺省用 GenClient.from_env()（BYOK/server 双模式自动适配）。
+    case（可选）：run.json 顶层的用例对象——失败步骤的 res-id 定位器从这里取，
+    用于注入页面图谱证据（`graph_evidence`）；不给就缺这张证据，其余照常。
 
     ⚠️ **没有 LLM 时也必须给出结论**（`source="rules"` + `need_human=True`），
     **不能抛异常**——调用方（CLI / console / 失败样本回流）都依赖"这里永远有返回"。
@@ -144,7 +205,9 @@ def diagnose_run(run: RunResult, artifacts_dir: Path, client=None) -> dict[str, 
     ⇒ 没配 LLM 的机器上**归因直接崩**，文档承诺的"规则兜底"根本够不到。
     评测线要在无 LLM 环境下收失败样本时撞上了这个。
     """
-    failed = [s for s in run.steps if s.status != "passed"]
+    # 只归因**真失败**的步骤。`skipped` 是前序失败后未执行的步骤，把它算成失败会
+    # 虚增失败样本与失败率（2026-10-25 真机评测：1 failed + 2 skipped 被报成 3 个失败步）。
+    failed = [s for s in run.steps if s.status == "failed"]
     if not failed:
         return {}
     if client is None:
@@ -159,7 +222,8 @@ def diagnose_run(run: RunResult, artifacts_dir: Path, client=None) -> dict[str, 
 
     if task_mode(client) != "server" and not client.api_key:
         return {s.step_id: _rule_card(s) for s in failed}  # 无 Key：规则兜底
-    variables = build_variables(run, artifacts_dir)
+    variables = build_variables(run, artifacts_dir, case=case,
+                                page_index_dir=page_index_dir)
     try:
         content = complete_task_raw(client, "diagnose", variables, context="失败归因")
     except Exception:

@@ -47,3 +47,11 @@ engine/insta_engine/console_dist/
 .coverage
 htmlcov/
 coverage.xml
+
+# 资产备份包（ops/backup_assets.sh 产出）：内含 prompts_private 与签发私钥的
+# AES-256 加密副本。**绝不入库**——一条 `git add -A` 就会把凭据加密包带走并推到
+# 远端；口令虽不落盘，但它仍是攻击面，且备份本身属于"本机灾备"而非源码。
+ops/backups/
+
+# 按应用的测试说明（用户数据，随工作区走不进 git——同 artifacts/ 口径）
+app_notes/

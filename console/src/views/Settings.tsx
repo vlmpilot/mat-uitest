@@ -1,17 +1,17 @@
 import {
-  Alert, Button, Descriptions, Input, Modal, Popover, Space, Tag, Tooltip, Typography, Tabs, message,
+  Alert, Button, Descriptions, Input, Modal, Space, Tag, Tooltip, Typography, Tabs, message,
 } from "antd";
 import {
   CloudDownloadOutlined, InfoCircleOutlined, KeyOutlined, SafetyOutlined, TeamOutlined,
 } from "@ant-design/icons";
 import { useEffect, useState } from "react";
 import {
-  getCreds, getJob, getSeats, Seat, seatRemove, startExport, StateResp, writeCred,
+  getCreds, getJob, getSeats, SeatsResp, seatRemove, startExport, StateResp, writeCred,
 } from "../api";
 import PageHeader from "../components/PageHeader";
 
 // 设置页：顶部切 tab（2026-10-12 发起人要求改回 Tabs），四个标签页：
-// 订阅（套餐+团队成员+激活/续期）→ 用例凭据 → 本地数据导出 → 关于。
+// 使用方式（套餐+团队成员+激活/续期）→ 用例凭据 → 本地数据导出 → 关于。
 // 移除的 tab：AI（与概览重复——额度/就绪概览统计卡已有，GEN_* .env 配置指引 EnvDoctor 已覆盖）、
 // 设备（只读 serial/型号/状态清单，概览设备卡片已有实时画面与在线状态，纯冗余）。
 
@@ -40,24 +40,34 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
   return (
     <>
       <Descriptions size="small" column={1} bordered>
-        {/* 商业化口径（发起人 2026-10-12）：体验版=free、标准版=pro；功能不分档全员一致，
-            商业化只控额度与成员人数——标签样式展示，不再裸露 free/pro 字样 */}
-        <Descriptions.Item label="套餐">
-          <Tag color={state.usage.gen_limit != null ? "default" : "gold"} style={{ marginInlineEnd: 0 }}>
-            {state.usage.gen_limit != null ? "体验版" : "标准版"}
+        {/* 两个独立维度（2026-10-24 修正）：此前把「模式」和「AI 接入」压成一维，
+            让「标准模式」看起来只能自带 API Key。实际标准模式走官方代理也合法。
+            功能不分档全员一致，商业化只控官方代理额度与团队人数——不裸露 free/pro */}
+        <Descriptions.Item label="使用方式">
+          <Tag color={state.license?.plan === "free" || !state.license?.plan ? "default" : "gold"}
+            style={{ marginInlineEnd: 0 }}>
+            {usageModeLabel(state.license?.plan)}
           </Tag>
-          {/* 到期日（2026-10-13）：标准版才显示，绿色强调；激活/续期（含时长卡核销
+          {/* 到期日（2026-10-13）：标准模式才显示，绿色强调；激活/续期（含时长卡核销
               换码）写盘后 onRefresh 重拉 state，这里自然更新 */}
           {state.license?.plan === "pro" && state.license?.expires_at ? (
             <Typography.Text style={{ color: "#389e0d", fontWeight: 600, marginLeft: 8 }}>
               有效期至 {new Date(state.license.expires_at * 1000).toLocaleDateString()}
             </Typography.Text>
           ) : null}
-          {/* 额度小字已删（发起人 2026-10-14）：「AI 生成/视觉兜底不限额度」与激活行
-              「无限 AI 生成与更高视觉兜底额度」口径打架；额度展示概览统计卡已有 */}
+        </Descriptions.Item>
+        <Descriptions.Item label="AI 接入">
+          <Tag color={state.ai_mode === "server" ? "default" : "gold"} style={{ marginInlineEnd: 8 }}>
+            {state.ai_mode === "server" ? "官方代理" : "自带 API Key"}
+          </Tag>
+          <Typography.Text type="secondary" style={{ fontSize: 13 }}>
+            {state.ai_mode === "server"
+              ? "有月度上限；切自带 API Key 就不设上限"
+              : "本站不设上限，请求直连你选的服务商"}
+          </Typography.Text>
         </Descriptions.Item>
         <Descriptions.Item label="激活/续期">
-          公测期在<a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">官网联系</a>获取激活码（无限 AI 生成与更高视觉兜底额度）。
+          公测期在<a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">官网联系</a>获取标准模式激活码（更高的官方代理 AI 额度）。
           <Space.Compact style={{ marginTop: 8, display: "flex" }}>
             <Input placeholder="MAT-pro.…" value={code}
                    onChange={(e) => setCode(e.target.value)}
@@ -66,9 +76,8 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
           </Space.Compact>
           {msg && <div style={{ marginTop: 6, color: msg.ok ? "#389e0d" : "#cf1322" }}>{msg.text}</div>}
         </Descriptions.Item>
-        <Descriptions.Item label="命令行方式"><code>mat activate &lt;激活码&gt;</code></Descriptions.Item>
       </Descriptions>
-      {/* 团队成员并入订阅 tab（2026-10-12 发起人）：商业化只控额度+人数，看套餐就该看到成员名额 */}
+      {/* 团队成员并入使用方式 tab（2026-10-12 发起人）：商业化只控额度+人数，看套餐就该看到成员名额 */}
       <div style={{ marginTop: 16 }}>
         <SeatsCard />
       </div>
@@ -78,7 +87,7 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
 
 // AccountTabWithInvite 半成品已移除(2026-10-13):引用的 AccountTab/InviteBlock 组件
 // 从未落地且全仓无引用,导致 tsc 编译失败(TS2304)阻塞整个 console 构建——邀请卡片
-// 如需恢复,补齐组件后重新接入订阅 tab。
+// 如需恢复,补齐组件后重新接入使用方式 tab。
 
 function AboutTab({ state }: { state: StateResp }) {
   return (
@@ -160,26 +169,29 @@ function ExportTab() {
   );
 }
 
-// 团队成员（商业化规则，发起人 2026-10-12）：功能不分档，商业化只控额度+人数；
-// 上限 = 免费基线 5 人 + 运营按主机发的配额（`seat_quota`，2026-10-14 起取代了
-// ".env MAT_SEAT_LIMIT 可调"与"扩容购买"两种旧说法）。名单落 artifacts/team_seats.json，
-// 任何成员在此都能移除名单里的人（无权限分级：这是内网协作的取舍，不是权限系统）——
-// 名额不是权限，别当安全边界讲；误填/离职的名字要能被人清掉，所以不限制"只能删自己"。
-// 「联系客服」悬停出微信二维码（发起人 2026-10-14：扩容入口从"联系我们"换成客服微信）。
-// 素材在 console/public/wx-qrcode.png，构建后从站点根路径直接取。
+// 团队成员（2026-10-25 产品定位调整）：功能不分档，商业化只控额度 + 人数；
+// **团队共享只随团队授权提供**——标准/体验授权面向单人使用，`--share` 下上限也恒 1。
+// 名单落 artifacts/team_seats.json，任何成员在此都能移除名单里的人（无权限分级：这是内网
+// 协作的取舍，不是权限系统）——名额不是权限，别当安全边界讲；误填/离职的名字要能被人清掉，
+// 所以不限制"只能删自己"。
+// 「联系客服」跳官网联系区（发起人 2026-10-15）：二维码素材不随包分发（PyPI/公开仓均不含），
+// 官网 #contact 联系区有公众号二维码，点击跳转扫码即可。
+/** 使用方式（与「AI 接入」是两个维度）：free=体验模式、pro=标准模式、team/private=团队模式 */
+function usageModeLabel(plan?: string): string {
+  const p = (plan || "free").toLowerCase();
+  if (p === "free") return "体验模式";
+  if (p === "team" || p === "private") return "团队模式";
+  return "标准模式";
+}
+
 function WxContact() {
-  return (
-    <Popover trigger="hover" placement="top" title="微信扫码添加客服"
-      content={<img src="/wx-qrcode.png" alt="客服微信二维码"
-        style={{ width: 210, display: "block" }} />}>
-      <a onClick={(e) => e.preventDefault()}>联系客服</a>
-    </Popover>
-  );
+  return <a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">联系客服</a>;
 }
 
 function SeatsCard() {
-  const [data, setData] = useState<{ seats: Seat[]; limit: number } | null>(null);
-  const load = () => getSeats().then(setData).catch(() => setData({ seats: [], limit: 5 }));
+  const [data, setData] = useState<SeatsResp | null>(null);
+  // 拿不到就按"本机单人"渲染：本机控制台真就只有安装者一个人（2026-10-23）
+  const load = () => getSeats().then(setData).catch(() => setData({ seats: [], limit: 1, shared: false }));
   useEffect(() => { load(); }, []);
   // 移除需确认（发起人 2026-10-14）：防误点 × 号直接释放名额。
   // ⚠️ antd Tag 点 × 默认自带消失动画（onClose 只是通知），必须 preventDefault 拦下，
@@ -200,7 +212,14 @@ function SeatsCard() {
     <>
       <Alert type="info" showIcon style={{ marginBottom: 12 }}
         message={<span><TeamOutlined style={{ color: "#4F5BFF", marginRight: 8 }} />成员管理</span>}
-        description={<span>团队协作（--share）按成员管理：同事首次进入填名字即占一位，当前 {used}/{data?.limit ?? 5}{full ? "——已满，请" : "，如需增加名额请"}<WxContact />。</span>} />
+        description={data && !data.shared ? (
+          <span>本机单人模式：这个控制台只有你（安装者）。要和同事共用同一个控制台，
+            用 <Typography.Text code>mat console --share</Typography.Text> 启动——团队共享随团队授权提供（标准/体验授权面向单人使用）。</span>
+        ) : data && data.shared && !data.team_authorized ? (
+          <span>团队共享随团队授权提供：当前授权面向单人使用，<Typography.Text code>--share</Typography.Text> 下也只有你 1 人。若名单里的名字就是你自己（换了浏览器/设备，或改过名字）：点右侧 <Typography.Text code>×</Typography.Text> 移除旧名字即可进入；要与同事共用同一个控制台，请联系我们获取团队授权（<WxContact />，或加微信 lazy_vizen）。</span>
+        ) : (
+          <span>团队模式按成员管理：同事首次进入填名字即占一位，当前 {used}/{data?.limit ?? 5}{full ? "——已满，请" : "，如需增加名额请"}<WxContact />。</span>
+        )} />
       {data && data.seats.length > 0 ? (
         <Space size={[6, 6]} wrap>
           {/* 行首前缀（发起人 2026-10-13）：「团队成员：」说明这行 Tag 是成员名单 */}
@@ -217,7 +236,11 @@ function SeatsCard() {
           ))}
         </Space>
       ) : (
-        <Typography.Text type="secondary">暂无成员登记——同事打开控制台填名字后出现在这里。</Typography.Text>
+        <Typography.Text type="secondary">
+          {data && !data.shared
+            ? "本机单人模式：名单里只有安装者本人。"
+            : "暂无成员登记——同事打开控制台填名字后出现在这里。"}
+        </Typography.Text>
       )}
     </>
   );
@@ -226,7 +249,7 @@ function SeatsCard() {
 export default function Settings({ state, onRefresh }: {
   state: StateResp; onRefresh?: () => void }) {
   const items = [
-    { key: "subscribe", label: <span><SafetyOutlined style={{ color: "#4F5BFF", marginRight: 6 }} />订阅</span>,
+    { key: "subscribe", label: <span><SafetyOutlined style={{ color: "#4F5BFF", marginRight: 6 }} />使用方式</span>,
       children: <SubscribeTab state={state} onRefresh={onRefresh} /> },
     { key: "creds", label: <span><KeyOutlined style={{ color: "#4F5BFF", marginRight: 6 }} />用例凭据</span>,
       children: <CredsTab /> },
@@ -237,7 +260,7 @@ export default function Settings({ state, onRefresh }: {
   ];
   return (
     <>
-      <PageHeader title="设置" desc="订阅、用例凭据、本地数据导出与关于;写盘型配置经 .env / CLI 生效。" />
+      <PageHeader title="设置" desc="使用方式、用例凭据、本地数据导出与关于;写盘型配置经 .env / CLI 生效。" />
       <Tabs items={items} />
     </>
   );

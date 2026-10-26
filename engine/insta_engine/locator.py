@@ -32,12 +32,33 @@ class Element:
     node: Any = None  # uiautomator2 UiObject / XPathSelector
     point: tuple[int, int] | None = None
     drv: BaseDriver | None = None
+    #: 命中所用的「第 N 个匹配」（`None` = 未指定）。只用于**证据**：失败/成功记录里
+    #: 能区分「第 0 个卡片没找到」与「文案没找到」，否则位置型定位的失败现场无从复核。
+    index: int | None = None
 
     @property
     def ok(self) -> bool:
         if self.point is not None:
             return True
-        return bool(self.node is not None and self.node.exists)
+        if self.node is None:
+            return False
+        if self.index is not None:
+            # ⚠️ 位置定位**不能用 `.exists` 判定**：u2 的 `exist` RPC 不看 `instance`
+            # （2026-10-25 真机实测：`c_list_view_container` 只有 6 个，`instance=9`
+            # 的 `exist` 仍返回 True，而 `objInfo` 如实抛 UiObjectNotFoundError）。
+            # 用 `.exists` 会让"第 9 个卡片"这种必然失败的定位记成命中，然后在
+            # `click()` 里抛一个与定位无关的异常 ⇒ 失败归因全错。
+            # `info` 对两种驱动都是"取到了才有"的语义（iOS 的 WdaNode.info 走 `sel.get()`）。
+            try:
+                return bool(self.node.info)
+            except Exception:  # noqa: BLE001 —— 越界/未找到 = 未命中
+                return False
+        try:
+            return bool(self.node.exists)
+        except Exception:  # noqa: BLE001 —— u2 的 `exists` 在部分版本**会抛「未找到」**
+            # （2026-10-25 真机实测：`Selector [text='账号']` 的 `.exists` 直接抛
+            # UiObjectNotFoundError ⇒ 整个失败步被记成 unknown 而不是 locate-fail）
+            return False
 
     def click(self) -> None:
         if self.point is not None:
@@ -82,15 +103,48 @@ class Element:
                     f"输入未生效（回读为空，策略 {self.strategy}）：{platform} 无二级输入通道")
 
     def _read_back_empty(self) -> bool:
-        if (self.get_text() or "").strip():
+        """回读为空才走二级通道；**读不到（抛异常）不算空**，否则会重复输入。"""
+        try:
+            text = self.get_text()
+        except Exception:  # noqa: BLE001 —— 节点已失效，视作"未知"（见 get_text 注释）
+            return False
+        if text is not None and text.strip():
             return False
         time.sleep(0.2)
-        return not (self.get_text() or "").strip()
+        try:
+            text = self.get_text()
+        except Exception:  # noqa: BLE001
+            return False
+        return text is None or not text.strip()
 
     def clear_text(self) -> None:
+        """清空输入框：`clear_text()` → `set_text("")` → 都不行才抛。
+
+        为什么非要能清空：内容型 App 的搜索框把**占位/热词写在 text 里**
+        （tx「网友捕捉绝美"火箭云"！」、xhs「搜索, 」），`set_text` 会**拼在后面**
+        ⇒ 输入「世界杯」实际得到「火箭世界杯」，搜出来的结果与意图无关，
+        而用例侧完全看不出来（引擎的回读校验也认为"有内容"）。
+
+        **两级兜底都是真机逼出来的**（2026-10-25/26 实测）：
+
+        1. u2 的 **`XPathSelector` 根本没有 `clear_text`** —— 直接
+           `AttributeError: ('Invalid attr', 'clear_text')`；
+        2. u2 的 **`UiObject.clear_text` 存在，但内部走 ADB 广播**
+           （`am broadcast -a ADB_KEYBOARD_CLEAR_TEXT`）—— 输入框不是
+           `ExtractEditText` 时抛 `AdbBroadcastError`。**「有这个方法」不等于「调得通」**，
+           所以调用本身也要包 try（实测一个输入框不是 `ExtractEditText` 的用例就
+           栽在这：广播抛错、引擎虽标了 `false_red`，步骤照样是红的）。
+        """
         if self.node is None:
             raise RuntimeError("坐标定位不支持清空输入")
-        self.node.clear_text()
+        clear = getattr(self.node, "clear_text", None)
+        if callable(clear):
+            try:
+                clear()
+                return
+            except Exception:  # noqa: BLE001 —— ADB 广播失败/属性不支持，降级覆写空串
+                pass
+        self.node.set_text("")
 
     def get_text(self) -> str | None:
         if self.node is None:
@@ -98,6 +152,14 @@ class Element:
         if hasattr(self.node, "get_text"):
             return self.node.get_text()
         return getattr(self.node, "text", None)
+
+    # ⚠️ 为什么 `_read_back_empty` 必须吞掉 get_text 的异常（2026-10-25 真机评测）：
+    # 定位命中 **hint** 后输入新值，提示文案消失 ⇒ 同一选择器不再匹配，u2 的
+    # `get_text()` 直接抛 UiObjectNotFoundError（method=wait）。这是**正常时序**
+    # （输入本来就会改掉 hint），不是执行失败；不吞就会把成功输入记成 `unknown`
+    # 失败（InstaDemo 登录用例实测）。注意这里**不能**把 None 一并当"未知"：
+    # iOS 的空输入框 `get_text()` 正常返回 None（WdaNode 的 value/text 都为空），
+    # 那恰恰是"要回读为空"的证据，需继续走二级通道。
 
     def get_state(self, state: str) -> bool:
         """读控件状态（enabled/checked/selected，u2 info 同名键）。
@@ -124,6 +186,25 @@ _SELECTOR_KWARGS = {
 }
 
 
+def _label(loc: Locator) -> str:
+    """定位的**可读标识**（报错/证据用）：带 index 时必须显示，否则两种失败长得一样。"""
+    return (f"{loc.strategy.value}={loc.value}" if loc.index is None
+            else f"{loc.strategy.value}={loc.value}#{loc.index}")
+
+
+def _find(drv: BaseDriver, by: str, value: str, timeout_s: float,
+          index: int | None) -> Any:
+    """调驱动 `find`，**只在 index 非 None 时**才传该参数。
+
+    为什么这么绕：`index` 是后加的可选参数，仓里十多个测试桩/历史实现仍是
+    三参签名（`find(self, by, value, timeout)`）。无条件传 `index=` 会让它们全部 TypeError
+    ——而那些桩验证的是定位链/失败分类，与 index 无关，不该被一个新特性打挂。
+    """
+    if index is None:
+        return drv.find(by, value, timeout_s)
+    return drv.find(by, value, timeout_s, index=index)
+
+
 def resolve(drv: BaseDriver, locator: Locator, timeout_ms: int) -> Element:
     """沿 fallback 链逐级尝试；全部失败抛 LocateFailed（附各级证据）。"""
     chain: list[Locator] = []
@@ -142,11 +223,11 @@ def resolve(drv: BaseDriver, locator: Locator, timeout_ms: int) -> Element:
             element = _try(drv, loc, min(per_strategy, remaining))
             if element.ok:
                 return element
-            errors.append(f"{loc.strategy.value}={loc.value} 未命中")
+            errors.append(f"{_label(loc)} 未命中")
         except LocatorNotSupported as exc:
             errors.append(str(exc))
         except Exception as exc:  # 单策略异常不阻断链
-            errors.append(f"{loc.strategy.value}={loc.value}: {exc}")
+            errors.append(f"{_label(loc)}: {exc}")
 
     raise LocateFailed("定位失败（策略链）: " + " / ".join(errors))
 
@@ -179,14 +260,50 @@ def try_resolve(drv: BaseDriver, locator: Locator, timeout_ms: int) -> Element |
         return None
 
 
+def _xpath_literal(value: str) -> str:
+    """把任意字符串变成 XPath 1.0 字符串字面量（无转义机制，按引号拆分后 concat）。"""
+    if '"' not in value and "'" not in value:
+        return f'"{value}"'
+    parts: list[str] = []
+    buf = ""
+    for ch in value:
+        if ch in "\"'":
+            if buf:
+                parts.append(f'"{buf}"')
+                buf = ""
+            parts.append("'\"'" if ch == '"' else "\"'\"")
+        else:
+            buf += ch
+    if buf:
+        parts.append(f'"{buf}"')
+    return "concat(" + ", ".join(parts) + ")"
+
+
+def _exists(node: Any) -> bool:
+    """安全读 `node.exists`：u2 部分版本的 `exists` 在未命中时会抛异常。"""
+    try:
+        return bool(node.exists)
+    except Exception:  # noqa: BLE001 —— 未命中就是 False，不该把定位失败升级成 unknown
+        return False
+
+
+def _nth_xpath(expr: str, index: int | None) -> str:
+    """把 XPath 表达式收成「第 N 个匹配」：`(expr)[N+1]`（XPath 1.0 是 1 基）。
+
+    加括号是必须的：`//a/b[2]` 是"每个 a 的第二个 b"，`(//a/b)[2]` 才是"全屏第二个"。
+    """
+    return expr if index is None else f"({expr})[{index + 1}]"
+
+
 def _try(drv: BaseDriver, loc: Locator, timeout_s: float) -> Element:
     if loc.strategy == LocatorStrategy.POINT:
         x, y = (int(v.strip()) for v in loc.value.split(",", 1))
         return Element(strategy=loc.strategy.value, value=loc.value, point=(x, y), drv=drv)
 
     if loc.strategy == LocatorStrategy.XPATH:
-        selector = drv.find_xpath(loc.value, timeout_s)
-        return Element(strategy=loc.strategy.value, value=loc.value, node=selector, drv=drv)
+        selector = drv.find_xpath(_nth_xpath(loc.value, loc.index), timeout_s)
+        return Element(strategy=loc.strategy.value, value=loc.value, node=selector, drv=drv,
+                       index=loc.index)
 
     if loc.strategy == LocatorStrategy.IMAGE_TEMPLATE:
         return _match_template(drv, loc.value, timeout_s)
@@ -201,18 +318,35 @@ def _try(drv: BaseDriver, loc: Locator, timeout_s: float) -> Element:
         # text 语义等价链（真机首测教训：现代 App 的底部导航/图标类控件，
         # 文字常在 content-desc 而 text 为空，如某些 App 的"我的"标签）：
         # text 精确 → description 精确 → textContains → descriptionContains
-        budget = max(0.5, timeout_s / 4)
+        # `index` 逐级透传：位置语义在整条链上一致（第 N 个"含该文案"的控件），
+        # 不会出现"精确匹配取第 2 个、包含匹配又退回第 1 个"的错位。
+        budget = max(0.5, timeout_s / 5)
         for attr, mark in (("text", None), ("description", "description"),
                            ("textContains", "contains"), ("descriptionContains", "descContains")):
-            node = drv.find(attr, loc.value, budget)
-            if node.exists:
+            node = _find(drv, attr, loc.value, budget, loc.index)
+            if _exists(node):
                 via = f"text→{mark}" if mark else "text"
-                return Element(strategy=via, value=loc.value, node=node, drv=drv)
-        return Element(strategy="text", value=loc.value, node=drv.find("text", loc.value, 0), drv=drv)
+                return Element(strategy=via, value=loc.value, node=node, drv=drv, index=loc.index)
+        # hint 兜底：输入框**有默认值/预填值**时 text 不为空、提示文案只留在 hint 属性
+        # （2026-10-25 真机评测：text="alice" / hint="账号" ⇒ 上面四条全未命中，
+        # tx-news 搜索框同理）。UiSelector 没有 hint 属性 ⇒ 只能走 XPath；
+        # 平台不支持 XPath/hint 时异常被吞，行为与旧版一致（最后一个 return 仍会记录未命中）。
+        try:
+            node = drv.find_xpath(
+                _nth_xpath(f"//*[@hint={_xpath_literal(loc.value)}]", loc.index), budget)
+            if _exists(node):
+                return Element(strategy="text→hint", value=loc.value, node=node, drv=drv,
+                               index=loc.index)
+        except Exception:  # noqa: BLE001 —— 平台不支持 ⇒ 跳过，不影响既有策略链
+            pass
+        return Element(strategy="text", value=loc.value,
+                       node=_find(drv, "text", loc.value, 0, loc.index), drv=drv,
+                       index=loc.index)
 
     if loc.strategy in _SELECTOR_KWARGS:
-        node = drv.find(_SELECTOR_KWARGS[loc.strategy], loc.value, timeout_s)
-        return Element(strategy=loc.strategy.value, value=loc.value, node=node, drv=drv)
+        node = _find(drv, _SELECTOR_KWARGS[loc.strategy], loc.value, timeout_s, loc.index)
+        return Element(strategy=loc.strategy.value, value=loc.value, node=node, drv=drv,
+                       index=loc.index)
 
     raise LocatorNotSupported(f"当前未实现定位策略: {loc.strategy.value}（规划中）")
 
@@ -251,7 +385,7 @@ def heal_fuzzy(drv: BaseDriver, locator: Locator) -> Element:
     for token in tokens:
         for key in ("textContains", "descriptionContains"):
             node = drv.find(key, token, 2)
-            if node.exists:
+            if _exists(node):
                 return Element(strategy=f"fuzzy:{key}", value=token, node=node, drv=drv)
     raise LocateFailed(f"自愈模糊匹配未命中: {', '.join(tokens)}")
 

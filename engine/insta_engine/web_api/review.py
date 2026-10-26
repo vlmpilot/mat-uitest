@@ -69,7 +69,9 @@ def api_review_save(root: Path, body: dict) -> tuple[int, dict]:
         return 404, {"error": f"没有页面图谱：{package}"}
 
     stats = review_mod.apply_corrections(index, corrections, summary_corrections)
-    if stats["applied"] or stats["summary_applied"]:
+    # promoted：批量确认路径——值没变但 source 升级成 manual（纯确认时 applied 为 0，
+    # 不带上它图谱就不会落盘，确认等于没确认）
+    if stats["applied"] or stats["summary_applied"] or stats.get("promoted"):
         save_index(review_mod.index_path(package, root), index)
     store = review_mod.review_path(package, root)
     existing: dict = {}
@@ -90,4 +92,5 @@ def api_review_save(root: Path, body: dict) -> tuple[int, dict]:
                  "unchanged": len(stats["unchanged"]),
                  "summary_applied": len(stats["summary_applied"]),
                  "summary_unchanged": len(stats["summary_unchanged"]),
+                 "promoted": stats.get("promoted", 0),
                  "missing": stats["missing"]}

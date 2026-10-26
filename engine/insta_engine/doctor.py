@@ -77,25 +77,36 @@ FIX_ACTIONS: dict[str, dict] = {
                        "cmd": ["brew", "install", "scrcpy"]},
     "install-simctl": {"kind": "run", "label": "安装",
                        "cmd": ["xcode-select", "--install"]},
-    "open-simulator": {"kind": "run", "label": "启动",
-                       "cmd": ["open", "-a", "Simulator"]},
+    # kind=open-sim：Simulator.app 在 Xcode 包内、`open -a` 常找不到（用户实测）——
+    # 逻辑在 ios_setup.open_simulator_app（按 xcode-select 拼确定性路径）
+    "open-simulator": {"kind": "open-sim", "label": "启动"},
     # kind=wda：非单命令动作（launch + 轮询就绪），逻辑在 ios_wda.start_on_booted
     # （发起人 2026-10-12：WDA 未起只有 tips 没有入口，概览行上直接给一键启动）
     "start-wda": {"kind": "wda", "label": "启动"},
+    # 真机 WDA：start-wda 只认模拟器（simctl），真机必须走 usbmux + xcodebuild
+    "start-wda-device": {"kind": "wda-device", "label": "启动真机 WDA"},
+    # 证书续期（= 重新签名；xcodebuild 能用账号才有效，否则如实回滚并提示 ⌘U）
+    "renew-cert": {"kind": "renew", "label": "续期证书"},
     "open-env": {"kind": "open", "label": "打开配置"},
+    # 登录 Apple ID / 信任证书都必须在 Xcode GUI 里做——**唯一能自动的是把 Xcode 打开**，
+    # 剩下的文字引导写在该检查项的 hint 里（不要假装能一键登录）。
+    "open-xcode": {"kind": "run", "label": "打开 Xcode",
+                   "cmd": ["open", "-a", "Xcode"]},
 }
 
 ENV_TEMPLATE = (
     "# MAT 控制台环境变量（二选一配置 AI 生成）\n"
-    "# 方式一：官方代理\n"
-    "# GEN_BASE_URL=https://mobileaitest.com\n"
-    "# GEN_API_KEY=<你的 token>\n"
-    "# GEN_PROMPT_MODE=server\n"
-    "# 方式二：自带 Key（OpenAI 兼容端点）\n"
+    "# 方式一（推荐）：自带 Key（OpenAI 兼容端点）——prompt 本地拼装、数据不经我们，模型可自选\n"
     "# GEN_BASE_URL=<你的 OpenAI 兼容端点>\n"
     "# GEN_API_KEY=<你的 Key>\n"
     "# GEN_MODEL=<语言模型名>\n"
     "# GEN_VL_MODEL=<视觉模型名>\n"
+    "# 方式二：官方代理（零配置试用；关注公众号「Mobile AI Test」获取代理token）\n"
+    "GEN_BASE_URL=https://mobileaitest.com\n"
+    "GEN_API_KEY=<平台代理token>\n"
+    "GEN_PROMPT_MODE=server\n"
+    "# 视觉兜底的总开关\n"
+    "GEN_VL_FALLBACK=0\n"
 )
 
 _FIX_TIMEOUT_S = 600
@@ -127,6 +138,19 @@ def reload_env(root: Path) -> None:
     _RELOADED.update(mtime=mtime, path=str(env_path))
 
 
+def _usb_device_udid() -> str | None:
+    """当前 USB 连接的真机 udid（没有则 None）。**失败不抛**，配置台不能被它拖住。"""
+    try:
+        from . import ios_device
+
+        for d in ios_device.list_devices():
+            if d.get("transport") == "wired":
+                return d["udid"]
+    except Exception:  # noqa: BLE001 —— 探测失败按"没有"处理
+        return None
+    return None
+
+
 def run_fix(action: str, root: Path, host: str = "127.0.0.1") -> tuple[int, dict]:
     """执行白名单修复动作。run 返回 (exit, 输出尾部)；open 先建缺失的 .env 再打开。"""
     from .web_api.workspace import _local_only
@@ -137,6 +161,34 @@ def run_fix(action: str, root: Path, host: str = "127.0.0.1") -> tuple[int, dict
     spec = FIX_ACTIONS.get(action)
     if spec is None:
         return 400, {"error": f"未知修复动作: {action}"}
+    if spec["kind"] == "wda-device":
+        from .ios_device import list_devices, pick_device
+        from .ios_wda import start_on_device
+
+        usb = [d for d in list_devices() if d.get("transport") == "wired"]
+        dev, _why = pick_device(devices=usb)
+        if dev is None:
+            return 400, {"error": "没有 USB 连接的 iOS 真机——请用数据线连接并解锁后重试"}
+        ok, detail = start_on_device(dev["udid"])
+        body: dict = {"ok": ok, "action": action, "detail": detail}
+        if not ok:
+            body["error"] = detail
+        return (200 if ok else 400), body
+    if spec["kind"] == "renew":
+        from .ios_device import list_devices, pick_device
+        from .ios_wda import renew_device_profile
+
+        # 续期 = 重新签名，必须有可用 USB 真机作 build 目标；Wi-Fi 设备试了也白试
+        usb = [d for d in list_devices() if d.get("transport") == "wired"]
+        dev, _why = pick_device(devices=usb)
+        if dev is None:
+            return 400, {"error": "续期证书需要先用数据线（USB）连接 iPhone 并解锁；"
+                                  "续期成功后需重启 WDA 才生效"}
+        ok, detail = renew_device_profile(dev["udid"])
+        body = {"ok": ok, "action": action, "detail": detail}
+        if not ok:
+            body["error"] = detail
+        return (200 if ok else 400), body
     if spec["kind"] == "wda":
         from .ios_wda import start_on_booted
 
@@ -153,6 +205,14 @@ def run_fix(action: str, root: Path, host: str = "127.0.0.1") -> tuple[int, dict
         from .web_api.workspace import open_path_in_file_manager
         open_path_in_file_manager(str(target))
         return 200, {"ok": True, "action": action, "path": str(target)}
+    if spec["kind"] == "open-sim":
+        from .ios_setup import open_simulator_app
+
+        ok, detail = open_simulator_app()
+        body: dict = {"ok": ok, "action": action, "detail": detail}
+        if not ok:
+            body["error"] = detail
+        return (200 if ok else 400), body
     try:
         proc = subprocess.run(spec["cmd"], capture_output=True, text=True,
                               timeout=_FIX_TIMEOUT_S)
@@ -258,45 +318,44 @@ def android_checks() -> list[Check]:
         ))
 
     server_mode = promptstore.is_server()
-    # 提示文案按模式分类（发起人 2026-10-14：默认按官方代理引导，配了 local 才给 local 引导）。
-    # 「local 倾向」= 显式 GEN_PROMPT_MODE=local，或没写 mode 但已配 GEN_MODEL（自带 Key 用户）；
-    # 其余（显式 server、或什么都没配的新用户）都按官方代理引导——官方代理配置项最少。
+    # 提示文案按模式分类。2026-10-21 起**推荐 BYOK**（数据不经我们），但 .env 模板里
+    # 默认生效的仍是官方代理——新用户不配 Key 也能先跑通，避免首启即"AI 未配置"。
     local_inclined = (promptstore.mode() == "local"
                       or (not promptstore.is_server() and os.environ.get("GEN_MODEL")))
     if local_inclined:
         gen_hint = (
-            "当前：自带 Key（本地组装 prompt）\n"
+            "当前：自带 Key（本地组装 prompt，数据不经我们）\n"
             "GEN_BASE_URL=<你的 OpenAI 兼容端点>\n"
             "GEN_API_KEY=<你的 Key>\n"
             "GEN_MODEL=<语言模型名>\n"
-            "GEN_VL_MODEL=<视觉模型名>\n"
-            "prompt 可在「AI生成prompt」行「管理」里选择/自定义（server 模式则由服务端下发）\n"
-            "切官方代理（.env 改三行）：\n"
+            "GEN_VL_MODEL=<视觉模型名>（可选）\n"
+            "切官方代理（零配置试用，.env 改三行）：\n"
             "GEN_BASE_URL=https://mobileaitest.com\n"
-            "GEN_API_KEY=<你的 token>\n"
+            "GEN_API_KEY=<平台代理token>\n"
             "GEN_PROMPT_MODE=server"
         )
     else:
         gen_hint = (
-            "方式一：官方代理（推荐，配置最少）\n"
-            "GEN_BASE_URL=https://mobileaitest.com\n"
-            "GEN_API_KEY=<你的 token>\n"
-            "GEN_PROMPT_MODE=server\n"
-            "（模型与 prompt 均由服务端管理，无需 GEN_MODEL/GEN_VL_MODEL）\n"
-            "方式二：自带 Key（OpenAI 兼容端点）\n"
+            "方式一（推荐）：自带 Key（OpenAI 兼容端点）——数据不经我们\n"
             "GEN_BASE_URL=<你的 OpenAI 兼容端点>\n"
             "GEN_API_KEY=<你的 Key>\n"
             "GEN_MODEL=<语言模型名>\n"
-            "GEN_VL_MODEL=<视觉模型名>"
+            "GEN_VL_MODEL=<视觉模型名>（可选）\n"
+            "方式二：官方代理（零配置试用；关注公众号「Mobile AI Test」获取代理token）\n"
+            "GEN_BASE_URL=https://mobileaitest.com\n"
+            "GEN_API_KEY=<平台代理token>\n"
+            "GEN_PROMPT_MODE=server\n"
+            "（模型与 prompt 均由服务端管理，无需 GEN_MODEL/GEN_VL_MODEL）"
         )
     gen_ok = bool(os.environ.get("GEN_API_KEY")) and (server_mode or bool(os.environ.get("GEN_MODEL")))
     # detail 说清「还缺哪一项」——只报「未配置」会让人对着一排 GEN_* 猜
     gen_missing = "" if gen_ok else (
         "缺少 GEN_API_KEY" if not os.environ.get("GEN_API_KEY") else
-        "方式一需 GEN_PROMPT_MODE=server；方式二需 GEN_MODEL（自带 Key 模式）")
-    # 状态文案按生效模式分（发起人 2026-10-14）：server 显「server模式 · 已配置」；
+        "自带 Key 模式需 GEN_MODEL；官方代理模式需 GEN_PROMPT_MODE=server")
+    # 状态文案按生效方式分（发起人 2026-10-14；2026-10-25 起「模式」一词专指授权档
+    # 体验/标准/团队，AI 接入维度不再占用它）：server 显「server · 已配置」；
     # 配了自部署（GEN_MODEL）显「已优先使用自部署」——对齐「配了 local 就取 local」口径。
-    gen_state = ("server模式 · 已配置" if server_mode else "已优先使用自部署"
+    gen_state = ("server · 已配置" if server_mode else "已优先使用自部署"
                  if gen_ok else "未配置(建议配置)")
     # 「建议配置」≠「可选」（发起人 2026-10-12）：AI 生成是主路径能力，缺失会明显
     # 降低易用性，但缺失不阻塞手动用例执行——仍是提示级 warn，不计入退出码。
@@ -336,7 +395,7 @@ def android_checks() -> list[Check]:
     checks.append(Check(
         id="notify", label="结果通知(MAT_WEBHOOK_URL)(可选)",
         ok=webhook,
-        hint="可选:在运行目录 .env 加 MAT_WEBHOOK_URL(飞书/钉钉机器人地址),见手册 §4.9",
+        hint="可选:在运行目录 .env 加 MAT_WEBHOOK_URL(飞书/钉钉机器人地址),见使用手册「结果通知」",
         fix={"action": "open-env"} if not webhook else None,
     ))
 
@@ -368,11 +427,28 @@ def _wda_installed() -> bool:
 
 
 def _wda_status_ok() -> bool:
+    """WDA 服务就绪判据：模拟器走 localhost:8100，USB 真机走 usbmux。
+
+    真机 WDA **不在 localhost**（USBClient 走 /var/run/usbmuxd），旧判据只探
+    localhost ⇒ 真机屏幕已显示 Automation Running 仍报「WDA 服务未起」
+    （2026-10-22 发起人实测）。先探模拟器，再探当前唯一 USB 真机。
+    """
     try:
         with urllib.request.urlopen(_WDA_STATUS_URL, timeout=_WDA_TIMEOUT_S) as resp:
-            return resp.status == 200
-    except Exception:  # noqa: BLE001 —— 探测失败即「不可达」,细节不进入结论
+            if resp.status == 200:
+                return True
+    except Exception:  # noqa: BLE001 —— 探测失败继续试真机
+        pass
+    try:
+        import wda  # noqa: F401 —— 没装驱动时不必再起 devicectl 子进程
+    except ImportError:
         return False
+    udid = _usb_device_udid()
+    if not udid:
+        return False
+    from .ios_wda import device_wda_ready
+
+    return device_wda_ready(udid)
 
 
 def _booted_simulators() -> list[str]:
@@ -387,21 +463,43 @@ def _booted_simulators() -> list[str]:
 
 
 def ios_checks() -> list[Check]:
+    """iOS 组的检查结果——**任何平台都返回同一套结构**（2026-10-25 修正）。
+
+    原实现非 macOS 直接 `return []`，于是「这一组有没有内容」成了平台相关的隐式契约：
+    CLI 靠 `sys.platform == "darwin"` 不渲染（对），但**同一份检查在测试里被直接调用**
+    ⇒ Linux/Windows CI 上 10 条结构断言全 KeyError（ci 工作流连红 7 天的一个来源）。
+    契约改成「检查恒有结构，**渲染由调用方决定**」：CLI 决定不显示，控制台仍能看到
+    「本机没有这套工具链」的诚实结论，而不是一片空白（空白无法区分「没检查」和
+    「不支持」）。
+
+    非 macOS 上探测照跑，但它们都是**失败即返回**的（xcrun/devicectl 不存在 → OSError；
+    localhost:8100 直接拒连），不会像 macOS 上那样等超时。差别只在两处：平台专属的修复
+    按钮一律收起（install-simctl / open-simulator / start-wda / open-xcode 在 Windows 上
+    是空话），并用 `detail` 说明「仅 macOS 提供」。状态语义保持原口径：装了 wda 库但服务
+    没起 = fail（"想用 iOS 而当前不可用"），跟 test_wda_server_fails_when_lib_present
+    钉的契约一致。
+    """
+    supported = sys.platform == "darwin"
+    platform_note = "" if supported else f"iOS 工具链仅在 macOS 提供（当前 {sys.platform}）"
     checks: list[Check] = []
 
     wda_ok = _wda_installed()
+    # 只探一次：真机探测含 devicectl 子进程，多处复用避免环境卡越检测越慢
+    server_ok = _wda_status_ok()
     checks.append(Check(
         id="wda-lib", label="facebook-wda 驱动", ok=wda_ok,
         detail="" if wda_ok else "未安装(可选)",
-        hint="pip install 'mat-uitest[ios]'(iOS 模拟器支持)",
+        hint="pip install 'mat-uitest[ios]'(iOS 模拟器+真机支持)",
         fix={"action": "install-wda"} if not wda_ok else None,
     ))
 
     simctl_ok = bool(shutil.which("xcrun"))
     checks.append(Check(
         id="simctl", label="Xcode 命令行工具(xcrun simctl)", ok=simctl_ok,
+        detail=platform_note,  # 非 macOS 由 detail 说明「为什么不可用」，hint 保持原动作
         hint="brew install --cask xcodes-app,或仅装 Command Line Tools:xcode-select --install",
-        fix={"action": "install-simctl"} if not simctl_ok else None,
+        # 非 macOS 上「去装 Xcode」这个修复动作毫无意义 ⇒ 不给按钮（给了就是误导）
+        fix={"action": "install-simctl"} if (not simctl_ok and supported) else None,
     ))
 
     booted = _booted_simulators()
@@ -409,24 +507,100 @@ def ios_checks() -> list[Check]:
         id="simulators", label=f"已启动模拟器: {len(booted)} 台" +
                                (f"({booted[0].split('(')[0].strip()})" if booted else ""),
         ok=bool(booted),
-        hint="打开 Simulator.app 选机型启动;iOS 用例执行前置",
-        fix={"action": "open-simulator"} if not booted else None,
+        # 真机与模拟器任一可用即可（2026-10-22）：有 USB 真机时模拟器不是前置条件
+        hint="打开 Simulator.app 选机型启动；已连接 USB 真机时可忽略",
+        fix={"action": "open-simulator"} if (not booted and supported) else None,
     ))
 
-    server_ok = _wda_status_ok()
+    # 真机（2026-10-17 P2）：**只在装了 [ios] extra 时出现**——纯 Android 用户看不到这两行，
+    # 避免"永远 warn 的噪音"（与 usbmux 检查此前被隐藏同一理由）。
+    if wda_ok:
+        from . import ios_device
+
+        # 只认 USB（2026-10-22）：devicectl 会把 Wi-Fi 无线调试的设备也列出来，
+        # 那些设备能配对但不能跑 WDA——环境卡干脆不展示，避免用户误以为可用。
+        devices = ios_device.list_devices()
+        usb = [d for d in devices if d.get("transport") == "wired"]
+        if usb:
+            checks.append(Check(
+                id="ios-device",
+                label=(f"真机: {len(usb)} 台 USB"
+                       f"（{ios_device.describe(usb[0], with_transport=False)}）"),
+                ok=True,
+            ))
+        else:
+            checks.append(Check(
+                id="ios-device", label="真机: 0 台", ok=False, status="warn",
+                detail=platform_note,
+                hint="用数据线（USB）连接 iPhone 并解锁（只用模拟器可忽略）",
+            ))
+        team = ios_device.team_id()
+        checks.append(Check(
+            id="ios-team", label=f"签名团队: {team or '未找到'}", ok=bool(team),
+            status="ok" if team else "warn",
+            detail=platform_note,
+            hint="" if team else "真机签名需要 Xcode 登录 Apple ID（Settings → Accounts）",
+        ))
+        # Xcode 账号必须**读磁盘**（2026-10-17 实测：cfprefsd 有、磁盘没有 ⇒ xcodebuild 报
+        # No accounts）。这条检查就是为了让用户不必靠猜。
+        accounts = ios_device.xcode_account_count()
+        from . import ios_setup as _ios_setup
+
+        has_signed = _ios_setup.signed_runner_exists()
+        if accounts:
+            acc_label, acc_hint = f"Xcode 账号: {accounts} 个", ""
+        elif has_signed:
+            # 有已签名产物 ⇒ 账号不是阻塞项（复用路径不用账号），别让人去登一个不需要的号
+            acc_label, acc_hint = "Xcode 账号: 未登录（可跳过——已有已签名产物）", \
+                "只有需要重新构建 WDA 时才要登录账号"
+        else:
+            acc_label, acc_hint = "Xcode 账号: 未登录", \
+                "Xcode → Settings → Accounts 登录 Apple ID；登录后退出 Xcode 让偏好落盘"
+        checks.append(Check(
+            id="xcode-account", label=acc_label, ok=bool(accounts) or has_signed,
+            status="ok" if (accounts or has_signed) else "warn", hint=acc_hint,
+            # 只有"真阻塞"（没账号且没已签名产物）才给入口——可跳过时给按钮是误导；
+            # 非 macOS 根本没有 Xcode 可打开，给按钮同样是误导（2026-10-25）
+            fix=None if (accounts or has_signed or not supported) else {"action": "open-xcode"},
+        ))
+        # 真机三项（与 `mat ios-setup` **同一实现**，不在这里重写一份）：
+        # 证书有效期 / 设备解锁 / 已签名产物。控制台此前看不到这三项，
+        # 而它们恰好是真机跑测最常卡住的地方（2026-10-20）。
+        from . import ios_setup
+
+        # 证书有效期 / 已签名产物与「插没插线」无关：有已配对真机（含 Wi-Fi）就展示；
+        # 「设备解锁」必须有实机 udid，只在 USB 时加（2026-10-22 发起人反馈：
+        # 上一版把三项一起藏了，证书有效期检测消失）。
+        if devices:
+            extras = (ios_setup.cert_check(),
+                      ios_setup.lock_check(usb[0]["udid"]) if usb else None,
+                      ios_setup.signed_runner_check(ios_setup.signed_runner_exists(),
+                                                    server_ok))
+            for extra in extras:
+                if extra is not None:
+                    checks.append(extra)
+
     checks.append(Check(
-        id="wda-server", label="WDA 服务 (localhost:8100)", ok=server_ok,
+        # 标签不再写死 localhost（真机 WDA 走 usbmux，localhost 探不到）
+        id="wda-server",
+        label="WDA 服务 (模拟器 / USB 真机)" + ("" if supported else "（需 macOS）"),
+        ok=server_ok,
         # 装了库但服务没起 = 想用 iOS 而当前不可用(fail);库都没装 = 用户没进 iOS
         # 这条赛道(warn 降级)——main 分支默认呈现「未安装(可选)」的诚实态,不是一片红。
         status=("warn" if not wda_ok else ("ok" if server_ok else "fail")),
+        detail=platform_note,
         hint="模拟器/真机运行 WDA 后可用(复现命令见仓库)",
         # 一键启动（发起人 2026-10-12）：模拟器上装过 WDA 的话 simctl launch 免构建
-        fix={"action": "start-wda"} if (wda_ok and not server_ok) else None,
+        # 有 USB 真机 ⇒ 走真机启动（start-wda 只认模拟器，点它没用）；否则模拟器
+        # 非 macOS 没有可点的修复动作（simctl/devicectl 都不存在）⇒ 一律不给按钮
+        fix=({"action": "start-wda-device"}
+             if (supported and wda_ok and not server_ok and _usb_device_udid())
+             else ({"action": "start-wda"} if (supported and wda_ok and not server_ok) else None)),
     ))
 
-    # usbmux/pymobiledevice3 检查项已隐藏（发起人 2026-10-12）：真机转发是 P2 规划
-    # 能力、当前 iOS 真机链路尚未支持，展示一条永远 warn 的检查项只会制造噪音。
-    # 等真机转发落地时再随功能一起恢复。
+    # usbmux/pymobiledevice3 检查项不在此处展示（2026-10-19 更新）：真机链路已打通
+    # （usbmux 由 wda.USBClient 内建；syslog 证据源的可用性在 `mat ios-setup` 的
+    # evidence 检查项里呈现），doctor 保持精简不重复。
 
     return checks
 

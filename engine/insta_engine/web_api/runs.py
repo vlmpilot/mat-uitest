@@ -6,7 +6,9 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .. import promptstore
 from ..dsl import TestCase, dump_dsl, unique_case_id
+from ..preconditions import refused_result, unprovisionable
 from ..recording import make_recorder
 from ..report import render_html
 from ..runner import Runner, RunResult
@@ -21,7 +23,25 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
     case_name = str(body.get("case", "")).strip()
     cases_param = body.get("cases")
     raw: dict | None = None
-    if (isinstance(cases_param, list) and cases_param
+    rerun_dir = str(body.get("rerun_dir", "")).strip()
+    if rerun_dir:
+        # 单条回放（2026-10-25）：用**报告产物自带的完整用例数据**重跑——
+        # 不依赖 cases/ 源文件（改名/删除/同名 caseId 多文件都不影响）；
+        # 平台由调用方透传（报告页从 run.json 顶层 platform 带出）。
+        if ".." in rerun_dir or rerun_dir.startswith("/"):
+            return 400, {"error": f"非法 rerun_dir: {rerun_dir}"}
+        run_json = root / "artifacts" / rerun_dir / "run.json"
+        if not run_json.exists():
+            return 404, {"error": f"找不到执行产物: artifacts/{rerun_dir}/run.json"}
+        try:
+            raw = json.loads(run_json.read_text(encoding="utf-8")).get("case")
+        except (OSError, ValueError) as exc:
+            return 400, {"error": f"读取执行产物失败: {exc}"}
+        if not isinstance(raw, dict):
+            return 400, {"error": "执行产物里没有用例数据（旧产物或探索任务）"}
+        case_name = f"_rerun_{Path(rerun_dir).name}.json"
+        case_path = root / "cases" / case_name
+    elif (isinstance(cases_param, list) and cases_param
             and not app_filter and not case_name):
         # 选中多条用例批量执行（发起人 2026-10-12 用例列表多选）：内存构建临时套件
         # 走与套件完全相同的执行/聚合报告链路——**不落盘**，避免每次勾选运行都往
@@ -39,15 +59,17 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
         case_name = "_batch_selected.json"
         case_path = root / "cases" / case_name
     elif app_filter and not case_name:
-        # 批量执行：按 target.package 过滤 cases/ 全部用例（与 CLI --app 同语义）
+        # 批量执行：按 target.package 过滤 cases/ 全部用例（与 CLI --app 同语义）。
+        # 内存构建临时套件、**不落盘**（2026-10-24 修，评审附带项：对齐多选分支与
+        # CLI 10-23 的改法）——此前每次批量都往 cases/ 写 `_batch_<pkg>.json`，
+        # 污染用例列表（state 列表只滤 .suite.json）、坏了还会让列表接口 500。
         matched = [f for f in sorted((root / "cases").glob("*.json"))
                    if json.loads(f.read_text(encoding="utf-8")).get("target", {}).get("package") == app_filter]
         if not matched:
             return 400, {"error": f"没有 target.package={app_filter} 的用例"}
-        suite = {"name": f"app:{app_filter}", "cases": [f.name for f in matched]}
+        raw = {"name": f"app:{app_filter}", "cases": [f.name for f in matched]}
         case_name = f"_batch_{app_filter.replace('.', '_')}.json"
         case_path = root / "cases" / case_name
-        case_path.write_text(json.dumps(suite, ensure_ascii=False), encoding="utf-8")
     else:
         case_path = root / "cases" / case_name
     if raw is None:
@@ -67,6 +89,11 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
     # 套件判定：文件含 cases 数组 ⇒ 套件模式（与 CLI mat run 套件模式同构）
     suite_items = raw.get("cases") if isinstance(raw.get("cases"), list) else None
     is_suite = suite_items is not None
+    # 分阶段套件（2026-10-21）：控制台的套件执行循环还是"平铺 cases"同构实现，
+    # 不认 stages ⇒ 如实拒绝并指路，而不是报"用例格式错误"让人以为文件坏了。
+    if (isinstance(raw, dict) and isinstance(raw.get("stages"), list)
+            and "steps" not in raw):
+        return 400, {"error": "分阶段套件（stages）暂只支持命令行 `mat run`；控制台请用平铺 cases 套件"}
     case = None
     if not is_suite:
         try:
@@ -75,7 +102,13 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
             return 400, {"error": f"用例格式错误: {exc}"}
     serial = body.get("serial") or None
     platform = str(body.get("platform") or "android")
-    record = bool(body.get("record")) and not (case and case.datasets)  # 数据驱动暂不支持录屏（诚实降级）
+    # 录屏（P1-5，2026-10-24 起数据驱动同样支持——逐组挂 recorder）：
+    # 此前数据驱动被硬性禁用且**无声**（record 被置 False 后连 disabled 提示都
+    # 不触发），用户勾了录屏跑数据组 = 无视频无提示。
+    record = bool(body.get("record"))
+    # 前置拒跑的放行开关（P1-7，与 CLI --allow-unmet-preconditions 同语义）：
+    # 用户先手工把设备置成该状态后再勾选放行，而不是让闸门变成永远打不开的门。
+    allow_unmet = bool(body.get("allowUnmetPreconditions"))
     # 套件用例间重置（发起人 2026-10-12：16 条导入用例顺序执行零重置，08 失败后
     # 09-16 的前置页面全部不可达、雪崩连锁失败）。cold = 每条开始前 force-stop
     # 目标 App，冷启动交给用例自身的 launch 前置（导入转换产物已自动注入）。
@@ -84,24 +117,42 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
 
     def job(emit, cancel):
         _require_fresh_code()
+        # 前置拒跑（P1-7，2026-10-24）：与 CLI `_blocked_preconditions` 同口径——
+        # 带 MAT 无法置备前置（否定式权限态）的用例**不跑**。跑下去只会产出一条
+        # 假的定位失败报告，用户按报告排查、方向从源头就错。产物与 CLI 同源
+        # （preconditions.refused_result）：skipped 条目 + 最小报告，不占设备锁。
+        if case is not None and not allow_unmet:
+            blocked = unprovisionable(list(case.preconditions or []))
+            if blocked:
+                emit("run", "refused", f"前置条件无法置备：{'、'.join(blocked)}（已拒跑，详见报告）")
+                refused_result(case, blocked, artifacts)
+                return ("已拒跑：前置条件 MAT 无法置备（详见报告与处置建议）"), \
+                    f"/artifacts/{artifacts.name}/report.html"
         # **驱动/Runner 的创建必须在 job 内**：无设备时 `get_driver` 抛 `AdbError`，
         # 放在 job 外会让端点直接 **500**，而契约是"优雅落 error + 事件流可查"。
         # ⚠️ 这个洞**一直被掩盖**：跑测试时设备总是插着，走不到这个分支。
         # 2026-10-06 设备掉线后 `test_run_job_fails_gracefully_without_device` 才红。
+        # ⚠️ 套件模式**不在 job 开头建初始 Runner/录屏器**（2026-10-24，P1-7）：
+        # 套件循环逐条自建 `runner_i`/`rec_i`，初始那份是死工作，而且它取设备
+        # 会挡在逐条前置拒跑**之前**——拒跑本不需要设备。
+        runner = None
         recorder = None
-        if record:
-            recorder, rec_reason = make_recorder(platform, serial, artifacts)
-            if recorder is None:
-                # 录屏不可用必须**可见**（事件流+报告），而不是静默按无录屏跑——
-                # 用户勾了录屏却看不到视频 = 上一条抱怨的根源。
-                emit("record", "disabled", f"录屏不可用：{rec_reason}")
-        try:
-            runner = Runner(get_driver(serial, platform), artifacts, recorder=recorder)
-            runner.operator = operator_of(body)  # 执行人落 run.json/报告（发起人 2026-10-12）
-        except Exception as exc:
-            # 先 emit 再抛：worker 会把 job 置 error，但**事件流要非空**才可查
-            emit("run", "error", f"设备不可用：{type(exc).__name__}: {exc}")
-            raise
+        if not is_suite:
+            if record and not (case and case.datasets):
+                recorder, rec_reason = make_recorder(platform, serial, artifacts)
+                if recorder is None:
+                    # 录屏不可用必须**可见**（事件流+报告），而不是静默按无录屏跑——
+                    # 用户勾了录屏却看不到视频 = 上一条抱怨的根源。
+                    emit("record", "disabled", f"录屏不可用：{rec_reason}")
+            try:
+                runner = Runner(get_driver(serial, platform), artifacts, recorder=recorder,
+                                quality_gate=True,
+                                workspace_root=root)  # 图谱/校准规则按控制台当前工作区读取（P1-3）
+                runner.operator = operator_of(body)  # 执行人落 run.json/报告（发起人 2026-10-12）
+            except Exception as exc:
+                # 先 emit 再抛：worker 会把 job 置 error，但**事件流要非空**才可查
+                emit("run", "error", f"设备不可用：{type(exc).__name__}: {exc}")
+                raise
         lock = device_lock(serial)
         if not lock.acquire(blocking=False):
             default_dev = serial or "默认设备"
@@ -160,10 +211,22 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
                     case_i = TestCase.model_validate_json(item_path.read_text(encoding="utf-8"))
                     stem = Path(str(item)).stem
                     art_i = root / "artifacts" / f"{index:02d}_{stem}"
+                    # 前置拒跑（P1-7）：套件逐条与 CLI `_refused_entry` 同口径——
+                    # refused 条目 emit skipped 事件、聚合页按普通条目可见（不占设备时间）。
+                    if not allow_unmet:
+                        blocked_i = unprovisionable(list(case_i.preconditions or []))
+                        if blocked_i:
+                            emit(stem, "skipped",
+                                 f"（{index}/{total}）拒跑：前置条件无法置备（{'、'.join(blocked_i)}）")
+                            run_i = refused_result(case_i, blocked_i, art_i)
+                            entries.append((case_i.name or case_i.case_id,
+                                            f"../{art_i.name}/report.html", run_i))
+                            continue
                     rec_i = make_recorder(platform, serial, art_i)[0] \
                         if record and not case_i.datasets else None
                     runner_i = Runner(get_driver(serial, platform), art_i,
-                                      recorder=rec_i)
+                                      quality_gate=True,
+                                      recorder=rec_i, workspace_root=root)
                     runner_i.operator = operator_of(body)  # 执行人随每条 run.json 落盘
                     # 批次归组：写进每条 run.json 的 run.batch（报告页聚合展示）
                     runner_i.batch = {"id": batch_id, "suite": case_path.stem,
@@ -205,8 +268,17 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
                 from ..report import render_index_html
                 ds_root = root / "artifacts" / f"{case_path.stem}-ds"
                 entries = []
+
+                def _rec_factory(art_dir, _platform=platform, _serial=serial):
+                    # P1-5：数据驱动逐组挂录屏（此前无声禁用）；不可用时逐组 emit 可见
+                    rec, reason = make_recorder(_platform, _serial, art_dir)
+                    if rec is None and reason:
+                        emit("record", "disabled", f"录屏不可用：{reason}")
+                    return rec
+
                 for name, run, ds_artifacts in runner.run_datasets(
-                        case, ds_root, on_step=_on_step, cancel_event=cancel):
+                        case, ds_root, on_step=_on_step, cancel_event=cancel,
+                        recorder_factory=_rec_factory if record else None):
                     render_html(run, ds_artifacts)
                     entries.append((name, f"{ds_artifacts.name}/report.html", run))
                 render_index_html(case.name or case.case_id, entries, ds_root)
@@ -222,8 +294,11 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
         finally:
             lock.release()
 
-    return 200, {"job_id": start_job("run", job, meta={"serial": serial, "platform": platform,
-                                                       "operator": operator_of(body)})}
+    job_id = start_job("run", job, meta={"serial": serial, "platform": platform,
+                                         "operator": operator_of(body)})
+    # live：实时视图页（人看的旁路：投屏+事件流）。agent/前端可据此直接给用户
+    # 一个可点链接；同源场景（控制台/agent 面板）相对路径即可。
+    return 200, {"job_id": job_id, "live": f"/live/{job_id}"}
 
 
 def api_explore(root: Path, body: dict) -> tuple[int, dict]:
@@ -278,8 +353,9 @@ def api_explore(root: Path, body: dict) -> tuple[int, dict]:
         finally:
             lock.release()
 
-    return 200, {"job_id": start_job("explore", job, meta={"serial": serial, "platform": platform,
-                                                           "operator": operator_of(body)})}
+    job_id = start_job("explore", job, meta={"serial": serial, "platform": platform,
+                                             "operator": operator_of(body)})
+    return 200, {"job_id": job_id, "live": f"/live/{job_id}"}
 
 
 def api_gen(root: Path, body: dict) -> tuple[int, dict]:
@@ -298,6 +374,12 @@ def api_gen(root: Path, body: dict) -> tuple[int, dict]:
     graph = graph_context_for(package, base_dir)
     if graph:
         app_info["graph"] = graph
+    # 负责人对该应用的补充说明（app_notes/<包名>.md，黑/白名单等）——随 {app_info} 进 prompt
+    from ..appnotes import for_prompt as _app_notes_for_prompt
+
+    user_notes = _app_notes_for_prompt(root, package)
+    if user_notes:
+        app_info["user_notes"] = user_notes
     cases_dir = root / "cases"
 
     def job(emit, cancel):
@@ -305,20 +387,31 @@ def api_gen(root: Path, body: dict) -> tuple[int, dict]:
         from ..quota import UsageStore
 
         usage = UsageStore()
-        usage.ensure_capacity()  # 预检（T53b：模型失败不扣额度；web 端此前漏配额，一并补上）
         emit("gen", "running", "AI 生成中（同页多个入口将拆分为多个用例）")
-        cases, warns = GenClient.from_env().generate_cases(nl, app_info)
+        cases, warns = GenClient.from_env().generate_cases(
+            nl, app_info, index_dir=root / "artifacts" / "page_index")
         cases_dir.mkdir(parents=True, exist_ok=True)  # 循环外建一次（严格环境 EEXIST 教训）
         stamp = datetime.now().strftime("%H%M%S")
         truncated = max(0, len(cases) - MAX_SPLIT)
         outs: list[str] = []
         total_steps = 0
+        # 文件名直接用用例标题（2026-10-25 用户诉求：不用再改一次名）；批内/磁盘撞名
+        # 加 -2/-3（同标题多次生成是合法输入）。批次溯源在 meta.split_batch，不靠文件名。
+        from ..manual_import import slugify_filename
+
+        used_stems: set[str] = set()
         for i, case in enumerate(cases[:MAX_SPLIT], 1):
             case.case_id = unique_case_id(case.case_id, cases_dir)
-            case.meta["split_batch"] = stamp  # 同一次生成的批次溯源（同前缀文件名可追）
+            case.meta["split_batch"] = stamp  # 同一次生成的批次溯源
             for gate_issue in case.meta.get("quality_issues") or []:
                 warns.append(f"{case.name or case.case_id}: {gate_issue}")
-            path = cases_dir / f"gen-{stamp}-{i}.json"
+            stem = slugify_filename(case.name, fallback=f"gen-{stamp}-{i}")
+            path = cases_dir / f"{stem}.json"
+            n = 2
+            while path.exists() or path.stem in used_stems:
+                path = cases_dir / f"{stem}-{n}.json"
+                n += 1
+            used_stems.add(path.stem)
             path.write_text(dump_dsl(case), encoding="utf-8")
             outs.append(path.name)
             total_steps += len(case.steps)
@@ -337,10 +430,13 @@ def api_gen(root: Path, body: dict) -> tuple[int, dict]:
             m = meta.get(name) or {}
             title = str(m.get("title") or "")
             return f"{name}(#{m.get('no')} {title})" if m.get("no") and title else name
-        # 标准版(gen_limit=null)不限额——完成提示不再带「本月生成用量」（与入口提示同规则）
-        usage_bit = ("，本月生成用量 "
-                     f"{snapshot['gen_count']}/{snapshot['gen_limit']}"
-                     ) if snapshot["gen_limit"] is not None else ""
+        # 官方代理才报「本月生成用量」；自带 Key 的用量不占平台（token 用户自付）
+        if promptstore.is_server():
+            usage_bit = ("，本月生成用量 "
+                         f"{snapshot['gen_count']}/{snapshot['gen_limit']}"
+                         ) if snapshot["gen_limit"] is not None else ""
+        else:
+            usage_bit = "，自带 Key 不占平台额度"
         return (f"已生成 {len(outs)} 个用例（共 {total_steps} 步{usage_bit}）→ "
                 f"cases/{'、'.join(_desc(o) for o in outs)}{tail}", None)
 

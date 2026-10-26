@@ -42,8 +42,8 @@ from collections.abc import Callable
 from .dsl import LocatorStrategy
 
 __all__ = [
-    "BLOCK", "INFO", "RULES", "WARN", "clean_locator", "ensure_launch", "fmt_issue",
-    "grade_of", "quality_issues", "review", "rule_code_of", "sanitize_assertions",
+    "BLOCK", "INFO", "RULES", "STATE_ASSERTION_TYPES", "WARN", "clean_locator", "ensure_launch",
+    "fmt_issue", "grade_of", "quality_issues", "review", "rule_code_of", "sanitize_assertions",
     "sanitize_targets", "severity_of",
 ]
 
@@ -53,6 +53,12 @@ VALID_STRATEGIES = {s.value for s in LocatorStrategy}
 TEXT_STRATEGIES = ("text", "textContains", "description")
 #: 导航类动作：点完页面通常已经变了。
 NAV_ACTIONS = ("tap", "long-press")
+
+#: **状态类断言**：断的是"状态变了"，不是"控件还在"。
+#: 它们与"动作指向同一个控件"**不冲突** —— `tap 我的` + `selected 我的` 是语料里
+#: 最好的一条断言（底部 tab 一直都在，但选中态会变）。所以 R2/R23 都豁免它们
+#: （2026-10-24：此前 `tap 关注` + `selected 关注` 会被 R2 判成"必失败"，是误报）。
+STATE_ASSERTION_TYPES = ("selected", "checked", "enabled", "disabled")
 
 #: accessibility 状态后缀（`视频，可选中`）—— 它是**状态说明**，不是控件文案。
 #: uiautomator / ATX 会把**控件状态**拼进 text / description，状态一变文案就变 ⇒
@@ -93,6 +99,12 @@ INVISIBLE_CHARS = re.compile(r"[\ue000-\uf8ff\u200b-\u200f\u2060\ufeff\u0000-\u0
 #     `scripts/validate_quality_gate.py`）。**严重度不是设计出来的，是量出来的。**
 BLOCK, WARN, INFO = "block", "warn", "info"
 
+#: 「首启弹窗确认」的 res-id 形态（`tv_dialog_confirm` / `btn_agree` / `dialog_ok`）。
+#: 只用于**启动后前 2 步**的消毒（见 `sanitize_splash_steps`），不参与运行期判定。
+_DIALOG_CONFIRM_RE = re.compile(
+    r"(?i)(?:dialog|popup|alert)[_./-]*(?:confirm|ok|agree|allow|positive)"
+    r"|(?:confirm|agree)[_./-]*(?:btn|button|dialog)")
+
 RULES: dict[str, tuple[str, str]] = {
     "R1": (WARN, "断言必须有定位（缺则继承本步目标；继承不了就删）"),
     "R2": (BLOCK, "断言不得与导航耦合（点完页面已变，入口控件不在）"),
@@ -108,6 +120,20 @@ RULES: dict[str, tuple[str, str]] = {
     "R17": (WARN, "前置条件含**不可置备的系统态**：执行时会被拒跑，需人工置备或显式放行"),
     # R18/R19 由 `case_audit` 产出（那两条需要页面索引 / 弹窗词表，`case_quality` 判不了）
     "R18": (WARN, "定位引用的文案/res-id 不在控件清单里（可能是幻觉，也可能索引未覆盖该页）"),
+    "R20": (WARN, "定位在**本步所在页**不存在（图谱其他页有）——很可能跨页/碎片，运行期必定位失败"),
+    "R22": (INFO, "「点跳过广告」类步骤已自动改为可选（onFailure=continue）——"
+                  "引擎 launch 后已统一关广告，重跑时该目标必然不存在"),
+    "R21": (WARN, "text 定位在该页不唯一，或只匹配到 content-desc 控件（图标入口）——"
+                  "TEXT 策略是 text 精确优先，会先命中同名的内容标签"),
+    "R23": (WARN, "断言与**本步动作指向同一个控件**（平凡断言：能点到它就说明它在）——"
+                  "该步骤等于没有断言，App 行为错了也照样绿"),
+    "R24": (WARN, "断言目标**没有页面区分度**（该文案在 ≥10% 的页面里都出现）——"
+                  "断言它「存在」证明不了到了目标页"),
+    # R25 由 `case_audit.rewrite_coupled_assertions` 产出（要图谱才能判"点完控件还在不在"）。
+    # INFO 而不是 WARN：它把"必失败/恒真"的断言**换成了真断言**，缺陷已被完全处置，
+    # 只留痕迹让人知道产物与手写原稿不一样了（同 R5/R22 的口径）。
+    "R25": (INFO, "导航耦合断言已改写为**状态断言**（`selected`）——"
+                  "原写法点完即失效或恒真，等于没断"),
     "R19": (WARN, "用例依赖一次性系统/首启权限弹窗（重跑通常不再出现）"),
     "LLM": (WARN, "模型自己报的问题（未映射到规则编号）"),
     "X0": (BLOCK, "转换失败（未产出可用草稿）"),
@@ -173,6 +199,13 @@ def clean_locator(target) -> dict | None:
         value = STATE_SUFFIX.sub("", value).strip()
     if strategy and value and strategy in VALID_STRATEGIES:
         cleaned: dict = {"strategy": strategy, "value": value}
+        # `index`（第 N 个匹配）必须原样留下：本函数是**重建**定位字典，
+        # 不显式搬运的字段会被静默丢掉（`preconditions` 在 IR→DSL 边界上丢过一次）。
+        # 非法值（负数 / 非整数 / bool）丢弃并退回"取第一个"——
+        # 严格校验在 `dsl.Locator` 上，这里只保证不把脏值带进运行期。
+        index = target.get("index")
+        if isinstance(index, int) and not isinstance(index, bool) and index >= 0:
+            cleaned["index"] = index
         fallback = clean_locator(target.get("fallback"))
         if fallback:
             cleaned["fallback"] = fallback
@@ -207,6 +240,52 @@ def sanitize_targets(raw_case: dict) -> list[str]:
                     "R5", f"{label}定位文案 `{old_value}` 带 accessibility 状态后缀，"
                           f"已自动剥离为 `{new_value}`"))
             holder["target"] = after
+    return issues
+
+
+def sanitize_splash_steps(raw_case: dict) -> list[str]:
+    """把「点跳过广告」类步骤标成**可选**（`onFailure=continue`）。返回 issues。
+
+    为什么（2026-10-21 真机实测，tx-news 4/16 用例）：
+    引擎在**每次 launch 后都会 `_skip_splash_ad`** —— 关广告是引擎职责（用例不该负责），
+    于是用例里那一步「点击跳过」重跑时**目标必然不存在**。而 DSL 默认 `onFailure=abort`
+    ⇒ 整条用例在第 2 步就废（实测 4 条全部停在 25% 步骤，报「text=跳过 未命中」）。
+
+    这条不是"放宽标准"：点「跳过」本来就是**如果还在就点掉**，不是断言；
+    把它当硬失败等于让用例依赖"广告一定会出现"。
+    """
+    from .safety import is_splash_skip_label
+
+    issues: list[str] = []
+    # 只在**启动后的前 2 个动作步骤**里认「首启弹窗确认」：再往后可能是流程里真正的确认
+    # （删除/提交/授权），改成可选会削弱用例。
+    startup_budget = 2
+    for step in raw_case.get("steps", []):
+        if str(step.get("action") or "").strip().lower() != "tap":
+            continue
+        if startup_budget <= 0:
+            continue
+        startup_budget -= 1
+        target = step.get("target") or {}
+        value = str(target.get("value") or "").strip()
+        if not value:
+            continue
+        splash = is_splash_skip_label(value)
+        # res-id 形态的「弹窗确认」：R19 的词表只认文案（「同意」），认不出 `tv_dialog_confirm`
+        # 这类；实测 tx-news 4 条用例的第 3 步都栽在这里（隐私弹窗首次同意后再不出现）。
+        dialog = (bool(_DIALOG_CONFIRM_RE.search(value))
+                  and str(target.get("strategy") or "").strip().lower() in ("res-id", "id"))
+        if not (splash or dialog):
+            continue
+        current = str(step.get("onFailure") or step.get("on_failure") or "").strip().lower()
+        if current == "continue":
+            continue
+        step["onFailure"] = "continue"
+        what = "开屏广告" if splash else "首启弹窗（隐私/引导）"
+        issues.append(fmt_issue(
+            "R22", f"步骤 {step.get('id') or '?'}：点击「{value}」是{what}的一次性动作——"
+                   "引擎在 launch 后已统一清理启动噪声，且这类弹窗首次同意后再不出现 ⇒ "
+                   "重跑时该目标必然不存在；已自动改为 onFailure=continue（目标不在就跳过）"))
     return issues
 
 
@@ -259,6 +338,11 @@ def ensure_launch(raw_case: dict) -> list[str]:
     if not isinstance(steps, list) or not steps:
         return []
     if any(str(s.get("action") or "") == "launch" for s in steps if isinstance(s, dict)):
+        return []
+    # **纯 API 用例不补**（2026-10-23）：补 launch 的目的是把设备带到确定起点，
+    # 而纯接口用例根本不碰设备（`mat run` 对它们跳过设备连接）。给它们塞一个 launch
+    # 会让"离线可跑"变成"必须有设备"——实测直接把 `test_cmd_run_pure_api_case_needs_no_device` 打红。
+    if all(str(s.get("action") or "") == "api" for s in steps if isinstance(s, dict)):
         return []
     package = str((raw_case.get("target") or {}).get("package") or "").strip()
     if not package:
@@ -344,6 +428,25 @@ def _start_state_issues(steps: list[dict], preconditions: list[str]) -> list[str
     return issues
 
 
+def _action_labels(step: dict) -> set[str]:
+    """本步动作**指向的那几个标识**：能点到它，就说明它在。
+
+    `params.text` 必须算进去 —— 容器 + 文案的组合定位（`res-id=channelbar_text` +
+    `params.text=要闻`）在现代 App 里是常态，只看 `target.value` 会把这种写法漏掉。
+    """
+    labels: set[str] = set()
+    target = step.get("target")
+    if isinstance(target, dict) and target.get("value"):
+        labels.add(str(target["value"]).strip())
+    params = step.get("params")
+    if isinstance(params, dict):
+        for key in ("text", "description", "label", "contentDescription"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                labels.add(value.strip())
+    return {v for v in labels if v}
+
+
 def quality_issues(raw_case: dict, preconditions: list[str] | None = None) -> list[str]:
     """**大概率在运行期必失败**的用例缺陷。只报 issue，不自动改。
 
@@ -375,30 +478,67 @@ def quality_issues(raw_case: dict, preconditions: list[str] | None = None) -> li
             # A2：断言与导航耦合 —— ⚠️ 对**所有策略**成立（旧版只看 text，
             #     于是 `tap(res-id)` + `assert exists(同一 res-id)` 漏网）
             if step.get("action") in NAV_ACTIONS and value:
+                labels = _action_labels(step)
                 for assertion in step.get("assertions") or []:
                     at = assertion.get("target") if isinstance(assertion, dict) else None
+                    atype = str(assertion.get("type") or "") if isinstance(assertion, dict) else ""
+                    # 状态类断言**豁免**（`tap 我的` + `selected 我的` 是推荐写法：
+                    # tab 一直在，但选中态会变 ⇒ 有区分度）。不加这条，R2 会把
+                    # "最该这么写"的断言判成必失败 —— 实测语料里最好的一条就是它。
+                    state_assertion = atype in STATE_ASSERTION_TYPES
                     # `not-exists` 是**正确**写法（"点跳过 → 跳过按钮应当消失"），不报。
-                    if (isinstance(at, dict) and at.get("value") == value
+                    if (not state_assertion and isinstance(at, dict) and at.get("value") == value
                             and at.get("strategy") == strategy
                             and assertion.get("type") != "not-exists"):
                         issues.append(fmt_issue(
                             "R2",
                             f"断言与导航耦合：本步 `{step.get('action')}({value})` 之后又断言该控件存在"
-                            " —— 点完页面通常已经变了，入口控件不在 ⇒ 断言必失败；"
-                            "建议改断「到了哪一页」"))
+                            " —— 两种结局都不好：入口控件**不在**了 ⇒ 断言必失败；"
+                            "还在（tab/底栏这类）⇒ 断言恒真，页面没切也照样绿。"
+                            "建议改断「到了哪一页」的独有控件，或该控件的**状态**（`selected`）"))
+                        continue
+                    # A8/R23：**语义同一** —— 断言指向的控件就是本步点/长按的那个。
+                    # 与 R2 的区别：R2 是"点完它就不在了 ⇒ 必失败"；R23 是"它一定还在
+                    # （能点到就说明它在）⇒ 断言必然通过，等于没断"。实测（2026-10-22
+                    # 假绿复核）：tx-news 4 条频道切换用例全是这个形态 —— 点
+                    # `res-id=channelbar_text`（7 个 tab 共用，实际点中的是「7x24」），
+                    # 断言 `exists text=要闻`，页面压根没切也照样绿。
+                    av = str(at.get("value") or "").strip() if isinstance(at, dict) else ""
+                    if (av and av in labels and not state_assertion
+                            and assertion.get("type") not in ("not-exists", "notExists")):
+                        issues.append(fmt_issue(
+                            "R23",
+                            f"断言与动作指向**同一个控件**（`{av}`）：本步 `{step.get('action')}` "
+                            "刚点过它，断言它「存在」必然通过 —— App 行为错了也照样绿。"
+                            "建议改断**状态**（`selected`/`enabled`）或**到了哪一页**"
+                            "（结果页的业务控件）"))
 
     issues += _start_state_issues(steps, pre)
+    # R12：整条用例**没有任何断言** —— 它跑绿只证明"步骤没抛异常"，不证明任何业务结果。
+    # 这条原先只写在导入路径（`manual_import`）里，生成路径没有 ⇒ 实测漏掉过
+    # `gen-225111`（某生活服务 App「启动应用并进入个人中心」，2 步 0 断言，真机必绿）。
+    if steps and not any(step.get("assertions") for step in steps):
+        issues.append(fmt_issue(
+            "R12",
+            "整条用例**没有任何断言**：跑绿只能证明「步骤没报错」，不证明任何业务结果"
+            "（App 坏了它照样绿）。至少给最后一步加一条可判定的断言"))
     return issues
 
 
 def review(raw_case: dict, preconditions: list[str] | None = None,
-           expand: Callable[[dict], list[str]] | None = None) -> list[str]:
-    """**一站式**：保证起始状态 → （可选）展开前置条件 → 消毒 → 检查。
+           expand: Callable[[dict], list[str]] | None = None,
+           rewrite: Callable[[dict], list[str]] | None = None) -> list[str]:
+    """**一站式**：保证起始状态 → （可选）展开前置条件 → 消毒 → （可选）要图谱的改写 → 检查。
 
     ⚠️ **顺序是刻意的，别调换**：
       ① `ensure_launch` 先补起点 —— 展开出来的导航必须从某个**确定的地方**出发；
       ② `expand` 再插导航步骤（可选，只有导入路径需要）；
       ③ 消毒 / 检查**最后** —— **展开出来的步骤也要过闸门**。
+      ④ `rewrite`（可选）夹在消毒与检查**之间** —— 它要图谱（`case_audit`），
+         改的是"断言指向哪个控件"，所以必须跑在 `sanitize_assertions`（补定位）**之后**、
+         `quality_issues`（判 R2/R23）**之前**：改写掉了就不该再报那条缺陷，
+         否则一条用例会同时背"已修好"的改动和"未修好"的 issue（同族 C17：消毒与报 issue
+         是两条通路，但**缺陷被处置后不该继续报**）。
     第 ③ 点最容易漏：如果展开发生在闸门之后，插进去的步骤就**没人检查**
     （而它是 LLM 产出，一样会幻觉、一样会写出内容快照或不可见字符）。
 
@@ -410,6 +550,9 @@ def review(raw_case: dict, preconditions: list[str] | None = None,
     if expand is not None:
         issues += expand(raw_case)
     issues += sanitize_targets(raw_case)
+    issues += sanitize_splash_steps(raw_case)   # 依赖上一步：文案先剥掉状态后缀才能全等判「跳过」
     issues += sanitize_assertions(raw_case)
+    if rewrite is not None:
+        issues += rewrite(raw_case)
     issues += quality_issues(raw_case, preconditions)
     return issues

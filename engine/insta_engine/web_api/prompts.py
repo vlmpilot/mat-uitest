@@ -15,6 +15,7 @@ server 模式下 prompt 由轻云下发，本地选择**不参与生效**——�
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 
 from .. import promptstore
@@ -22,8 +23,9 @@ from .. import promptstore
 #: 控制台暴露的槽位（其余 NAMES 任务走同一套解析，将来要放出来只需加一行）
 SLOTS: tuple[tuple[str, str], ...] = (("gen", "用例生成"), ("convert", "用例转换"))
 
-#: 保存文件的后缀白名单（解析 glob 是 `*.prompt*`，这里再收紧一步）
-_SUFFIXES = (".prompt", ".prompt.example")
+#: 保存文件的后缀白名单（解析 glob 是 `*.prompt*`，这里再收紧一步；
+#: `.append.md` 是追加段（promptstore.read_append），不参与候选 glob，天然不出现在下拉里）
+_SUFFIXES = (".prompt", ".prompt.example", ".append.md")
 
 MAX_PROMPT_BYTES = 512 * 1024  # 单个 prompt 文件上限（正常模板 ~10KB，留足余量防误传大文件）
 
@@ -64,6 +66,10 @@ def _slot(name: str, root: Path) -> dict:
             "size": active.stat().st_size,
         },
         "candidates": candidates,
+        # 2026-10-25：工作区模板副本落后于包内新版（模板冻结检测）+ 追加段是否已配置
+        "stale": promptstore.staleness(name, ws),
+        "append_file": f"{name}{promptstore.APPEND_SUFFIX}",
+        "has_append": promptstore.read_append(name, ws) is not None,
     }
 
 
@@ -90,6 +96,28 @@ def api_prompts_select(root: Path, body: dict) -> tuple[int, dict]:
         return 404, {"error": f"工作区 prompts/ 里没有 {filename}"}
     promptstore.write_choice(root / "prompts", name, filename)
     return 200, {"ok": True, "slot": _slot(name, root)}
+
+
+def api_prompts_upgrade(root: Path, body: dict) -> tuple[int, dict]:
+    """POST /api/prompts/upgrade：{name}——把过期的工作区模板副本改名备份，解析回落包内新版。
+
+    「模板冻结」的解法（2026-10-25）：seed 复制的 `<name>.prompt` 永远压过包内新版；
+    升级 = 改名为 `<name>.prompt.bak-<时间戳>`（不删——副本可能有用户手改，可回退），
+    resolve 自动落到包内模板。追加段（`<name>.append.md`）是独立文件，天然不受影响。
+    choice 指名被备份文件时同时清掉该 choice（否则选择指向已不存在的文件）。
+    """
+    name = str((body or {}).get("name") or "")
+    if name not in dict(SLOTS):
+        return 400, {"error": f"不支持的槽位：{name or '(空)'}"}
+    info = promptstore.staleness(name, root / "prompts")
+    if info is None:
+        return 400, {"error": "该槽位当前没有可升级的过期副本（未过期 / 无工作区副本 / 显式选择的文件）"}
+    src = root / "prompts" / info["file"]
+    bak = src.with_name(f"{src.name}.bak-{int(time.time())}")
+    src.rename(bak)
+    if str(promptstore.read_choice(root / "prompts").get(name) or "") == info["file"]:
+        promptstore.write_choice(root / "prompts", name, None)
+    return 200, {"ok": True, "backup": bak.name, "slot": _slot(name, root)}
 
 
 def api_prompts_save(root: Path, body: dict) -> tuple[int, dict]:

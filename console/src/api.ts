@@ -1,11 +1,15 @@
-export type Device = { serial: string; state: string; model?: string; os?: string };
+// platform 缺省 android（历史字段无它）；iOS USB 真机由 /api/state 下发
+// （serial=udid，state="device"），前端按它分流到 WDA 真机链路（2026-10-19）。
+export type Device = { serial: string; state: string; model?: string; os?: string;
+  platform?: "android" | "ios" };
 export type RunInfo = { dir: string; case_id?: string; case_name?: string; package?: string;
   status?: string; rate?: number; finished_at?: string; operator?: string;
+  platform?: "android" | "ios";
   failed_categories?: Record<string, number>;
   batch?: { id: string; suite: string; index: number; total: number };
   diagnosed?: boolean; calibrated?: boolean; human_marked?: boolean };
 export type JobInfo = { id: string; kind: string; status: string; started_at: string;
-  summary?: string | null; link?: string | null; seq: number;
+  summary?: string | null; error?: string | null; link?: string | null; seq: number;
   serial?: string | null; platform?: string; operator?: string };
 export type JobEvent = { seq: number; step_id: string; status: string; ts: string;
   duration_ms?: number | null; detail?: string; screenshot?: string | null };
@@ -17,11 +21,17 @@ export type StateResp = {
     calibrated?: boolean; finished_at?: string }[];
   indexes: { package: string; pages: number; generated_at?: string }[];
   usage: { gen_count: number; gen_limit: number | null; vision_count: number; vision_limit: number | null };
-  // 订阅页「套餐」行展示到期日：plan=pro 时有 expires_at（Unix 秒）；free/过期时为 null。
+  /** AI 接入方式：server=官方代理（体验模式）/ local=自带 Key（标准模式） */
+  ai_mode?: "server" | "local";
+  // 使用方式页「套餐」行展示到期日：plan=pro 时有 expires_at（Unix 秒）；free/过期时为 null。
   // 激活/续期（含时长卡核销换码）写盘 license.json 后，重拉 state 自然拿到新日期。
   license?: { plan: string; expires_at: number | null };
   code_stale: { stale: boolean; file?: string; behind_seconds?: number }; gen_ready: boolean;
   devices: Device[]; console?: "pro" | "legacy"; prompt_mode?: "server" | "local";
+  // iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 下隐藏环境卡、iOS 运行平台与模拟器入口
+  ios_supported?: boolean;
+  // 遍历探索建议（readiness.EXPLORE_TIP 单一来源下发；2026-10-26 去术语留判据）
+  explore_tip?: string;
 };
 
 // 触发者身份（团队协作 P1，发起人 2026-10-12）：所有 POST 自动携带 operator——
@@ -58,6 +68,14 @@ export const postJson = <T,>(url: string, body: Record<string, unknown>): Promis
   j<T>(url, { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });
 
+// 按应用的测试说明（app_notes/<包名>.md，黑/白名单等负责人补充）——
+// 生成与润色时后端自动注入 prompt；此处只是控制台的编辑入口
+export const getAppNote = (pkg: string) =>
+  j<{ package: string; notes: string }>(`/api/app/note?package=${encodeURIComponent(pkg)}`);
+export const saveAppNote = (pkg: string, notes: string) =>
+  j<{ ok: boolean }>("/api/app/note", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ package: pkg, notes }) });
+
 // 口令校验（--share）：成功后服务端种 cookie，之后所有请求自动携带
 export const submitAuthKey = (key: string) =>
   j<{ ok: boolean }>("/api/auth", { method: "POST",
@@ -69,16 +87,19 @@ export type AuditItem = { ts: string; operator: string; action: string;
 export const getAudit = (limit = 50) =>
   j<{ items: AuditItem[]; total: number }>(`/api/audit?limit=${limit}`);
 
-// 团队成员（商业化规则：**免费基线 5 人**；更高上限由**服务端按主机发配额**，与激活码无关）：
-// 登记/名单/移除。`limit` 由后端按「基线 + 服务端配额」算好，前端只展示。
+// 团队成员（2026-10-25 起：共享名额**只随团队授权提供**——标准/体验授权面向单人使用，
+// `--share` 下上限恒 1）：`shared` 由后端按实际监听地址判断，前端据此决定提示与新增入口；
+// `team_authorized` 区分「共享了但没授权」（提示去拿团队授权）与「团队授权」（正常成员管理）
+// ——不能拿 limit 推授权状态：团队合同席位可以是 1。
 export type Seat = { name: string; first_seen: string; last_seen: string };
-export const getSeats = () => j<{ seats: Seat[]; limit: number }>("/api/seats");
+export type SeatsResp = { seats: Seat[]; limit: number; shared?: boolean; team_authorized?: boolean };
+export const getSeats = () => j<SeatsResp>("/api/seats");
 export const seatCheck = (name: string) =>
-  j<{ ok: boolean; returning: boolean; seats: Seat[]; limit: number }>(
+  j<{ ok: boolean; returning: boolean } & SeatsResp>(
     "/api/seats/check", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }) });
 export const seatRemove = (name: string) =>
-  j<{ ok: boolean; seats: Seat[]; limit: number }>("/api/seats/remove",
+  j<{ ok: boolean } & SeatsResp>("/api/seats/remove",
     { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }) });
 
@@ -99,6 +120,10 @@ export const getVersionCheck = () => j<VersionCheck>("/api/version/check");
 export const getAppLabels = (packages: string[]) =>
   j<{ labels: Record<string, string> }>(
     `/api/app/labels?packages=${encodeURIComponent(packages.join(","))}`);
+// 已安装第三方 App 包名（遍历探索输入候选；`pm list packages -3`，系统包不混入）
+export const listInstalledApps = (serial?: string | null) =>
+  j<{ serial: string; packages: string[] }>(
+    `/api/apps/installed${serial ? `?serial=${encodeURIComponent(serial)}` : ""}`);
 export const getCase = (name: string) => j<Record<string, unknown>>(`/api/case?name=${encodeURIComponent(name)}`);
 // 保存返回启发式警告（res-id 不在控件清单/params 缺失等；不阻断落盘，编辑器展示）
 export const saveCase = (name: string, content: unknown) =>
@@ -110,6 +135,7 @@ export const getControls = (pkg: string) =>
   j<{ package: string; count: number; controls: ControlItem[] }>(
     `/api/controls?package=${encodeURIComponent(pkg)}`);
 export const runCase = (payload: { case?: string; app?: string; cases?: string[];
+  rerun_dir?: string;
   serial?: string | null; platform?: string; record?: boolean; reset?: "off" | "cold" }) =>
   j<{ job_id: string }>("/api/run", { method: "POST",
     headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -165,9 +191,12 @@ export const doctorFix = (action: string) =>
 // server 模式下选择不参与生效（prompt 由服务端下发），前端提示并禁用。
 export type PromptCandidate = { file: string; source: "workspace" | "package";
   size: number; mtime: number; active: boolean };
+// stale:工作区模板副本落后于包内新版(模板冻结);append_file/has_append:追加段
 export type PromptSlot = { name: string; title: string; selected: string | null;
   active: { file: string; source: string; mtime: number; size: number } | null;
-  candidates: PromptCandidate[] };
+  candidates: PromptCandidate[];
+  stale?: { file: string; package_mtime: number } | null;
+  append_file: string; has_append: boolean };
 export type PromptsResp = { mode: string; server: boolean; slots: PromptSlot[] };
 export const getPrompts = () => j<PromptsResp>("/api/prompts");
 export const getPromptContent = (file: string) =>
@@ -177,6 +206,9 @@ export const selectPrompt = (name: string, file: string | null) =>
   postJson<{ ok: boolean; slot: PromptSlot }>("/api/prompts/select", { name, file });
 export const savePrompt = (filename: string, content: string) =>
   postJson<{ ok: boolean; existed: boolean }>("/api/prompts/save", { filename, content });
+// 过期模板副本升级:改名备份回落包内新版(追加段是独立文件不受影响)
+export const upgradePrompt = (name: string) =>
+  postJson<{ ok: boolean; backup: string; slot: PromptSlot }>("/api/prompts/upgrade", { name });
 export type KeyAction = "home" | "back" | "recents" | "settings";
 export const deviceKey = (payload: { action: KeyAction; serial?: string | null; platform?: string }) =>
   j<{ ok: boolean; action: KeyAction }>("/api/device/key", { method: "POST",
@@ -199,13 +231,21 @@ export type ReviewResp = {
   manual: number;                     // 其中人工改过的页数
   review_path: string;
 };
+// 图谱准备度（2026-10-17）：只读状态 + 一条建议，**不是闸门**（服务端 readiness 模块有完整理由）。
+export type ReadinessResp = {
+  package: string; has_index: boolean; pages: number; reviewed: number;
+  unreviewed: number; text: string; hint: string | null; explore_tip: string;
+};
+export const getReadiness = (pkg: string) =>
+  j<ReadinessResp>(`/api/readiness?package=${encodeURIComponent(pkg)}`);
 export const getReview = (pkg: string) =>
   j<ReviewResp>(`/api/review?package=${encodeURIComponent(pkg)}`);
 export const saveReview = (
-    pkg: string, corrections: Record<string, string>,
-    summaryCorrections?: Record<string, string>) =>
+  pkg: string, corrections: Record<string, string>,
+  summaryCorrections?: Record<string, string>) =>
   j<{ ok: boolean; applied: number; unchanged: number;
-      summary_applied?: number; summary_unchanged?: number; missing: string[] }>(
+      summary_applied?: number; summary_unchanged?: number; promoted?: number;
+      missing: string[] }>(
     "/api/review", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ package: pkg, corrections,
@@ -330,3 +370,8 @@ export const deleteSuite = (payload: { file: string }) =>
 export const deleteCase = (payload: { name: string }) =>
   j<{ ok: boolean; deleted: string }>("/api/case/delete", { method: "POST",
     headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+// 重命名（目录功能的轻量替代）：套件引用自动跟随（后端同步替换）
+export const renameCase = (payload: { from: string; to: string }) =>
+  j<{ ok: boolean; file: string; suites_updated: string[] }>("/api/case/rename",
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload) });

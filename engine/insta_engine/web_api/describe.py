@@ -1,9 +1,10 @@
-"""describe 域：/api/describe（AI 给图谱页面补标题/描述，1 次调用 ≤limit 页缺省 50，计 1 次生成额度）。"""
+"""describe 域：/api/describe（AI 给图谱页面补标题/描述，1 次调用 ≤limit 页缺省 50；额度由服务端计量）。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from .. import promptstore
 from ..ai_client import GenClient
 from ..quota import UsageStore
 from .runtime import _require_fresh_code, operator_of, start_job
@@ -36,12 +37,21 @@ def api_describe(root: Path, body: dict) -> tuple[int, dict]:
     """POST /api/describe：与 CLI `mat describe` 同语义。
 
     - 只描述 `summary_source != "ai"` 且 `title_source != "manual"` 的页面；
-    - 额度预检不核销（T53b）：失败不扣费；
+    - **本地不预检额度**（P0-2 起生成不再本地拦截）：成功落盘后才 `consume()` 计数，
+      失败不扣；真正的额度上限由服务端计量；
     - 无图谱在端点内 400 快速失败（不开 job）；单次 AI 调用不可中途取消。
     """
     package = str(body.get("package", "")).strip()
     if not package:
         return 400, {"error": "需要 package"}
+    # 与 api_explore 同闸口（A3）：包名会拼进 artifacts/page_index/<package>.json
+    # 路径并写回（save_index），形状非法（../、绝对路径、盘符）在边界拒绝。
+    from ..pkgname import safe_package_name
+
+    try:
+        safe_package_name(package)
+    except ValueError as exc:
+        return 400, {"error": f"包名不合法: {exc}"}
     limit = min(max(int(body.get("limit", 50)), 1), 200)
     refresh = bool(body.get("refresh"))
 
@@ -59,8 +69,9 @@ def api_describe(root: Path, body: dict) -> tuple[int, dict]:
 
         _require_fresh_code()
         usage = UsageStore()
-        usage.ensure_capacity()  # 只预检不核销（T53b）：模型失败不该扣额度
-        emit("describe", "running", f"描述 {len(targets)} 个页面（1 次 AI 调用，计 1 次生成额度）")
+        # P0-2：本地不再预检（ensure_capacity 已退化为纯快照、永不抛）——
+        # 官方代理由服务端 429 计量；这里的 usage 仅用于成功后本地计数展示
+        emit("describe", "running", f"描述 {len(targets)} 个页面（1 次 AI 调用，额度由服务端计量）")
         described = GenClient.from_env().describe_pages(payload)
         snapshot = usage.consume()  # 成功落盘前才核销
 
@@ -77,8 +88,12 @@ def api_describe(root: Path, body: dict) -> tuple[int, dict]:
                         summary=info.get("summary", ""), summary_source="ai")
             updated += 1
         save_index(index_path, index)
-        limit_text = snapshot["gen_limit"] if snapshot["gen_limit"] is not None else "不限"
-        return (f"已补 {updated}/{len(targets)} 个页面标题"
-                f"（本月生成用量 {snapshot['gen_count']}/{limit_text}）"), None
+        if promptstore.is_server():
+            limit_text = snapshot["gen_limit"] if snapshot["gen_limit"] is not None else "不限"
+            usage_tail = f"（本月生成用量 {snapshot['gen_count']}/{limit_text}）"
+        else:
+            # 自带 Key：token 由用户自己的服务商计费，不存在"平台额度"
+            usage_tail = "（自带 Key，不占平台额度）"
+        return (f"已补 {updated}/{len(targets)} 个页面标题{usage_tail}"), None
 
     return 200, {"job_id": start_job("describe", job, meta={"operator": operator_of(body)})}

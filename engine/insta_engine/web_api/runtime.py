@@ -14,7 +14,18 @@ from ..driver_factory import connect_driver
 
 WEB_DIR = Path(__file__).parent.parent / "web"
 CONSOLE_DIST = Path(__file__).parent.parent / "console_dist"  # AntD 构建产物（存在即优先服务）
-JOB_TIMEOUT_SECONDS = 15 * 60  # 任务看门狗：无响应超时（锁屏/离线等导致的挂死）
+JOB_TIMEOUT_SECONDS = 15 * 60  # 任务看门狗：**无活动**超时（不是总时长）
+#: 超时文案按任务类型分支（2026-10-21）：此前所有任务共用「设备锁屏/离线」一句，
+#: 而导入/生成/描述根本不碰设备——纯 AI 转换被套上设备归因，用户按提示去解锁手机毫无意义。
+_TIMEOUT_HINTS = {
+    "import": "AI 转换耗时过长或上游接口超时。可减少单批条数后重试；"
+              "若反复出现请检查 .env 的 AI 配置（GEN_BASE_URL / GEN_API_KEY）",
+    "gen": "AI 生成耗时过长或上游接口超时。请检查网络与 .env 的 AI 配置后重试",
+    "describe": "AI 页面描述耗时过长或上游接口超时。可减少页数后重试",
+    "diagnose": "AI 归因耗时过长或上游接口超时。请稍后重试",
+}
+_DEVICE_TIMEOUT_HINT = ("常见原因：设备锁屏/离线或 adb 无响应。请点亮并解锁手机、确认 USB 连接后重试；"
+                        "若反复出现请重启控制台")
 
 _JOBS: dict[str, dict] = {}
 _JOB_LOCK = threading.Lock()
@@ -109,8 +120,11 @@ def device_lock(serial: str | None) -> threading.Lock:
 
 def operator_of(body: dict | None) -> str:
     """触发者身份（团队协作，发起人 2026-10-12）：前端所有 POST 自动注入 operator
-    （首次进入时填写的名字，存 localStorage）。截断 40 字符防滥用。"""
-    return str((body or {}).get("operator") or "").strip()[:40]
+    （首次进入时填写的名字，存 localStorage）。截断 40 字符防滥用。
+
+    空名兜底为「本机」（2026-10-25 方案 B）：单人模式不再要求设名，run.json/审计
+    仍记 operator 字段；共享模式（--share）下 seats.enforce 已保证走到这里的名字非空。"""
+    return str((body or {}).get("operator") or "").strip()[:40] or "本机"
 
 
 def _append_event(job_id: str, step_id: str, status: str, detail: str = "",
@@ -121,6 +135,8 @@ def _append_event(job_id: str, step_id: str, status: str, detail: str = "",
         if job is None:
             return
         job["seq"] = job.get("seq", 0) + 1
+        # 任何事件都算「任务在推进」——看门狗据此判无活动，而不是按总时长杀（2026-10-21）
+        job["last_activity_ts"] = time.time()
         events = job.setdefault("events", [])  # 容错：看门狗/测试手工造的 job 可能无 events 键
         events.append({"seq": job["seq"], "step_id": step_id, "status": status,
                        "ts": _now(), "duration_ms": duration_ms,
@@ -137,7 +153,8 @@ def start_job(kind: str, fn, meta: dict | None = None) -> str:
     cancel = threading.Event()
     with _JOB_LOCK:
         _JOBS[job_id] = {"kind": kind, "status": "running", "started_at": _now(),
-                         "started_ts": time.time(), "summary": None, "error": None, "link": None,
+                         "started_ts": time.time(), "last_activity_ts": time.time(),
+                         "summary": None, "error": None, "link": None,
                          "events": [], "seq": 0, "cancel": cancel, "meta": meta or {}}
 
     def emit(step_id: str, status: str, detail: str = "",
@@ -171,17 +188,26 @@ def start_job(kind: str, fn, meta: dict | None = None) -> str:
 
 
 def sweep_stale_jobs(timeout_seconds: int = JOB_TIMEOUT_SECONDS) -> int:
-    """看门狗：running 超时的任务标记 error（执行线程无法强杀，但 UI 立即解锁并给出指引）。"""
+    """看门狗：**无活动**超过阈值才标记 error（执行线程无法强杀，但 UI 立即解锁并给出指引）。
+
+    2026-10-21 修正：判据从 `started_ts`（总时长）改为 `last_activity_ts`（最后一次事件）。
+    旧实现会把"正常推进但整体较长"的批量转换误杀（16 条串行 >15 分钟很常见），
+    还给出设备归因——导入任务根本不碰设备。任何 emit 都会刷新活动时间。
+    """
     now = time.time()
     swept: list[str] = []
     with _JOB_LOCK:
         for job_id, job in _JOBS.items():
-            if job["status"] == "running" and now - job.get("started_ts", now) > timeout_seconds:
-                job["status"] = "error"
-                job["error"] = (f"任务超过 {timeout_seconds // 60} 分钟无响应，已标记超时——"
-                                "常见原因：设备锁屏/离线或 adb 无响应。请点亮并解锁手机、确认 USB 连接后重试；"
-                                "若反复出现请重启控制台")
-                swept.append(job_id)
+            if job["status"] != "running":
+                continue
+            last = job.get("last_activity_ts") or job.get("started_ts", now)
+            if now - last <= timeout_seconds:
+                continue
+            job["status"] = "error"
+            hint = _TIMEOUT_HINTS.get(str(job.get("kind") or ""), _DEVICE_TIMEOUT_HINT)
+            job["error"] = (f"任务超过 {max(1, int(timeout_seconds // 60))} 分钟无活动，已标记超时——"
+                            f"{hint}")
+            swept.append(job_id)
     for job_id in swept:  # 锁外追加（_append_event 自行拿锁，嵌套会死锁）
         _append_event(job_id, "job", "error", str(_JOBS.get(job_id, {}).get("error") or "")[:300])
     return len(swept)

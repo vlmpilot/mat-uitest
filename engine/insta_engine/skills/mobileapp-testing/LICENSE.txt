@@ -5,4 +5,4 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 本 skill 随 MAT 开源核心以 AGPL-3.0-or-later 分发。
 完整许可文本见 MAT 仓库根 LICENSE：
-https://github.com/vlmpilot/mat/blob/main/LICENSE
+https://github.com/vlmpilot/mat-uitest/blob/main/LICENSE

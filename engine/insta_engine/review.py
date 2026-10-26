@@ -258,6 +258,7 @@ def apply_corrections(index: dict, corrections: dict,
     """
     by_key = {str(p.get("page_key")): p for p in index.get("pages") or []}
     applied, unchanged, missing = [], [], []
+    promoted = 0
     for key, title in corrections.items():
         page = by_key.get(str(key))
         if page is None:
@@ -266,6 +267,12 @@ def apply_corrections(index: dict, corrections: dict,
         new = (title or "").strip()
         if (page.get("title") or "").strip() == new:
             unchanged.append(str(key))
+            # 值没变但来源升级：批量确认走的就是这条路——把 AI 起的标题「落章」成
+            # 人工认可（manual ⇒ describe/重建不再覆盖）。目标值为空不升级：
+            # 空标题页谈不上认可，升级了 describe 会永远不给它补名。
+            if new and page.get("title_source") != "manual":
+                page["title_source"] = "manual"
+                promoted += 1
             continue
         page["title"] = new
         page["title_source"] = "manual"      # 人工 ⇒ describe / merge 都不覆盖
@@ -282,12 +289,16 @@ def apply_corrections(index: dict, corrections: dict,
         new = (summary or "").strip()
         if (page.get("summary") or "").strip() == new:
             summary_unchanged.append(str(key))
+            if new and page.get("summary_source") != "manual":
+                page["summary_source"] = "manual"   # 同标题：批量确认落章，空值不升
+                promoted += 1
             continue
         page["summary"] = new
         page["summary_source"] = "manual"    # 人工 ⇒ describe / merge 都不覆盖
         summary_applied.append(str(key))
     return {"applied": applied, "unchanged": unchanged, "missing": missing,
-            "summary_applied": summary_applied, "summary_unchanged": summary_unchanged}
+            "summary_applied": summary_applied, "summary_unchanged": summary_unchanged,
+            "promoted": promoted}
 
 
 def save_review(pkg: str, corrections: dict, root: Path, note: str = "",

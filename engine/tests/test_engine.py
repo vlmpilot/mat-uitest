@@ -144,7 +144,7 @@ def test_suite_index_enhanced_summary(tmp_path):
     assert "失败步骤" in html and "失败原因" in html, "明细表应有失败步骤/失败原因列"
     assert "生成于" in html, "汇总条应有生成时间"
     assert "总耗时" in html, "汇总条应有总耗时"
-    assert "通过 " in html and "失败 " in html and "中止 " in html, "汇总条应有三种状态计数"
+    assert ">通过</div>" in html and ">失败</div>" in html and ">中止</div>" in html, "汇总应有三种状态计数（stat tiles）"
     assert "MAT 套件聚合报告" in html
 
 
@@ -371,7 +371,7 @@ def test_report_inlines_screenshots_and_logcat(tmp_path):
     assert expected in html
     assert "details class=\"logcat\"" in html and "FATAL EXCEPTION" in html
     # 通过率环 + 失败分类条已渲染
-    assert "conic-gradient" in html and 'class="bar"' in html
+    assert "步骤成功率" in html and "class='bar'" in html, "成功率 tiles + 失败分类条已渲染"
 
 
 # -- 事件端点与取消端点 -------------------------------------------------------
@@ -538,24 +538,35 @@ def test_explore_heuristic_prefers_labeled_over_unlabeled(tmp_path):
 # -- 单设备互斥（评审 P1-4） -------------------------------------------------------
 
 def test_same_serial_jobs_serialize():
-    """同 serial 两个任务必须串行：第二个排队等待，事件流互不污染。"""
+    """同 serial 两个任务必须串行：第二个排队等待，事件流互不污染。
+
+    2026-10-24（评估 B4）：此前「先 start A 再 start B」依赖线程调度让 A 先抢到
+    锁——B 的线程若先被调度，就变成 B 先持锁、A 排队，断言偶发红（flaky）。
+    改为**事件同步**：等 A 真正持锁后再启动 B，「A 在前」成为构造出的事实而非
+    调度运气。
+    """
+    import threading
     import time as _t
 
     from insta_engine import web_server
 
     order: list[str] = []
+    a_holds_lock = threading.Event()
 
-    def make(tag: str, dur: float):
+    def make(tag: str, dur: float, held_signal=None):
         def job(emit, cancel):
             with web_server.device_lock("serialA"):
                 order.append(tag + "-start")
+                if held_signal is not None:
+                    held_signal.set()
                 emit(tag, "running")
                 _t.sleep(dur)
                 order.append(tag + "-end")
             return "ok", None
         return job
 
-    web_server.start_job("run", make("A", 0.2))   # 只为启动 A；句柄未用到，不赋值（ruff F841）
+    web_server.start_job("run", make("A", 0.2, a_holds_lock))  # 句柄未用到，不赋值（ruff F841）
+    assert a_holds_lock.wait(timeout=3), "A 必须先真正拿到锁（测试前提，而非调度运气）"
     j2 = web_server.start_job("run", make("B", 0.05))
     deadline = _t.time() + 3
     while _t.time() < deadline and web_server._JOBS[j2]["status"] == "running":
@@ -709,6 +720,68 @@ def test_graph_context_prefers_nav_pages_and_keeps_unknown_depth():
     assert "点[购物车]" in text and "点[订单]" in text, "导航页必须入选"
     assert "L?" in text, "depth 缺失应标 L?，不能静默丢弃"
     assert text.count("平铺页") == 10, "导航页占 2 槽后平铺页补位 10 个"
+
+
+# -- 页面用途（summary）进上下文（2026-10-16） --------------------------------------
+# 评测结论（title-only 注入）：等于"只告诉 AI 这页叫什么，不说它是干什么的"，
+# 注入太弱时 A/B 无论正负都不可解释。这里锁死 summary 的注入与降级行为。
+
+def test_graph_context_includes_page_summary():
+    """每页带上用途（summary）——它是 describe 花额度换来的业务理解。"""
+    from insta_engine.page_index import graph_context
+
+    pages = [
+        {"page_key": "k1", "depth": 1, "node_count": 27, "identities": ["搜索"],
+         "title": "搜索页", "summary": "输入关键词搜索内容，查看历史记录和热搜词"},
+    ]
+    text = graph_context(pages, max_pages=12)
+    assert "搜索页(27 控件)：输入关键词搜索内容，查看历史记录和热搜词" in text, text
+
+
+def test_graph_context_without_summary_matches_old_format():
+    """未跑 describe（无 summary）⇒ 输出与旧版**逐字一致**，不改动未描述图谱的行为。"""
+    from insta_engine.page_index import graph_context
+
+    pages = [{"page_key": "k1", "depth": 0, "node_count": 12,
+              "identities": ["首页"], "title": "首页"}]
+    assert graph_context(pages) == "【页面结构】L0 首页(12 控件)", graph_context(pages)
+    # 空白 summary（describe 写了空串）也不能留下一个孤零零的冒号
+    pages[0]["summary"] = "   "
+    assert graph_context(pages) == "【页面结构】L0 首页(12 控件)"
+
+
+def test_graph_context_summary_can_be_switched_off():
+    """`with_summary=False` ⇒ **只给页名**（= 2026-10-16 之前的行为）。
+
+    这个参数只服务**三臂消融**：不把"页名"这一层单独跑一臂，就跑不出"效果来自
+    summary 而不是来自页名"的结论（评测总结过的结论缺口）。
+    """
+    from insta_engine.page_index import graph_context
+
+    pages = [{"page_key": "k1", "depth": 1, "node_count": 27, "identities": ["搜索"],
+              "title": "搜索页", "summary": "输入关键词搜索内容，查看历史记录和热搜词"}]
+    with_s = graph_context(pages, with_summary=True)
+    without = graph_context(pages, with_summary=False)
+    assert "输入关键词" in with_s and "输入关键词" not in without, (with_s, without)
+    assert without == "【页面结构】L1 搜索页(27 控件)", without
+
+
+def test_graph_context_normalizes_and_truncates_summary():
+    """summary 是模型生成的自由文本：换行/连续空格要压成单行，超长要截断。
+
+    不归一时，一条记录会被劈成两行、看起来像两个页面（实测真实图谱里出现过换行）。
+    """
+    from insta_engine.page_index import GRAPH_SUMMARY_CHARS, graph_context
+
+    pages = [{"page_key": "k1", "depth": 1, "node_count": 5, "identities": ["详情"],
+              "title": "详情页", "summary": "查看商品详情\n\n  支持加入购物车"}]
+    text = graph_context(pages)
+    assert "\n" not in text, "换行没被归一"
+    assert "查看商品详情 支持加入购物车" in text, text
+    long = [{"page_key": "k2", "depth": 1, "node_count": 5, "identities": ["长"],
+             "title": "长页", "summary": "长" * 80}]
+    out = graph_context(long)
+    assert f"长页(5 控件)：{'长' * (GRAPH_SUMMARY_CHARS - 1)}…" in out, out
 
 
 # -- T55 P0：mat console --share 局域网分享 ----------------------------------------

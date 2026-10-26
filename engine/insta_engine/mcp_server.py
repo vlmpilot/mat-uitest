@@ -43,6 +43,10 @@ def resolve_workspace(explicit: str | None) -> Path:
         return cwd
     root = state_home() / "workspace"
     root.mkdir(parents=True, exist_ok=True)
+    # 兜底工作区自动铺到开箱即用（示例用例 + prompt 模板，幂等）——与 mat console 同语义。
+    from .state import ensure_default_workspace
+
+    ensure_default_workspace(root)
     return root
 
 
@@ -101,7 +105,8 @@ def build_server(root: Path):
         """在设备上运行一个测试用例（后台任务；每步截图证据、失败自动分类）。
 
         返回 job_id，用 mat_job 查事件流与报告路径。传 serial 指定设备，缺省取唯一在线设备。
-        platform="android"（默认）或 "ios"（模拟器 MVP，需 WDA 在 localhost:8100）。
+        platform="android"（默认）或 "ios"——iOS：USB 真机传 udid（`mat ios-setup` 可查看），
+        模拟器不传 serial（WDA 常驻 localhost:8100）。
         """
         code, obj = ws.api_run(root, {"case": case, "serial": serial, "platform": platform})
         return obj if code == 200 else {"error": obj}
@@ -111,7 +116,7 @@ def build_server(root: Path):
                     platform: str = "android") -> dict:
         """批量运行某被测应用下的全部用例（回归套件）。返回 job_id。
 
-        platform="android"（默认）或 "ios"（模拟器 MVP）。
+        platform="android"（默认）或 "ios"（USB 真机传 udid，模拟器不传 serial）。
         """
         code, obj = ws.api_run(root, {"app": app, "serial": serial, "platform": platform})
         return obj if code == 200 else {"error": obj}

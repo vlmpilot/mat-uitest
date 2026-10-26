@@ -62,13 +62,16 @@ export default function WorkspaceSwitcher({ state, open, onClose }: {
             <Space direction="vertical" size={2} style={{ width: "100%" }}>
               {dirs.map((d) => (
                 <Button key={d} type="text" size="small" style={{ display: "block", textAlign: "left", width: "100%" }}
-                  onClick={() => browse(`${browsePath.replace(\/$/, "")}/${d}`)}>
+                  onClick={() => browse(`${browsePath.replace(/\/$/, "")}/${d}`)}>
                   📁 {d}
                 </Button>))}
               {dirs.length === 0 && <span style={{ color: "#8a919f", fontSize: 12 }}>（无子目录）</span>}
             </Space>
           </div>
-          {selected && (
+          {/* 选定入口（2026-10-22 修）：原条件 selected && 是鸡生蛋——selected 只由输入框
+              赋值，纯浏览目录时恒空，链接永不出现、确认按钮永远灰着。改为有浏览路径且
+              尚未选中时显示。 */}
+          {browsePath && browsePath !== selected && (
             <Button size="small" type="link" style={{ padding: 0 }}
               onClick={() => setSelected(browsePath)}>选定当前浏览目录：{browsePath}</Button>
           )}

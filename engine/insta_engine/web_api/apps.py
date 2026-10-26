@@ -2,11 +2,14 @@
 
 - Android：`adb install -r -t`（覆盖安装保留数据；-t 允许测试包）；卸载 `adb uninstall`。
 - iOS 模拟器：`xcrun simctl install booted <path.app>`；卸载 `simctl uninstall`。
-- iOS 真机：签名/开发者模式 ⇒ P2，安装/卸载均不可用（诚实拒绝）。
+- iOS 真机（2026-10-19 起可用）：`xcrun devicectl device install app`（**只接受 `.app`
+  目录**，`.ipa` 需先解压——`devicectl` 与 `simctl` 都不认 .ipa）；卸载走
+  `devicectl device uninstall app`。真机安装仍要求 App 已签名 + 设备开启开发者模式，
+  失败原因原样回显末行（`ios_device.install_app` 的既有契约）。
 - 安装成功可选回显 versionName + APK sha256 指纹（T76 准入证据链）——需要调用方
-  提供包名（APK 路径里没有包名，不做 aapt 解析）。
+  提供包名（APK 路径里没有包名，不做 aapt 解析）。iOS 暂无指纹来源。
 
-⚠️ 卸载是**破坏性设备操作**：`_local_only` 门控——`--share` 局域网暴露时禁用。
+⚠️ 安装/卸载都是**会改写设备状态的操作**：`_local_only` 门控——`--share` 局域网暴露时禁用。
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from pathlib import Path
 
 from ..device import list_adb_devices
 from ..driver import app_apk_sha256, app_version
+from ..pkgname import is_safe_package
 from .runtime import _require_fresh_code, get_driver, operator_of, start_job
 from .workspace import _local_only
 
@@ -46,21 +50,34 @@ def _fingerprint(drv, package: str, platform: str) -> dict:
         return {"version": "", "sha256": ""}
 
 
-def api_apps_install(root: Path, body: dict) -> tuple[int, dict]:
-    """POST /api/apps/install：安装测试包（job 化——大 APK 安装可达 1 分钟）。"""
+def api_apps_install(root: Path, host: str, body: dict) -> tuple[int, dict]:
+    """POST /api/apps/install：安装测试包（job 化——大 APK 安装可达 1 分钟）。
+
+    ⚠️ 与卸载同口径（2026-10-20 评审 P1-2）：安装也是会改写设备状态的本机操作，
+    `_local_only` 门控——`--share` 局域网来源禁用；`package`（可选，用于指纹回显）
+    会拼进 `dumpsys package <pkg>` 设备 shell，过 `is_safe_package` 闸口。"""
+    gate = _local_only(host)
+    if gate:
+        return gate
     serial = body.get("serial") or None
     platform = str(body.get("platform") or "android")
     path = str(body.get("path", "")).strip()
     package = str(body.get("package", "")).strip() or None
-    if platform == "ios" and serial and serial != "simulator":
-        return 400, {"error": "iOS 真机安装需要签名与开发者模式——属 P2（当前仅模拟器支持）"}
+    if package and not is_safe_package(package):
+        return 400, {"error": "包名不合法（应为 com.example.app 形式，且不含路径分隔符）"}
+    real_ios = platform == "ios" and bool(serial) and serial != "simulator"
     p = Path(path).expanduser()
     if not p.exists():
         return 404, {"error": f"文件不存在: {p}"}
     if platform == "android" and p.suffix.lower() != ".apk":
         return 400, {"error": f"Android 安装包须为 .apk（收到 {p.suffix or '无后缀'}）"}
-    if platform == "ios" and p.suffix.lower() not in (".app", ".ipa"):
-        return 400, {"error": f"iOS 模拟器安装须为 .app 目录（收到 {p.suffix or '无后缀'}）"}
+    if platform == "ios" and p.suffix.lower() != ".app":
+        # .ipa 是「zip 包了一层 .app」——simctl 与 devicectl 都不接受，必须先解压；
+        # 此前放行 .ipa 只会在 job 里失败（验收判据前移，报错说清怎么办）。
+        extra = "（.ipa 需先解压出 .app）" if p.suffix.lower() == ".ipa" else ""
+        return 400, {"error": f"iOS 安装须为 .app 目录{extra}（收到 {p.suffix or '无后缀'}）"}
+    if real_ios and not p.is_dir():
+        return 400, {"error": f"iOS 真机安装须为 .app 目录（收到文件 {p.name}）"}
 
     def job(emit, cancel):
         _require_fresh_code()
@@ -69,6 +86,13 @@ def api_apps_install(root: Path, body: dict) -> tuple[int, dict]:
             rc, out = _run(_adb(serial, "install", "-r", "-t", str(p)), timeout=600)
             if rc != 0 or "Success" not in out:
                 raise RuntimeError(f"安装失败: {out[-300:]}")
+        elif real_ios:
+            from ..ios_device import install_app as ios_install
+
+            emit("install", "running", f"devicectl install {p.name} → {serial}")
+            ok, why = ios_install(serial, p, timeout=600)
+            if not ok:
+                raise RuntimeError(f"安装失败: {why}")
         else:
             emit("install", "running", f"simctl install {p.name}")
             rc, out = _run(["xcrun", "simctl", "install", "booted", str(p)], timeout=300)
@@ -93,7 +117,7 @@ def api_apps_install(root: Path, body: dict) -> tuple[int, dict]:
                                                            "operator": operator_of(body)})}
 
 
-def api_app_probe(path: str) -> tuple[int, dict]:
+def api_app_probe(path: str, host: str = "127.0.0.1") -> tuple[int, dict]:
     """GET /api/app/probe?path=...：从**本地安装包**解析包名（安装弹窗自动回填，2026-10-13）。
 
     背景：装完测试包用户不知道包名就没法建用例/跑测试（发起人原话）。包名其实就在
@@ -101,8 +125,13 @@ def api_app_probe(path: str) -> tuple[int, dict]:
     用 aapt dump badging（复用 `_aapt_bin` 探测，与显示名解析同一来源）。
     **失败一律静默回空**（200）——这是增强能力，解析不出就让用户手填，不弹错。
 
-    本机路径与 /api/fs 浏览器同信任模型（配置台是本机服务），不做目录白名单。
+    本机路径与 /api/fs 浏览器同信任模型：**按来源 IP 门控**（`_local_only`，2026-10-24
+    评审 P1-6 补上——docstring 此前宣称同信任模型但实现没有同门控，`--share` 下持口令的
+    局域网用户可探测任意本机 APK 的包名/版本），不做目录白名单。
     """
+    gate = _local_only(host)
+    if gate is not None:
+        return gate
     p = Path(path).expanduser()
     empty = {"package": "", "label": "", "version": ""}
     if not p.exists():
@@ -163,12 +192,16 @@ def api_apps_uninstall(root: Path, host: str, body: dict) -> tuple[int, dict]:
     package = str(body.get("package", "")).strip()
     if not package or " " in package or ";" in package or "&" in package:
         return 400, {"error": "需要合法的包名/bundleId"}
-    if platform == "ios" and serial and serial != "simulator":
-        return 400, {"error": "iOS 真机卸载需要签名与开发者模式——属 P2"}
 
+    real_ios = platform == "ios" and bool(serial) and serial != "simulator"
     if platform == "android":
         rc, out = _run(_adb(serial, "uninstall", package), timeout=120)
         ok = rc == 0 and "Success" in out
+    elif real_ios:
+        from ..ios_device import uninstall_app as ios_uninstall
+
+        ok, detail = ios_uninstall(serial, package, timeout=180)
+        out = detail
     else:
         rc, out = _run(["xcrun", "simctl", "uninstall", "booted", package], timeout=120)
         ok = rc == 0
@@ -246,3 +279,62 @@ def api_app_labels(root: Path, packages_raw: str) -> tuple[int, dict]:
         except OSError:
             pass  # 缓存写失败只影响下次解析速度
     return 200, {"labels": {p: labels[p] for p in wanted if labels.get(p)}}
+
+
+#: `pm list packages` 的 adb 超时（设备卡顿时 pm 也可能慢，配置台不能被拖死）
+_INSTALLED_TIMEOUT_S = 15
+
+
+def api_apps_installed(serial: str = "") -> tuple[int, dict]:
+    """GET /api/apps/installed?serial=...：当前 Android 设备上的**第三方** App 包名。
+
+    遍历探索的包名输入用它做候选（2026-10-22）：`pm list packages -3` 只列非系统
+    应用——系统包上百个，混进来反而难找。无在线设备返回 400，前端静默回落手输。
+    """
+    serial = serial.strip()
+    devs = [d for d in list_adb_devices() if d.get("state") == "device"]
+    if serial:
+        devs = [d for d in devs if d.get("serial") == serial]
+    if not devs:
+        return 400, {"error": "没有在线的 Android 设备"}
+    target = devs[0]["serial"]
+    try:
+        proc = subprocess.run(
+            ["adb", "-s", target, "shell", "pm", "list", "packages", "-3"],
+            capture_output=True, text=True, timeout=_INSTALLED_TIMEOUT_S,
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 500, {"error": f"读取已安装应用失败：{exc}"}
+    if proc.returncode != 0:
+        return 500, {"error": f"读取已安装应用失败：{(proc.stderr or '').strip()[-200:]}"}
+    prefix = "package:"
+    packages = sorted({line.strip()[len(prefix):]
+                       for line in (proc.stdout or "").splitlines()
+                       if line.strip().startswith(prefix)})
+    return 200, {"serial": target, "packages": packages}
+
+
+def api_app_note_get(root: Path, package: str) -> tuple[int, dict]:
+    """GET /api/app/note?package=：读该应用的测试说明（无文件返回空串，不是错误）。"""
+    from .. import appnotes
+
+    try:
+        return 200, {"package": (package or "").strip(), "notes": appnotes.read(root, package)}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+
+
+def api_app_note_put(root: Path, body: dict) -> tuple[int, dict]:
+    """POST /api/app/note：保存测试说明（清空即删除文件）。"""
+    from .. import appnotes
+
+    package = str((body or {}).get("package", "")).strip()
+    notes = str((body or {}).get("notes", "") or "")
+    try:
+        appnotes.write(root, package, notes)
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+    except OSError as exc:
+        return 500, {"error": f"保存失败：{exc}"}
+    return 200, {"ok": True, "package": package}

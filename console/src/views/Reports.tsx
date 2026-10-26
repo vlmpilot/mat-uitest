@@ -1,13 +1,15 @@
-import { Button, Card, Empty, Input, message, Progress, Select, Space, Table, Tag, Tooltip, Typography } from "antd";
+import { Button, Card, Empty, Input, message, Progress, Select, Space, Table, Tabs, Tag, Tooltip, Typography } from "antd";
 import type { MenuProps } from "antd";
 import { useEffect, useMemo, useState } from "react";
-import { getJob, getShare, RunInfo, ShareResp, startDiagnose, StateResp } from "../api";
+import { getJob, getShare, runCase, RunInfo, ShareResp, startDiagnose, StateResp } from "../api";
 import CalibrateDrawer from "../components/CalibrateDrawer";
 import ExploreCalibrateDrawer from "../components/ExploreCalibrateDrawer";
 import PageHeader from "../components/PageHeader";
 
 // 报告页重构(「内容完善合理、分类清晰、数据准确完备」):
 // - 统计区:总数/通过率 + 失败五分类分布(此前只有通过/失败二值);
+// - 分类快捷 tab(发起人 2026-10-21):全部 / 套件报告 / 用例报告 / 探索任务,
+//   统计卡与「显示 X/Y」口径跟随 tab;
 // - 筛选:状态 / 应用 / 关键字;
 // - 表格:失败分类明细列 + 标记列(已归因/已校准/人工改判)+ 行内操作(AI 归因/校准);
 // - 数据口径如实标注「最近 50 次」(后端 list_runs 的保留上限)。
@@ -40,6 +42,16 @@ type ReportRow = RunInfo | BatchRow | ExploreRow;
 const isBatchRow = (r: ReportRow): r is BatchRow => (r as BatchRow).isBatch === true;
 const isExploreRow = (r: ReportRow): r is ExploreRow => (r as ExploreRow).isExplore === true;
 
+// 分类快捷 tab（发起人 2026-10-21）：三类执行报告 + 「全部」保持原混排。
+// 套件批次算「套件报告」，无 batch 的单条算「用例报告」，探索单独一类。
+type ReportTab = "all" | "suite" | "case" | "explore";
+const EMPTY_DESC: Record<ReportTab, string> = {
+  all: "暂无执行记录——从「用例管理/执行」页运行第一条用例",
+  suite: "暂无套件批次报告——在「用例管理/执行」页的套件 Tab 批量运行",
+  case: "暂无单用例报告——在「用例管理/执行」页运行一条用例",
+  explore: "暂无探索报告——在「遍历探索」页发起一次探索",
+};
+
 function ShareCard() {
   const [share, setShare] = useState<ShareResp | null>(null);
   useEffect(() => { getShare().then(setShare).catch(() => {}); }, []);
@@ -67,7 +79,8 @@ function ShareCard() {
   );
 }
 
-export default function Reports({ state }: { state: StateResp }) {
+export default function Reports({ state, onLaunched }: {
+  state: StateResp; onLaunched: (jobId: string) => void }) {
   const runs = state.runs;
   const [diagnosing, setDiagnosing] = useState<string | null>(null);
   const [calibRun, setCalibRun] = useState<string | null>(null);
@@ -75,21 +88,66 @@ export default function Reports({ state }: { state: StateResp }) {
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const [appFilter, setAppFilter] = useState<string | null>(null);
   const [keyword, setKeyword] = useState("");
+  const [tab, setTab] = useState<ReportTab>("all");
+  // 单条重跑（2026-10-25）：报告 → 行动 的断链补齐——看到失败想验证修复，
+  // 此前得退回用例页重新找文件勾选。用报告产物自带的用例数据重放（rerun_dir），
+  // 不受源文件改名/删除影响；按原平台发起。
+  const [rerunning, setRerunning] = useState<string | null>(null);
+  const rerun = async (r: RunInfo) => {
+    setRerunning(r.dir);
+    try {
+      const { job_id } = await runCase({ rerun_dir: r.dir, platform: r.platform || "android" });
+      message.success(`已重新运行「${r.case_name || r.dir}」——执行页跟踪进度`);
+      onLaunched(job_id);
+    } catch (e) { message.error(String(e)); }
+    finally { setRerunning(null); }
+  };
 
-  const total = runs.length;
-  const passed = runs.filter((r) => r.status === "passed").length;
-  const cancelled = runs.filter((r) => r.status === "cancelled").length;
+  // 探索报告行：同套筛选（无状态语义——选了状态筛选即隐藏）；完成后端记 generated_at
+  const exploreRows: ExploreRow[] = useMemo(() => state.explores
+    .filter((e) => e.id)
+    .map((e) => ({ key: `explore:${e.id}`, isExplore: true as const, id: e.id!,
+      package: e.package || "", steps: e.steps || 0, findings: e.findings || 0,
+      calibrated: e.calibrated, finished_at: e.finished_at })), [state.explores]);
+
+  // tab 作用域：统计卡与列表都跟随 tab 重算，但统计仍不叠加状态/应用/关键字筛选
+  // （与改版前统计口径一致——否则用户一筛应用，头部通过率就变成「当前筛选结果」）
+  const scopedRuns = useMemo(() => {
+    if (tab === "explore") return [];
+    if (tab === "suite") return runs.filter((r) => !!r.batch);
+    if (tab === "case") return runs.filter((r) => !r.batch);
+    return runs;
+  }, [runs, tab]);
+
+  // 报告口径计数（套件批次算 1 份，组内单条不计数）——tab 标签与「显示 X/Y」共用
+  const batchCount = useMemo(
+    () => new Set(runs.filter((r) => !!r.batch).map((r) => r.batch!.id)).size, [runs]);
+  const caseCount = useMemo(() => runs.filter((r) => !r.batch).length, [runs]);
+
+  const total = scopedRuns.length;
+  const passed = scopedRuns.filter((r) => r.status === "passed").length;
+  const cancelled = scopedRuns.filter((r) => r.status === "cancelled").length;
   const failed = total - passed - cancelled;
-  const avgRate = total ? Math.round((runs.reduce((a, r) => a + (r.rate ?? 0), 0) / total) * 100) : 0;
+  const avgRate = total
+    ? Math.round((scopedRuns.reduce((a, r) => a + (r.rate ?? 0), 0) / total) * 100) : 0;
   const catTotal: Record<string, number> = {};
-  for (const r of runs)
+  for (const r of scopedRuns)
     for (const [k, v] of Object.entries(r.failed_categories || {}))
       catTotal[k] = (catTotal[k] || 0) + v;
+
+  // 探索 tab 的统计口径（探索没有步骤成功率）：无异常占比 / 合并后异常总数 / 累计步数
+  const exploreStat = useMemo(() => {
+    const n = exploreRows.length;
+    const bad = exploreRows.filter((e) => e.findings > 0).length;
+    return { n, bad, clean: n - bad,
+      sum: exploreRows.reduce((a, e) => a + e.findings, 0),
+      steps: exploreRows.reduce((a, e) => a + e.steps, 0) };
+  }, [exploreRows]);
 
   const apps = Array.from(new Set(
     [...runs.map((r) => r.package), ...state.explores.map((e) => e.package)].filter(Boolean),
   )) as string[];
-  const filtered = useMemo(() => runs.filter((r) => {
+  const filtered = useMemo(() => scopedRuns.filter((r) => {
     if (statusFilter && r.status !== statusFilter) return false;
     if (appFilter && r.package !== appFilter) return false;
     if (keyword.trim()) {
@@ -98,28 +156,28 @@ export default function Reports({ state }: { state: StateResp }) {
       if (!hay.includes(kw)) return false;
     }
     return true;
-  }), [runs, statusFilter, appFilter, keyword]);
+  }), [scopedRuns, statusFilter, appFilter, keyword]);
 
-  // 探索报告行：同套筛选（无状态语义——选了状态筛选即隐藏）；完成后端记 generated_at
-  const exploreRows: ExploreRow[] = useMemo(() => state.explores
-    .filter((e) => e.id)
-    .map((e) => ({ key: `explore:${e.id}`, isExplore: true as const, id: e.id!,
-      package: e.package || "", steps: e.steps || 0, findings: e.findings || 0,
-      calibrated: e.calibrated, finished_at: e.finished_at })), [state.explores]);
   // 报告口径总数（发起人 2026-10-13）：套件批次算 1 份报告，组内单条不计数
   const totalReports = useMemo(() => {
-    const bids = new Set(runs.filter((r) => r.batch).map((r) => r.batch!.id));
-    return runs.filter((r) => !r.batch).length + bids.size + exploreRows.length;
-  }, [runs, exploreRows]);
-  const filteredExplores = useMemo(() => exploreRows.filter((e) => {
-    if (statusFilter) return false;
-    if (appFilter && e.package !== appFilter) return false;
-    if (keyword.trim()) {
-      const kw = keyword.trim().toLowerCase();
-      if (!`${e.package} ${e.id}`.toLowerCase().includes(kw)) return false;
-    }
-    return true;
-  }), [exploreRows, statusFilter, appFilter, keyword]);
+    if (tab === "explore") return exploreRows.length;
+    if (tab === "suite") return batchCount;
+    if (tab === "case") return caseCount;
+    return caseCount + batchCount + exploreRows.length;
+  }, [tab, batchCount, caseCount, exploreRows]);
+  // 探索行只在「全部」和「探索任务」下出现；套件/用例 tab 下不混入
+  const filteredExplores = useMemo(() => {
+    if (tab === "suite" || tab === "case") return [];
+    return exploreRows.filter((e) => {
+      if (statusFilter) return false;
+      if (appFilter && e.package !== appFilter) return false;
+      if (keyword.trim()) {
+        const kw = keyword.trim().toLowerCase();
+        if (!`${e.package} ${e.id}`.toLowerCase().includes(kw)) return false;
+      }
+      return true;
+    });
+  }, [exploreRows, statusFilter, appFilter, keyword, tab]);
 
   // 批次归组（发起人 2026-10-12）：有 batch 的条目按批次 id 折叠为汇总行（children 展开），
   // 筛选条件先作用于条目再重建组——组内全部被筛掉时该组不出现
@@ -154,6 +212,11 @@ export default function Reports({ state }: { state: StateResp }) {
     return [...out, ...filteredExplores];
   }, [filtered, filteredExplores]);
 
+  // 空态只看 tab 的原始数据源是否为空（筛选筛空时让表格自己显示 No data）
+  const hasAny = tab === "suite" || tab === "case"
+    ? scopedRuns.length > 0
+    : scopedRuns.length + exploreRows.length > 0;
+
   const diagnose = async (dir: string) => {
     setDiagnosing(dir);
     try {
@@ -183,38 +246,84 @@ export default function Reports({ state }: { state: StateResp }) {
     <>
       <PageHeader title="报告" desc="每次执行的自包含 HTML 报告（证据链 + 失败分类 + LLM 归因），行内可归因与校准。" />
       <ShareCard />
+      {/* 分类快捷 tab（发起人 2026-10-21）：数量按报告口径（套件批次算 1 份） */}
+      <Card size="small" style={{ marginBottom: 12 }}>
+        <Tabs size="small" activeKey={tab} tabBarStyle={{ marginBottom: 0 }}
+          onChange={(k) => {
+            setTab(k as ReportTab);
+            // 探索行没有执行状态语义：切过去时清掉状态筛选，避免列表被筛空
+            if (k === "explore") setStatusFilter(null);
+          }}
+          items={[
+            { key: "all", label: `全部 ${totalReports}` },
+            { key: "suite", label: `套件报告 ${batchCount}` },
+            { key: "case", label: `用例报告 ${caseCount}` },
+            { key: "explore", label: `探索任务 ${exploreRows.length}` },
+          ]} />
+      </Card>
       <Card size="small" style={{ marginBottom: 16 }}>
-        <div style={{ display: "flex", gap: 40, alignItems: "center", flexWrap: "wrap" }}>
-          <Progress type="circle" size={96} percent={avgRate}
-            strokeColor={avgRate >= 80 ? "#52c41a" : avgRate >= 50 ? "#faad14" : "#ff4d4f"}
-            format={(p) => <span style={{ fontSize: 18, fontWeight: 600 }}>{p}%</span>} />
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>整体步骤成功率（最近 {total} 次执行）</div>
-            <div style={{ color: "#697080", fontSize: 13 }}>
-              <Tag color="green" bordered={false}>通过 {passed}</Tag>
-              <Tag color="red" bordered={false}>失败 {failed}</Tag>
-              <Tag color="orange" bordered={false}>已中止 {cancelled}</Tag>
+        {tab === "explore" ? (
+          <div style={{ display: "flex", gap: 40, alignItems: "center", flexWrap: "wrap" }}>
+            <Progress type="circle" size={96}
+              percent={exploreStat.n ? Math.round((exploreStat.clean / exploreStat.n) * 100) : 0}
+              strokeColor={(exploreStat.n ? exploreStat.clean / exploreStat.n : 1) >= 0.8 ? "#52c41a" : "#faad14"}
+              format={(p) => <span style={{ fontSize: 18, fontWeight: 600 }}>{p}%</span>} />
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>探索无异常占比（最近 {exploreStat.n} 次）</div>
+              <div style={{ color: "#697080", fontSize: 13 }}>
+                <Tag color="red" bordered={false}>有异常 {exploreStat.bad}</Tag>
+                <Tag color="green" bordered={false}>无异常 {exploreStat.clean}</Tag>
+              </div>
             </div>
+            <div>
+              <div style={{ color: "#697080", fontSize: 12, marginBottom: 6 }}>累计异常（同页同类合并后）</div>
+              <Tag color={exploreStat.sum ? "red" : "green"} bordered={false}>{exploreStat.sum} 个</Tag>
+              <Tag bordered={false}>共 {exploreStat.steps} 步</Tag>
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12, maxWidth: 320 }}>
+              探索不做步骤成功率统计；异常逐条确认/忽略在「校准」里完成，校准过的报告本行挂「已校准」。
+            </Typography.Text>
           </div>
-          <div>
-            <div style={{ color: "#697080", fontSize: 12, marginBottom: 6 }}>失败分类分布（累计）</div>
-            {Object.keys(catTotal).length === 0
-              ? <Tag bordered={false} color="green">无失败分类</Tag>
-              : Object.entries(catTotal).map(([k, v]) => {
-                  const m = CAT_LABEL[k] || { text: k, color: "default" };
-                  return <Tag key={k} color={m.color} bordered={false}>{m.text} ×{v}</Tag>;
-                })}
+        ) : (
+          <div style={{ display: "flex", gap: 40, alignItems: "center", flexWrap: "wrap" }}>
+            <Progress type="circle" size={96} percent={avgRate}
+              strokeColor={avgRate >= 80 ? "#52c41a" : avgRate >= 50 ? "#faad14" : "#ff4d4f"}
+              format={(p) => <span style={{ fontSize: 18, fontWeight: 600 }}>{p}%</span>} />
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                {tab === "suite"
+                  ? `套件批次步骤成功率（${batchCount} 个批次 · ${total} 次用例执行）`
+                  : tab === "case"
+                    ? `单用例步骤成功率（最近 ${total} 次执行）`
+                    : `整体步骤成功率（最近 ${total} 次用例执行）`}
+              </div>
+              <div style={{ color: "#697080", fontSize: 13 }}>
+                <Tag color="green" bordered={false}>通过 {passed}</Tag>
+                <Tag color="red" bordered={false}>失败 {failed}</Tag>
+                <Tag color="orange" bordered={false}>已中止 {cancelled}</Tag>
+              </div>
+            </div>
+            <div>
+              <div style={{ color: "#697080", fontSize: 12, marginBottom: 6 }}>失败分类分布（累计）</div>
+              {Object.keys(catTotal).length === 0
+                ? <Tag bordered={false} color="green">无失败分类</Tag>
+                : Object.entries(catTotal).map(([k, v]) => {
+                    const m = CAT_LABEL[k] || { text: k, color: "default" };
+                    return <Tag key={k} color={m.color} bordered={false}>{m.text} ×{v}</Tag>;
+                  })}
+            </div>
+            <Typography.Text type="secondary" style={{ fontSize: 12, maxWidth: 320 }}>
+              失败先看「AI 归因」，判错就用「校准」改判并落成规则——同类失败下次自动归对；
+              断言期望过期可直接采纳实际值；失败可标「可忽略」、成功用例可校准「误判」；
+              探索报告的异常也能逐条确认/忽略。
+            </Typography.Text>
           </div>
-          <Typography.Text type="secondary" style={{ fontSize: 12, maxWidth: 320 }}>
-            失败先看「AI 归因」，判错就用「校准」改判并落成规则——同类失败下次自动归对；
-            断言期望过期可直接采纳实际值；失败可标「可忽略」、成功用例可校准「误判」；
-            探索报告的异常也能逐条确认/忽略。
-          </Typography.Text>
-        </div>
+        )}
       </Card>
       <Card size="small" style={{ marginBottom: 12 }}>
         <Space wrap>
           <Select allowClear placeholder="全部状态" style={{ width: 140 }} value={statusFilter}
+            disabled={tab === "explore"}
             onChange={setStatusFilter}
             options={Object.entries(STATUS_LABEL).map(([k, m]) => ({ value: k, label: m.text }))} />
           <Select allowClear placeholder="全部应用" style={{ width: 220 }} value={appFilter}
@@ -228,8 +337,8 @@ export default function Reports({ state }: { state: StateResp }) {
           </span>
         </Space>
       </Card>
-      {total + exploreRows.length === 0 ? (
-        <Card><Empty description="暂无执行记录——从「用例管理/执行」页运行第一条用例" /></Card>
+      {!hasAny ? (
+        <Card><Empty description={EMPTY_DESC[tab]} /></Card>
       ) : (
         <Table size="small" rowKey={(r: ReportRow) => (isBatchRow(r) || isExploreRow(r) ? r.key : r.dir)}
           dataSource={rows} scroll={{ x: 1360 }} tableLayout="fixed"
@@ -382,6 +491,11 @@ export default function Reports({ state }: { state: StateResp }) {
                   {/* 校准对全部结果开放（发起人 2026-10-13）：成功用例也要能校准「误判」 */}
                   <Button size="small" onClick={() => setCalibRun(r.dir)}>校准</Button>
                   <a href={`/artifacts/${r.dir}/report.html`} target="_blank" rel="noreferrer">报告 ↗</a>
+                  {/* 单条重跑：重放产物自带的用例数据（不受源文件变动影响），按原平台发起 */}
+                  <Tooltip title={`重放这次执行的用例（${r.platform === "ios" ? "iOS" : "安卓"}）——验证修复/回归`}>
+                    <Button size="small" loading={rerunning === r.dir}
+                      onClick={() => rerun(r)}>重跑</Button>
+                  </Tooltip>
                 </Space>) },
           ]} />
       )}

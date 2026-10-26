@@ -418,19 +418,25 @@ def test_convert_batch_quota_and_bundle(tmp_path, prompt_file, monkeypatch):
     report = json.loads((bundle / "import.json").read_text(encoding="utf-8"))
     assert report["import_id"] == import_id and report["summary"]["total"] == 3
     assert (bundle / "source.csv").exists()
-    drafts = list((tmp_path / "cases").glob("import-*.json"))
-    assert len(drafts) == 2  # 只有 A/B 写草稿
+    # 2026-10-25 起文件名直接用标题（slugify_filename），不再 import-* 前缀；
+    # 同标题多条落盘加 -2 序号并回写 record——按实际落盘数断言（口径不变）
+    case_files = [r["case_file"] for r in batch["results"] if r.get("dsl")]
+    drafts = [tmp_path / "cases" / f for f in case_files]
+    assert all(d.exists() for d in drafts) and len(drafts) == 2  # 只有 A/B 写草稿
+    assert len({f for f in case_files}) == 2, "撞名序号必须回写进 record（import.json 对账）"
 
 
-def test_quota_half_step_insufficient(tmp_path, monkeypatch):
+def test_convert_counts_half_step_never_blocks(tmp_path, monkeypatch):
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
-    from insta_engine.quota import FREE_GEN_LIMIT, QuotaExceeded, UsageStore
+    from insta_engine.quota import UsageStore
+    from insta_engine.quota_policy import plan_limits
 
     store = UsageStore(tmp_path / "usage.json")
-    for _ in range(FREE_GEN_LIMIT):  # 体验版 50 次/月；整额耗尽后半次也不放行
-        store.check_gen()
-    with pytest.raises(QuotaExceeded, match="剩 0"):
-        store.ensure_capacity(0.5)
+    total = plan_limits("free")["gen"]
+    for _ in range(int(total / 0.5)):  # convert 0.5/条：策略额度内双倍条数全可跑
+        store.consume(0.5)
+    snap = store.ensure_capacity(0.5)  # P0-2：预检已退化为纯快照，不再拦截
+    assert snap["gen_count"] == total and snap["gen_enforced"] is False
 
 
 # -- DSL 兼容性（meta/sourceStep 不破坏旧用例） -----------------------------------
@@ -514,8 +520,12 @@ def test_quality_flags_content_snapshot():
 
 
 def test_quality_does_not_flag_a_short_control_text():
+    # 带一条**指向别的控件**的断言：否则 R12（整条无断言）会报，把这条反向用例搅乱
     raw = {"steps": [_launch_step(), {"id": "s1", "action": "tap",
-                                      "target": {"strategy": "text", "value": "早晚报"}}]}
+                                      "target": {"strategy": "text", "value": "早晚报"},
+                                      "assertions": [{"type": "exists",
+                                                      "target": {"strategy": "text",
+                                                                 "value": "今日推荐"}}]}]}
     assert _quality_issues(raw) == []
 
 
@@ -607,7 +617,9 @@ def test_quality_does_not_flag_environment_precondition():
     """
     raw = {"steps": [{"id": "s0", "action": "launch", "params": {"package": "com.insta.demo"}},
                      {"id": "s1", "action": "tap",
-                      "target": {"strategy": "text", "value": "要闻"}}]}
+                      "target": {"strategy": "text", "value": "要闻"},
+                      "assertions": [{"type": "exists",
+                                      "target": {"strategy": "text", "value": "要闻要论"}}]}]}
     assert _quality_issues(raw, preconditions=["App 已安装", "已完成首次隐私授权"]) == []
 
 

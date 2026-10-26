@@ -33,7 +33,8 @@ from __future__ import annotations
 
 __all__ = [
     "ENV", "PAGE", "RANDOM", "SYSTEM", "classify", "classify_all", "is_random_event",
-    "is_unprovisionable", "provisionable", "refusal_message", "unprovisionable",
+    "is_unprovisionable", "provisionable", "refusal_message", "refused_result",
+    "unprovisionable",
 ]
 
 #: 权限 / 授权类名词：出现其一才算"权限态"。
@@ -138,3 +139,35 @@ def refusal_message(case_name: str, blocked: list[str]) -> str:
         "     ① 先手工把设备置成该状态，再加 --allow-unmet-preconditions 放行本次执行；\n"
         "     ② 或改写用例，让它自己用步骤到达该状态（权限类状态通常做不到，建议删掉该前置）。"
     )
+
+
+def refused_result(case, blocked: list[str], artifacts):
+    """拒跑的统一落盘产物（2026-10-24 从 CLI `_refused_entry` 下沉共享，评审 P1-7：
+    web 控制台此前**完全没有**前置拒跑检查——同一用例 CLI 拒跑给可行动提示、控制台
+    照跑并产出假定位失败报告，双入口语义漂移里最伤信任的一条）。
+
+    产出一个 `skipped` 的 RunResult（precheck 步骤）+ 一份最小 report.html，
+    聚合页/报告列表都按普通条目可见。⚠️ 记 `skipped` 而不是 `failed`：**它没跑**，
+    算成失败会污染通过率；它需要的是修用例或补前置，不是查失败原因。
+    """
+    from pathlib import Path
+
+    from .report import _CSS, _esc
+    from .runner import RunResult, StepResult
+
+    artifacts = Path(artifacts)
+    artifacts.mkdir(parents=True, exist_ok=True)
+    reason = "前置条件 MAT 无法置备：" + "、".join(blocked)
+    run = RunResult(
+        case_id=case.case_id, case_name=case.name, status="skipped",
+        preconditions=list(case.preconditions or []),
+        steps=[StepResult(step_id="precheck", intent="前置条件预检", action="precheck",
+                          status="skipped", category="precondition-unmet", error=reason)],
+    )
+    (artifacts / "report.html").write_text(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>未执行 — {_esc(case.name or case.case_id)}</title><style>{_CSS}</style>"
+        "</head><body><h1>未执行（前置条件预检未通过）</h1>"
+        f"<pre>{_esc(refusal_message(case.name or case.case_id, blocked))}</pre></body></html>",
+        encoding="utf-8")
+    return run

@@ -33,7 +33,7 @@ async function apiText(path) {
 }
 
 const post = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-const esc = (s) => String(s ?? "").replace([&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const pct = (x) => Math.round((x ?? 0) * 100) + "%";
 
 function toast(msg, type = "info", ms = 3600) {

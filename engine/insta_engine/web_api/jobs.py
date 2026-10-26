@@ -10,6 +10,7 @@ def api_jobs_list() -> tuple[int, dict]:
     with _JOB_LOCK:
         jobs = [{"id": jid, "kind": j["kind"], "status": j["status"],
                  "started_at": j["started_at"], "summary": j["summary"],
+                 "error": j.get("error"),
                  "link": j["link"], "seq": j.get("seq", 0),
                  "serial": (j.get("meta") or {}).get("serial"),
                  "platform": (j.get("meta") or {}).get("platform"),

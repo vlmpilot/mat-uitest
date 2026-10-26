@@ -99,3 +99,38 @@ def test_logcat_clear_calls_the_device(captured):
     """
     assert _REAL_LOG_CLEAR("SERIAL") is True
     assert captured[0] == ("logcat", "-c"), f"实际 argv={captured[0]}"
+
+
+def test_cli_adb_missing_falls_back_to_adbutils(monkeypatch):
+    """本机没有 CLI `adb` 时必须回退 adbutils，否则失败步日志静默变空。
+
+    2026-10-25 真机评测：这台机器 adb 不在 PATH（设备经 adbutils 在线），
+    `logcat_tail()` 恒空 ⇒ 崩溃证据丢失、`app-crash` 分类失效；
+    而驱动本身连得上，说明缺的只是**采集通道**。
+    """
+    import sys
+
+    seen: list[str] = []
+
+    def no_cli(*args, **kwargs):  # noqa: ARG001
+        raise FileNotFoundError("adb")
+
+    class _Dev:
+        @staticmethod
+        def shell(cmd: str, timeout: float = 10) -> str:  # noqa: ARG004
+            seen.append(cmd)
+            return "FATAL EXCEPTION: demo"
+
+    class _AdbFacade:
+        @staticmethod
+        def device(serial: str | None = None) -> _Dev:
+            assert serial == "SERIAL", "必须定向到同一台设备（多设备下裸 logcat 会失败）"
+            return _Dev()
+
+    class _FakeAdbutils:
+        adb = _AdbFacade()
+
+    monkeypatch.setattr(adb_mod.subprocess, "run", no_cli)
+    monkeypatch.setitem(sys.modules, "adbutils", _FakeAdbutils())
+    assert logcat_tail("SERIAL") == "FATAL EXCEPTION: demo"
+    assert seen and seen[0].split()[-1] == "'*:E'", "过滤标记必须被 shell 转义，否则被 glob 展开"

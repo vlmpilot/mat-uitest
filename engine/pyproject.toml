@@ -51,14 +51,18 @@ dependencies = [
     "pydantic>=2.7",
     "requests>=2.31",
     "pillow>=10",
+    # Excel 批量导入是控制台头号入口、license v2 验签是付费档必经路径：
+    # 两者都曾做成可选 extra，结果用户第一次点击才报「请另装依赖」（2026-10-21）。
+    "openpyxl>=3.1",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff==0.16.9", "pytest>=8", "pytest-cov>=5", "openpyxl>=3.1"]
+dev = ["ruff==0.16.9", "pytest>=8", "pytest-cov>=5"]
 image = ["opencv-python-headless>=4.8"]
-import = ["openpyxl>=3.1"]
 mcp = ["mcp>=2.0"]
-ios = ["facebook-wda>=1.5"]
+ios = ["facebook-wda>=1.5", "pymobiledevice3>=3.0"]
+maestro = ["pyyaml>=6"]
 
 [project.scripts]
 mat = "insta_engine.__main__:main"
@@ -68,7 +72,7 @@ mat-mcp = "insta_engine.mcp_server:main"
 [project.urls]
 Homepage = "https://github.com/vlmpilot/mat-uitest"
 Repository = "https://github.com/vlmpilot/mat-uitest"
-Documentation = "https://github.com/vlmpilot/mat-uitest/tree/main/docs"
+Documentation = "https://mobileaitest.com/manual.html"
 Changelog = "https://github.com/vlmpilot/mat-uitest/blob/main/CHANGELOG.md"
 Issues = "https://github.com/vlmpilot/mat-uitest/issues"
 
@@ -89,6 +93,9 @@ include = ["insta_engine*"]
 # 否则 `pip install mat-uitest` 的用户机器上没有 SKILL.md，`mat skill install` 无料可装。
 insta_engine = ["web/*.html", "web/*.js", "web/*.css", "prompts/*.example",
                  "console_dist/*.html", "console_dist/assets/*", "console_dist/*.svg", "console_dist/*.ico",
+                 # 配额策略的包内副本（唯一事实源的随包分发；缺失时回落 _DEFAULTS 同值，
+                 # 但那份兜底不该是常态——2026-10-23 实测 wheel 里没有它）
+                 "data/*.json",
                  "skills/*/*.md", "skills/*/*.txt"]
 
 [tool.ruff]

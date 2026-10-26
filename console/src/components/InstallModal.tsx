@@ -11,6 +11,8 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
   onInstalled?: (summary: string) => void;
 }) {
   const isAndroid = platform === "android";
+  // 真机（2026-10-19）：devicectl 安装，同样只接受 .app 目录（.ipa 需先解压）
+  const isRealIos = platform === "ios" && !!serial && serial !== "simulator";
   const ext = isAndroid ? ".apk" : "";
   const [browsePath, setBrowsePath] = useState("");
   const [dirs, setDirs] = useState<string[]>([]);
@@ -34,7 +36,7 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, platform]);
 
-  const join = (base: string, name: string) => `${base.replace(\/$/, "")}/${name}`;
+  const join = (base: string, name: string) => `${base.replace(/\/$/, "")}/${name}`;
 
   // 选中安装包 → 解析包名自动回填（失败静默；用户手填过且非上次自动值则不覆盖）
   const selectAndProbe = (path: string) => {
@@ -53,7 +55,8 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
     setBusy(true);
     try {
       const { job_id } = await installApp({ serial, platform, path: selected, package: pkg || undefined });
-      message.info(isAndroid ? "正在安装（覆盖安装，保留数据）…" : "正在安装到模拟器…");
+      message.info(isAndroid ? "正在安装（覆盖安装，保留数据）…"
+        : isRealIos ? "正在安装到真机（devicectl）…" : "正在安装到模拟器…");
       for (let i = 0; i < 300; i++) {
         const job = await getJob(job_id);
         if (job.status !== "running") {
@@ -70,7 +73,8 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
   };
 
   return (
-    <Modal title={`安装测试包（${isAndroid ? "Android · adb install -r" : "iOS 模拟器 · simctl install"}）`}
+    <Modal title={`安装测试包（${isAndroid ? "Android · adb install -r"
+      : isRealIos ? "iOS 真机 · devicectl" : "iOS 模拟器 · simctl"}）`}
       open={open} onCancel={onClose} width={560}
       footer={<Space>
         <Button onClick={onClose}>取消</Button>
@@ -117,6 +121,8 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
           {isAndroid
             ? "覆盖安装（adb install -r -t）保留应用数据；iOS 模拟器需模拟器架构的 .app 构建。"
+            : isRealIos
+            ? "真机安装要求 .app 已签名且设备已开启开发者模式；App Store 的 .ipa 需先解压成 .app。"
             : "simctl 安装需模拟器架构的 .app 目录（App Store 的 ipa 装不上模拟器）。"}
         </Typography.Text>
       </Space>

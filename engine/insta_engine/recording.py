@@ -5,7 +5,8 @@
   回退 `adb shell screenrecord`（部分国产 ROM 已裁剪该二进制——华为 EMUI 实测不存在）；
   两条都没有 ⇒ (None, 原因)，调用方诚实降级为无录屏（事件流可见）。
 - iOS 模拟器：`xcrun simctl io booted recordVideo --codec h264`，SIGINT 优雅收尾
-  （文件直落本机）。iOS 真机不支持（P2：需要绑屏工具链）。
+  （文件直落本机）。**iOS 真机不支持且不打算做**（2026-10-18 定论）：没有公开录制 API，
+  截图 + 系统日志已是足够证据；拿低帧率截图拼视频只会让人误以为有录屏。
 
 Android stop 语义（实测教训）：**kill 本地 adb 客户端不会停设备端 screenrecord**——
 必须 `pidof` 找到设备侧进程发 SIGINT 才会封装出完整 mp4；本地客户端随之退出。
@@ -106,6 +107,11 @@ class Recorder:
         return ["adb"] + (["-s", self.serial] if self.serial else []) + list(args)
 
     def _start_segment(self) -> None:
+        if self._stopping:
+            # P1-3（2026-10-24）：stop() 已置停止位 ⇒ 不再起新段。此前轮转线程
+            # sleep(0.5) 后不复查就 _start_segment()，与 stop() 并发时会起一个
+            # 不被 kill、不被 pull 的段（设备端进程/文件泄漏至多 180s）。入口同查兜底。
+            return
         self._seg += 1
         if self.platform == "android":
             if self.mode == "scrcpy":
@@ -146,6 +152,10 @@ class Recorder:
             if self._stopping or self._seg >= MAX_SEGMENTS:
                 return
             time.sleep(0.5)  # 给设备端一点收尾时间
+            if self._stopping:
+                # P1-3（2026-10-24）：sleep 窗口内 stop() 到来 ⇒ 不再起新段——
+                # 此前这里不复查，新段不被 kill/pull（设备端泄漏至多 180s）。
+                return
             self._start_segment()
 
     def _stop_android(self) -> None:
@@ -236,6 +246,11 @@ def make_recorder(platform: str, serial: str | None,
                       "（可选装后重试；模拟器/其他设备通常可用）")
     if platform == "ios":
         if serial and serial != "simulator":
-            return None, "iOS 真机录屏属 P2（当前仅模拟器支持）"
+            # 2026-10-18 定论：**没有公开 API**——`simctl io recordVideo` 只对模拟器有效，
+            # `devicectl` 无录屏子命令，`xctrace` 录的是 Instruments 轨迹不是视频。
+            # 不拿"2fps 截图拼视频"冒充录屏：那种产物对定位问题没有价值，还会让人误以为有录屏。
+            return None, ("iOS 真机不支持录屏：系统没有公开的录制 API"
+                          "（simctl 只对模拟器有效，xctrace 录的是 Instruments 轨迹）。"
+                          "失败步骤的**截图 + 系统日志**仍然完整，可作为证据")
         return Recorder("ios", serial, staging), None
     return None, f"未知平台 {platform!r}"

@@ -29,10 +29,17 @@ _MIGRATE_DIRS: dict[str, list[str]] = {
 
 
 def _local_only(host: str) -> tuple[int, dict] | None:
-    """目录浏览/切换是本机能力：`--share`（局域网暴露）下必须禁用，防信息泄露。"""
-    if host not in ("127.0.0.1", "localhost"):
-        return 403, {"error": "分享模式下禁用工作区浏览/切换（本机直连时可用）"}
-    return None
+    """本机能力门控：按【客户端来源 IP】判定——调用方必须传 self.client_address[0]。
+
+    目录浏览/切换/打开、凭据、卸载、校准落盘、doctor 修复等本机能力：
+    回环来源放行，局域网/外部来源 403。`--share` 下同事看报告不受影响，
+    发起人本机操作也不被连坐（2026-10-15 修复：旧实现误传 server 监听地址，
+    0.0.0.0 ⇒ --share 下连本机也 403，与「本机直连时可用」的设计意图相反）。
+    """
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return None
+    return 403, {"error": "该操作仅限本机：分享模式下局域网来源禁用，"
+                          "请在本机用 http://localhost:7421 访问"}
 
 
 def api_fs_browse(host: str, path: str | None, ext: str | None = None) -> tuple[int, dict]:
@@ -148,6 +155,8 @@ def case_meta(root: Path) -> dict:
         next_no = max([*nos.values(), 0]) + 1
         dirty = False
         for f in sorted(cases_dir.glob("*.json")):
+            if f.name.startswith("_batch_"):
+                continue  # 历史批量临时文件不进编号/元数据（2026-10-24 兜底，同 state 列表过滤）
             if f.name not in nos:
                 nos[f.name] = next_no
                 next_no += 1
@@ -175,16 +184,24 @@ def list_runs(root: Path) -> list[dict]:
     runs = []
     artifacts = root / "artifacts"
     if artifacts.exists():
-        for run_json in artifacts.glob("*/run.json"):
+        # P1-6（2026-10-24）：一层 glob 发现不了两层产物——CLI 套件条目
+        # `artifacts/<套件>/<NN>_<stem>/run.json`、数据驱动 `artifacts/<stem>-ds/<组名>/`
+        # 此前在报告列表**完全不可见**。改 rglob 递归发现；`dir` 从"叶子目录名"
+        # 改为 artifacts 相对 posix 路径（一层时与旧值相同 ⇒ 向后兼容，
+        # 前端 `/artifacts/${dir}/report.html` 与 diagnose/calibrate 的
+        # `root/"artifacts"/run` 都天然支持子路径）。
+        for run_json in artifacts.rglob("run.json"):
             try:
                 data = json.loads(run_json.read_text(encoding="utf-8"))
                 run = data.get("run", {})
                 run_dir = run_json.parent
                 runs.append({
-                    "dir": run_json.parent.name,
+                    "dir": run_dir.relative_to(artifacts).as_posix(),
                     "case_id": run.get("case_id"),
                     "case_name": run.get("case_name"),
                     "package": (data.get("case", {}).get("target") or {}).get("package"),
+                    # 平台（payload 顶层，runner 落盘时记录）——报告页「重跑」按原平台发起
+                    "platform": data.get("platform") or "android",
                     "status": run.get("status"),
                     "rate": run.get("step_success_rate"),
                     # 执行人（发起人 2026-10-12：报告列表/详情按人区分）；旧产物无此字段 → ""

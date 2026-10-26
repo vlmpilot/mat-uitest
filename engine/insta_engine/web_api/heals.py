@@ -53,7 +53,10 @@ def api_heal_apply(root: Path, body: dict) -> tuple[int, dict]:
     case_file = root / "cases" / f"{run}.json"
     if not run_dir.exists() or not case_file.exists():
         return 404, {"error": f"执行或原用例不存在: {run}"}
-    proposals = collect_proposals(run_dir)
+    try:
+        proposals = collect_proposals(run_dir)
+    except ValueError as exc:  # run.json 缺失/损坏：400 可行动报错，不是 500
+        return 400, {"error": str(exc)}
     if not proposals:
         return 400, {"error": "该执行没有自愈提案"}
     try:

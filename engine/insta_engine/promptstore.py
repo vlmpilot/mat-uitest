@@ -94,6 +94,54 @@ def read(name: str, workspace: Path | None = None) -> str | None:
     return path.read_text(encoding="utf-8") if path else None
 
 
+# -- 追加段（2026-10-25）：用户定制不复制整模板 --------------------------------------------
+#
+# 为什么需要：整模板复制到工作区后，解析优先级让副本**永远压过包内新版**——官方
+# prompt 迭代了，老工作区收不到（模板冻结）。追加式定制（`prompts/<name>.append.md`）
+# 与模板更新互不干扰：模板该谁解析谁解析，用户的追加段拼在**组装结果尾部**。
+# local 模式在 `_assemble_local` 拼接；server 模式把追加段作为 `user_append` 字段
+# 发给轻云（协议与 repair 同款：旧服务端不认识该字段会忽略，向后兼容）。
+
+APPEND_SUFFIX = ".append.md"
+
+
+def append_path(name: str, workspace: Path | None = None) -> Path:
+    ws = Path(workspace) if workspace else workspace_dir()
+    return ws / f"{name}{APPEND_SUFFIX}"
+
+
+def read_append(name: str, workspace: Path | None = None) -> str | None:
+    """读该任务的追加段；无文件/空白返回 None（调用方按「无」处理）。"""
+    p = append_path(name, workspace)
+    try:
+        text = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def staleness(name: str, workspace: Path | None = None) -> dict | None:
+    """工作区模板副本是否落后于包内新版（2026-10-25「模板冻结」的检测）。
+
+    只报告**默认解析**命中工作区 `<name>.prompt`（seed 复制的标准形态）且与包内
+    `.prompt.example` 内容不同的情形；显式选择（choice）指名的文件不报告——用户
+    明确要用那个文件，「升级」反而破坏意图。返回 {"file", "package_mtime"} 或 None。
+    """
+    ws = Path(workspace) if workspace else workspace_dir()
+    active = resolve(name, ws)
+    if active is None or active.parent == PKG_PROMPTS or active.name != f"{name}.prompt":
+        return None
+    pkg = PKG_PROMPTS / f"{name}.prompt.example"
+    if not pkg.exists():
+        return None
+    try:
+        if active.read_text(encoding="utf-8") == pkg.read_text(encoding="utf-8"):
+            return None  # 内容一致：只是位置不同，不算过期
+    except OSError:
+        return None
+    return {"file": active.name, "package_mtime": int(pkg.stat().st_mtime)}
+
+
 def describe_resolution(name: str, ws: Path | None = None) -> tuple[str, Path | None]:
     """解析来源标签（doctor/控制台口径展示用）：
 

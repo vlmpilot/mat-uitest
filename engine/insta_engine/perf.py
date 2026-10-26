@@ -6,20 +6,13 @@
 from __future__ import annotations
 
 import re
-import subprocess
 
-
-def _adb(serial: str | None, *args: str, timeout: int = 15) -> str | None:
-    cmd = ["adb"]
-    if serial:
-        cmd += ["-s", serial]
-    cmd += list(args)
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              encoding="utf-8", errors="replace")  # Windows 默认 GBK 会炸中文日志
-        return proc.stdout if proc.returncode == 0 else None
-    except Exception:
-        return None
+#: adb 通道**只有一个实现**（`adb.py`，含"CLI 缺失时回退 adbutils"）。这里曾自己复制
+#: 一份 `subprocess.run(["adb", ...])`：在没有 adb CLI 的机器上（本机就是，2026-10-25
+#: 真机实测）逐条 `FileNotFoundError ⇒ None`，于是**启动耗时与内存永远采不到**，而
+#: `perf` 是 best-effort 字段，run.json 里就是个空 `{}`——没有任何报错、没有任何红。
+#: 这正是 adb.py 抬头写的"收敛于此以免口径漂移"要防的第 4 份副本。
+from .adb import adb as _adb
 
 
 def am_start_w(serial: str | None, package: str, activity: str | None = None) -> dict | None:

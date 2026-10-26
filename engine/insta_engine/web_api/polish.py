@@ -25,6 +25,12 @@ def api_polish(root: Path, body: dict) -> tuple[int, dict]:
         controls = controls_context_for(package, root / "artifacts" / "page_index")
         if controls:
             app_info["controls"] = controls
+        # 负责人补充说明（app_notes/<包名>.md）——与 /api/gen 同一注入口径
+        from ..appnotes import for_prompt as _app_notes_for_prompt
+
+        user_notes = _app_notes_for_prompt(root, package)
+        if user_notes:
+            app_info["user_notes"] = user_notes
     try:
         text = GenClient.from_env().polish(nl, app_info)
     except GenError as exc:

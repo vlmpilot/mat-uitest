@@ -46,12 +46,23 @@ def _validate_name(name: str) -> str:
     return name
 
 
+def _flat_cases(data: dict) -> list:
+    """平铺取用例条目：cases 写法直读；stages 写法按阶段顺序摊平（2026-10-21）。"""
+    if isinstance(data.get("cases"), list):
+        return list(data["cases"])
+    flat: list = []
+    for st in data.get("stages") or []:
+        if isinstance(st, dict) and isinstance(st.get("cases"), list):
+            flat.extend(st["cases"])
+    return flat
+
+
 def read_suite(path: Path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or "cases" not in data:
-        raise ValueError(f"{path} 不是套件（应含 cases 数组）")
-    if not isinstance(data["cases"], list) or not data["cases"]:
-        raise ValueError(f"套件 {path} 的 cases 必须为非空数组")
+    if not isinstance(data, dict) or not ("cases" in data or "stages" in data):
+        raise ValueError(f"{path} 不是套件（应含 cases 或 stages 数组）")
+    if not _flat_cases(data):
+        raise ValueError(f"套件 {path} 没有用例（cases / stages 均为空）")
     return data
 
 
@@ -125,7 +136,7 @@ def refs_of(data: dict) -> tuple[list[str], list[dict]]:
     """拆出（文件引用列表, 内联用例列表）。内联项原样保留。"""
     files: list[str] = []
     inline: list[dict] = []
-    for item in data["cases"]:
+    for item in _flat_cases(data):
         if isinstance(item, str):
             files.append(item)
         elif isinstance(item, dict):
@@ -185,6 +196,9 @@ def _load_or_die(root: Path, name: str) -> tuple[Path, dict]:
 def cmd_add(args) -> int:
     root = Path(args.root)
     _, data = _load_or_die(root, args.name)
+    if "stages" in data and "cases" not in data:
+        print("分阶段套件（stages）请直接编辑文件——mat suite add 暂只支持平铺 cases 写法")
+        return 1
     files, _ = refs_of(data)
     files_norm = [_norm_ref(f) for f in files]  # 历史前缀条目归一化，避免判重失配
     new = expand_refs(root, args.cases)
@@ -203,6 +217,9 @@ def cmd_add(args) -> int:
 def cmd_rm(args) -> int:
     root = Path(args.root)
     _, data = _load_or_die(root, args.name)
+    if "stages" in data and "cases" not in data:
+        print("分阶段套件（stages）请直接编辑文件——mat suite rm 暂只支持平铺 cases 写法")
+        return 1
     files, inline = refs_of(data)
     # 归一化比较 + 落盘即迁移：历史 `cases/` 前缀条目重写为纯文件名（与配置台同构）
     files_norm = [_norm_ref(f) for f in files]
@@ -226,6 +243,15 @@ def cmd_rm(args) -> int:
 def cmd_show(args) -> int:
     root = Path(args.root)
     _, data = _load_or_die(root, args.name)
+    if "stages" in data and "cases" not in data:
+        print(f"套件 {data.get('name') or args.name}（分阶段写法，执行顺序即阶段顺序）\n")
+        for st in data.get("stages") or []:
+            gate = st.get("on_failure") or data.get("on_failure") or "continue"
+            print(f"  ▸ {st.get('name') or '(未命名)'}  on_failure={gate}")
+            for i, item in enumerate(st.get("cases") or [], 1):
+                label = item if isinstance(item, str) else (item.get("caseId") or "(内联用例)")
+                print(f"    {i:>2}. {label}")
+        return 0
     print(f"套件 {data.get('name') or args.name}（{len(data['cases'])} 条，执行顺序即下列顺序）\n")
     for i, item in enumerate(data["cases"], 1):
         if isinstance(item, str):

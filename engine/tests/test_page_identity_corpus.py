@@ -32,7 +32,8 @@ from pathlib import Path
 import pytest
 
 from insta_engine.explore import _candidate, _identities, _same_page, match_prior_page
-from insta_engine.page_index import page_key
+from insta_engine.page_index import is_degenerate_res_id, page_key
+from insta_engine.ui_tree import parse_nodes
 
 CORPUS = Path(__file__).resolve().parents[2] / "benchmarks" / "page_identity"
 
@@ -74,7 +75,10 @@ MIN_IDENTITY_SKIP = 0.50
 #: **错跳率**上限——认错页会静默跳过本页真实分支（丢覆盖），必须单独盯。
 #: 实测 **1.7%**（若去掉"明显胜出"间距判据会升到 10%+，所以间距判据不是可选项）。
 #: 分母是**第 2 轮的候选总数**，这样"跳过率"与"错跳率"直接可比。
-MAX_IDENTITY_WRONG = 0.02
+#: 2026-10-16 重校：`_candidate` 开始排除「无文案且无 rid」死链（icon-only 专项），
+#: 候选池 1004 → 647、认对 837 → 525（差值是死链控件的假收益）、**绝对错跳 17 → 16
+#: 反而降了**——比率 1.7% → 2.5% 纯属分母变纯，匹配本身没退化，阈值按新口径放到 3%。
+MAX_IDENTITY_WRONG = 0.03
 
 
 def _load_corpus() -> tuple[dict, list[dict]]:
@@ -105,6 +109,12 @@ def measured() -> dict:
             "key": page_key(xml, r["app_id"]),
             "ids": _identities(xml, r["app_id"]),
             "cands": _candidate(xml, r["app_id"]),
+            # 结构信号（rid-only）：`pages_equivalent_layout`（若采用）的判据原料。
+            # rid 是工程师命名，模板/框架类控件的 rid 跨内容稳定——轮播轮换、
+            # 弹窗变体下「同 activity + rid 结构重合」是否足以认"同类页"靠它回答。
+            "struct": {n.rid for n in parse_nodes(xml)
+                       if n.rid and n.in_package(r["app_id"])
+                       and not is_degenerate_res_id(n.rid)},
         })
 
     by_page: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -117,6 +127,16 @@ def measured() -> dict:
     cross: list[float] = []
     for (_, v1), (_, v2) in itertools.combinations(sorted(by_page.items()), 2):
         cross.append(_containment(v1[0]["ids"], v2[0]["ids"]))
+
+    # 结构（rid-only）版同页/跨页分布——评估「结构等价认页」是否可行（2026-10-16）。
+    def _jaccard(a: set, b: set) -> float:
+        return len(a & b) / len(a | b) if (a or b) else 0.0
+
+    struct_within = [_jaccard(a["struct"], b["struct"])
+                     for v in by_page.values()
+                     for a, b in itertools.combinations(v, 2)]
+    struct_cross = [_jaccard(v1[0]["struct"], v2[0]["struct"])
+                    for (_, v1), (_, v2) in itertools.combinations(sorted(by_page.items()), 2)]
 
     # 跨页误判：不同页名的首份观测被 _same_page(阈值 0.8) 判成"同页"
     firsts = [v[0] for _, v in sorted(by_page.items())]
@@ -139,6 +159,10 @@ def measured() -> dict:
     def median(xs: list[float]) -> float:
         s = sorted(xs)
         return s[len(s) // 2] if s else 0.0
+
+    def q(xs: list[float], p: float) -> float:
+        s = sorted(xs)
+        return s[min(len(s) - 1, int(p * len(s)))] if s else 0.0
 
     # 跨轮 `tried` 复用预测：模拟"跑两轮"，第 1 轮记下 tried={(page_key, bounds)}，
     # 看第 2 轮能命中多少。这是 那个"增量探索疑已静默失效"的**离线复现**。
@@ -186,6 +210,11 @@ def measured() -> dict:
         "cross_median": median(cross),
         "within_pairs": len(within),
         "cross_cmp_pairs": len(cross),
+        "struct_within_median": median(struct_within),
+        "struct_within_p25": q(struct_within, 0.25),
+        "struct_cross_median": median(struct_cross),
+        "struct_cross_false": sum(1 for x in struct_cross if x >= 0.5),
+        "struct_cross_pairs": len(struct_cross),
         "stable_pages": stable_pages,
         "stability": stable_pages / len(multi) if multi else 0.0,
         "per_app": {k: (v[0], v[1]) for k, v in sorted(per_app.items())},
@@ -341,8 +370,53 @@ def test_candidate_pool_baseline(measured: dict) -> None:
 def test_report(measured: dict) -> None:
     """把口径与数字打出来，便于人工核对（`pytest -s` 可见）。"""
     print("\n[页面身份语料] " + _report(measured))
+    print(f"[结构等价评估] rid-only Jaccard 同页中位 {measured['struct_within_median']:.2f}"
+          f"（p25 {measured['struct_within_p25']:.2f}）vs 跨页中位 {measured['struct_cross_median']:.2f}"
+          f"；J≥0.5 跨页误判 {measured['struct_cross_false']}/{measured['struct_cross_pairs']}"
+          f"（{measured['struct_cross_false'] / max(1, measured['struct_cross_pairs']):.1%}）")
     assert measured["trees"] >= 200 and measured["multi_pages"] >= 20, (
         f"语料规模异常偏小：{_report(measured)}")
+
+
+# -- 结构等价认页的可行性实测（2026-10-16） --------------------------------
+# 背景真机案例（tx-news）：轮播「当前位」rid（tv_left_curr）稳定但内容轮换，点击后
+# 落点是**轮换后的另一篇**详情页——若「同 activity + rid 结构重合」可认"同类页"，
+# 走链落点核对就能放行这类轮换（任务②候选方案 pages_equivalent_layout）。
+
+#: 结构等价的跨页误判上限。实测 **6.3%（90/1421）**——远差于 identities 版的 0.3%
+#: （跨页误判门禁 MAX_CROSS_FALSE_MERGE）。
+MAX_STRUCT_FALSE = 0.10
+
+#: 结构等价的同页中位分离度地板。实测同页中位 **0.82** vs 跨页中位 **0.02**——
+#: 中位间隔（0.80）与 identities 版相当，说明 rid 结构在中位意义下判别力是好的。
+MIN_STRUCT_WITHIN = 0.50
+
+
+def test_layout_equivalence_measured_not_adopted(measured: dict) -> None:
+    """记录「结构等价（同 activity + rid Jaccard）认页」的可行性数据。
+
+    **结论（2026-10-16 实测）：数据不支持把它接进落点判据**，只固化为观测指标：
+      - 中位分离度很好（同页 0.82 vs 跨页 0.02），但**尾部双向失败**：
+        ① 同页 p25 仅 0.19——内容型页面（列表翻页/轮换）rid 集差异大，会漏认；
+        ② 跨页存在 J=1.00 的**模板复用**页对（如某 App 的美食频道 vs 酒店民宿，
+        rid 全同）——阈值放多低都会把这类真不同页放进来（6.3% 误判 vs
+        identities 版 0.3%）。
+      - 若哪天要启用，先解决 ②（模板页需要额外判别信号），本测试的两条门禁
+        会在判别力恶化时报警。
+    """
+    w = measured["struct_within_median"]
+    c = measured["struct_cross_median"]
+    assert w >= MIN_STRUCT_WITHIN, (
+        f"同页 rid-Jaccard 中位 {w:.2f} < 地板 {MIN_STRUCT_WITHIN:.2f}（基线 0.82）\n"
+        f"→ rid 结构的判别力退化了（检查 is_degenerate_res_id / parse_nodes 口径）")
+    assert c <= w - 0.30, (
+        f"同页/跨页 rid-Jaccard 间隔只有 {w - c:.2f}（要求 ≥0.30，基线 0.80）\n"
+        f"→ 结构信号不再能区分同页与跨页")
+    rate = measured["struct_cross_false"] / max(1, measured["struct_cross_pairs"])
+    assert rate <= MAX_STRUCT_FALSE, (
+        f"结构等价 J≥0.5 跨页误判率 {rate:.1%} > 上限 {MAX_STRUCT_FALSE:.0%}"
+        f"（{measured['struct_cross_false']}/{measured['struct_cross_pairs']}，基线 6.3%）\n"
+        f"→ 模板复用页变多或 rid 抓取口径变了")
 
 
 # -- 状态指示文案不该参与页面签名（根因） --------------------------------

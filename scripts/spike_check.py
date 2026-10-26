@@ -136,7 +136,13 @@ def _run_task(task: dict, args, suite: dict, run_idx: int, repeat: int) -> dict:
     # （60 分钟白跑）。既有护栏只管「**步骤级** env-failure」，管不到"设备整个消失"。
     try:
         drv = DeviceDriver(args.serial)
-        run = Runner(drv, artifacts).run(case)
+        # **质量闸门**（2026-10-25 口径修复）：`mat run` 一直开着，跑批这里却漏了 ⇒
+        # 同一批用例「日常跑」与「对外报基线」走两条不同路径。实测代价：`gen-183555-1/3/4/5`
+        # 把「跳过开屏广告」「tv_dialog_confirm」写成 onFailure=abort 的必选步骤，
+        # 闸门 R22 明明能识别并自动降级为 continue，但跑批没过闸门 ⇒ 4 条用例在真机上 abort，
+        # 记成基线失败（真因是"用例把引擎已自动清理的噪声又写了一遍"）。
+        # ⚠️ 默认关（保持与历史批次可比）；引用时两档都要给。
+        run = Runner(drv, artifacts, quality_gate=getattr(args, "quality_gate", False)).run(case)
     except Exception as exc:  # noqa: BLE001 —— 驱动异常类型多，统一按"环境问题"处置
         return {"task": task["id"], "run": run_idx, "status": "device-error",
                 "passed": 0, "total": len(case.steps), "blocked": None,
@@ -244,6 +250,10 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1,
                         help="每条任务重复跑几遍（≥2 时给出中位/极差——**对外引用要用这个**）")
     parser.add_argument("--out", help="把汇总写成 JSON（供报告模板 T34 消费）")
+    parser.add_argument("--quality-gate", action="store_true",
+                        help="跑前过质量闸门（与 `mat run` 同一实现 `case_quality.review`）。"
+                             "⚠️ 开闸门后数字是**改后通过率**，不是未过闸门的原始通过率：对外引用必须两档都写，"
+                             "并说明闸门改了几步、改了哪条规则。")
     parser.add_argument("--self-test", action="store_true",
                         help="离线自检汇总口径（不需要真机）")
     args = parser.parse_args()
@@ -264,6 +274,9 @@ def main() -> int:
     repeat = max(1, args.repeat)
     print(f"套件 {suite_path.name} · {len(tasks)} 条任务 × {repeat} 遍"
           f"（共 {sum(len(t['case']['steps']) for t in tasks) * repeat} 步）\n")
+    if getattr(args, "quality_gate", False):
+        print("⚠️ **已开质量闸门**：以下数字是「闸门改后通过率」，**不是未过闸门的原始通过率**。"
+              "对外引用须同时给出未过闸门那一档。\n")
 
     results: list[dict] = []
     blocked_streak = 0

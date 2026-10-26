@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
 from .. import __version__, promptstore
 from ..device import list_adb_devices
 from ..quota import UsageStore
+from ..readiness import EXPLORE_TIP
+from .device import ios_state_devices
 from .runtime import CONSOLE_DIST, _now, source_staleness
 from .workspace import case_meta, list_explores, list_imports, list_indexes, list_runs
 
@@ -19,9 +22,12 @@ def api_state(root: Path, usage: dict | None = None) -> tuple[int, dict]:
     cases_dir = root / "cases"
     # 用例列表不含套件（*.suite.json）——套件是「一次跑多条用例」的编排资产而非用例，
     # 走 /api/suites 单独管理（发起人 2026-10-11：用例套件无需显示在用例列表里）。
-    cases = (sorted(p.name for p in cases_dir.glob("*.json") if not p.name.endswith(".suite.json"))
+    # `_batch_*` 一并滤掉（2026-10-24 兜底）：--app 批量已改内存套件不落盘，但旧工作区
+    # 可能残留历史文件，坏 JSON 曾让列表接口 500（评审附带项）。
+    cases = (sorted(p.name for p in cases_dir.glob("*.json")
+                    if not p.name.endswith(".suite.json") and not p.name.startswith("_batch_"))
              if cases_dir.exists() else [])
-    # 订阅页「套餐」行展示到期日（2026-10-13）：read_license 每次验签 ⇒ 续期（含时长卡
+    # 使用方式页「套餐」行展示到期日（2026-10-13）：read_license 每次验签 ⇒ 续期（含时长卡
     # 核销换发的普通码）写盘后这里自然拿到新日期。plan 落回 free（未激活/已过期）时
     # expires_at 为 None，前端不显示日期。
     from ..licensing import read_license
@@ -36,13 +42,22 @@ def api_state(root: Path, usage: dict | None = None) -> tuple[int, dict]:
         "indexes": list_indexes(root),
         "explores": list_explores(root),
         "usage": usage or UsageStore().snapshot(),
+        # AI 接入方式（2026-10-23）：server=官方代理（体验模式）/ local=自带 Key（标准模式）。
+        # 前端据此显示模式标签，不再靠 gen_limit 是否为 null 猜档位。
+        "ai_mode": "server" if promptstore.is_server() else "local",
         "license": {"plan": lic["plan"], "expires_at": lic.get("expires_at")},
         "code_stale": source_staleness(),
         # 与 doctor.gen / ai_client 校验同口径：server 模式需 KEY；本地模式需 KEY+GEN_MODEL+prompt
         "gen_ready": bool(os.environ.get("GEN_API_KEY"))
         and (promptstore.is_server()
              or (bool(os.environ.get("GEN_MODEL")) and promptstore.resolve("gen") is not None)),
-        "devices": list_adb_devices(),
+        # 遍历探索建议（判据本体保留；2026-10-26 去掉「甜点判据」术语）：单一来源下发
+        "explore_tip": EXPLORE_TIP,
+        # Android(adb) + iOS USB 真机（2026-10-19：控制台真机入口；iOS 侧带 TTL 缓存）
+        "devices": list_adb_devices() + ios_state_devices(),
+        # iOS 工具链（Xcode / simctl / devicectl / xcodebuild）只在 macOS 存在：
+        # Windows/Linux 前端据此隐藏 iOS 环境卡、iOS 运行平台与模拟器入口（2026-10-22）
+        "ios_supported": sys.platform == "darwin",
         "console": "pro" if (CONSOLE_DIST / "index.html").exists() else "legacy",
         "prompt_mode": "server" if promptstore.is_server() else "local",
     }

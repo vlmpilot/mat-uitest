@@ -282,6 +282,21 @@ def test_direct_api_validation_branches(tmp_path, monkeypatch):
     assert code == 400 and "package" in obj["error"]
 
 
+def _has_attached_device() -> bool:
+    """本机是否插着设备（决定下面那条"无设备"用例能不能成立）。"""
+    try:
+        from insta_engine.device import list_adb_devices
+
+        return bool(list_adb_devices())
+    except Exception:  # noqa: BLE001 —— 探测失败按"没设备"处理（宁可跑，不误跳）
+        return False
+
+
+@pytest.mark.skipif(
+    _has_attached_device(),
+    reason="该用例的前提是「无设备」：设备插着时会走真实执行分支（多一步 launch，>15s 未终态），"
+           "断言变成在等一个正常运行的 job。无设备路径由 "
+           "test_api_run_reports_error_job_when_no_device 用 monkeypatch 覆盖，不依赖环境。")
 def test_run_job_fails_gracefully_without_device(server):
     """api_run 全链：无设备时 job 应**优雅落 error**（不是 500、不挂死），事件流可查询。"""
     base, root = server
@@ -445,12 +460,18 @@ def test_invalidate_driver_is_platform_scoped(monkeypatch):
 
 
 def test_api_devices_annotates_platform(server):
-    """GET /api/devices 逐项标注 platform（评审 I4 验收）。"""
+    """GET /api/devices 逐项标注 platform（评审 I4 验收）。
+
+    2026-10-19 起 iOS **USB 真机**也在此列（serial=udid）——断言改为「每项都有
+    platform 且 iOS 项带 udid」，不再假设只有 adb 设备。
+    """
     base, _ = server
     r = requests.get(f"{base}/api/devices", timeout=3)
     assert r.status_code == 200
     for d in r.json()["devices"]:
-        assert d["platform"] == "android", "adb 枚举的设备须标注 platform"
+        assert d["platform"] in ("android", "ios"), "每台设备都必须标注 platform"
+        if d["platform"] == "ios":
+            assert d["serial"], "iOS 真机条目必须带 udid 作 serial"
 
 
 def test_api_explore_blocks_ios_honestly(tmp_path, monkeypatch):
@@ -991,7 +1012,7 @@ def test_api_apps_install_android_happy(tmp_path, monkeypatch):
                         lambda cmd, **k: (cmds.append(cmd), mock.Mock(returncode=0,
                                              stdout="Success", stderr=""))[1])
     code, obj = web_server.api_apps_install(
-        tmp_path, {"serial": "emulator-5554", "platform": "android", "path": str(apk),
+        tmp_path, "127.0.0.1", {"serial": "emulator-5554", "platform": "android", "path": str(apk),
                    "package": "com.x"})
     assert code == 200
     job = _wait_job(obj["job_id"])
@@ -1000,18 +1021,74 @@ def test_api_apps_install_android_happy(tmp_path, monkeypatch):
     assert "版本 9.9.9" in (job["summary"] or ""), "安装后必须回显版本（T76 准入证据链）"
 
 
+def test_api_apps_installed_lists_only_third_party(monkeypatch):
+    """遍历探索的包名候选只列第三方（`pm list packages -3`），排序去重。"""
+    monkeypatch.setattr("insta_engine.web_api.apps.list_adb_devices",
+                        lambda: [{"serial": "dev-1", "state": "device"}])
+    cmds: list[list[str]] = []
+    monkeypatch.setattr("insta_engine.web_api.apps.subprocess.run",
+                        lambda cmd, **k: (cmds.append(cmd), mock.Mock(
+                            returncode=0, stdout="package:com.b\npackage:com.a\n",
+                            stderr=""))[1])
+    code, obj = web_server.api_apps_installed()
+    assert code == 200 and obj["packages"] == ["com.a", "com.b"] and obj["serial"] == "dev-1"
+    assert cmds[0][-1] == "-3", "必须带 -3 过滤系统包"
+
+
+def test_api_apps_installed_requires_online_device(monkeypatch):
+    monkeypatch.setattr("insta_engine.web_api.apps.list_adb_devices", lambda: [])
+    code, obj = web_server.api_apps_installed()
+    assert code == 400 and "设备" in obj["error"]
+
+
 def test_api_apps_install_rejects_wrong_suffix(tmp_path):
     apk = tmp_path / "test.zip"
     apk.write_bytes(b"x")
     code, obj = web_server.api_apps_install(
-        tmp_path, {"serial": "emulator-5554", "platform": "android", "path": str(apk)})
+        tmp_path, "127.0.0.1", {"serial": "emulator-5554", "platform": "android", "path": str(apk)})
     assert code == 400 and ".apk" in obj["error"]
 
 
-def test_api_apps_install_ios_real_device_is_p2(tmp_path):
+def test_api_apps_install_ios_real_rejects_ipa_with_extract_hint(tmp_path):
+    """真机装 .ipa ⇒ 400 且说清「需先解压」（devicectl 只接受 .app 目录）。"""
+    ipa = tmp_path / "x.ipa"
+    ipa.write_bytes(b"PK")
     code, obj = web_server.api_apps_install(
-        tmp_path, {"serial": "00008101-XXX", "platform": "ios", "path": "/tmp/x.ipa"})
-    assert code == 400 and "P2" in obj["error"]
+        tmp_path, "127.0.0.1", {"serial": "00008101-000A1B2C3D4E5F60", "platform": "ios",
+                   "path": str(ipa)})
+    assert code == 400 and ".app" in obj["error"] and "解压" in obj["error"]
+
+
+def test_api_apps_install_ios_real_uses_devicectl(tmp_path, monkeypatch):
+    """真机装 .app ⇒ 走 devicectl（`ios_device.install_app`），不再拒绝。"""
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    app = tmp_path / "Demo.app"
+    app.mkdir()
+    calls: list[tuple] = []
+    monkeypatch.setattr("insta_engine.ios_device.install_app",
+                        lambda udid, path, timeout=180: (calls.append((udid, str(path))),
+                                                         (True, ""))[1])
+    code, obj = web_server.api_apps_install(
+        tmp_path, "127.0.0.1", {"serial": "00008101-000A1B2C3D4E5F60", "platform": "ios",
+                   "path": str(app)})
+    assert code == 200
+    job = _wait_job(obj["job_id"])
+    assert job["status"] == "done"
+    assert calls == [("00008101-000A1B2C3D4E5F60", str(app))]
+
+
+def test_api_apps_install_ios_real_failure_surfaces_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    app = tmp_path / "Demo.app"
+    app.mkdir()
+    monkeypatch.setattr("insta_engine.ios_device.install_app",
+                        lambda udid, path, timeout=180: (False, "签名不匹配"))
+    code, obj = web_server.api_apps_install(
+        tmp_path, "127.0.0.1", {"serial": "00008101-000A1B2C3D4E5F60", "platform": "ios",
+                   "path": str(app)})
+    assert code == 200
+    job = _wait_job(obj["job_id"])
+    assert job["status"] == "error" and "签名不匹配" in (job["error"] or "")
 
 
 def test_api_apps_uninstall_local_only_and_happy(tmp_path, monkeypatch):
@@ -1031,6 +1108,38 @@ def test_api_apps_uninstall_local_only_and_happy(tmp_path, monkeypatch):
     assert any("uninstall" in c and "com.x" in c for c in cmds)
 
 
+def test_api_apps_install_local_only(tmp_path):
+    """安装与卸载同为改写设备状态的操作——分享模式下局域网来源禁用（评审 P1-2）。"""
+    apk = tmp_path / "test.apk"
+    apk.write_bytes(b"x")
+    code, obj = web_server.api_apps_install(
+        tmp_path, "192.168.1.9",
+        {"serial": "emulator-5554", "platform": "android", "path": str(apk)})
+    assert code == 403 and "仅限本机" in obj["error"]
+
+
+def test_api_apps_install_rejects_unsafe_package(tmp_path):
+    """package 会拼进 `dumpsys package <pkg>` 设备 shell——非法形状在边界 400。"""
+    apk = tmp_path / "test.apk"
+    apk.write_bytes(b"x")
+    for bad in ("com.x; rm -rf /sdcard/x", "../../etc", "/abs/path", "com.x&reboot"):
+        code, obj = web_server.api_apps_install(
+            tmp_path, "127.0.0.1",
+            {"serial": "emulator-5554", "platform": "android", "path": str(apk),
+             "package": bad})
+        assert code == 400 and "包名" in obj["error"], bad
+
+
+@pytest.mark.parametrize("endpoint", ["api_index", "api_describe"])
+@pytest.mark.parametrize("bad", ["../x", "/etc/x", "com.x;whoami", "~root", "c:win"])
+def test_package_endpoints_reject_unsafe_package(tmp_path, endpoint, bad):
+    """契约测试（评审 P1-1/P2-6）：所有把 package 拼进 artifacts 路径/设备 shell 的
+    端点都必须过 safe_package_name 闸口——index/describe 曾漏（explore 早已有）。"""
+    fn = getattr(web_server, endpoint)
+    code, obj = fn(tmp_path, {"package": bad})
+    assert code == 400 and "包名" in obj["error"], f"{endpoint} 放行了 {bad!r}"
+
+
 def test_api_fs_browse_ext_filter(tmp_path):
     (tmp_path / "app.apk").write_bytes(b"x")
     (tmp_path / "sub").mkdir()
@@ -1038,6 +1147,18 @@ def test_api_fs_browse_ext_filter(tmp_path):
     assert code == 200 and obj["files"] == ["app.apk"] and obj["dirs"] == ["sub"]
     code, obj = web_server.api_fs_browse("127.0.0.1", str(tmp_path))
     assert obj.get("files", []) == [], "不带 ext 不得返回文件（工作区切换器行为不变）"
+
+
+def test_local_only_gates_by_client_ip():
+    """本机能力门控按客户端来源 IP 判定（2026-10-15 修复：旧实现误传 server_address，
+    --share 下监听地址恒 0.0.0.0 ⇒ 分享模式连本机也被 403）。0.0.0.0 必拒是回归判据：
+    谁再把 server 监听地址传进来，这条立刻红。"""
+    from insta_engine.web_api.workspace import _local_only
+    assert _local_only("127.0.0.1") is None
+    assert _local_only("::1") is None
+    for ip in ("192.168.1.9", "10.0.0.2", "0.0.0.0"):
+        code, obj = _local_only(ip)
+        assert code == 403 and "仅限本机" in obj["error"]
 
 
 # -- 套件保存（编辑=原地覆盖/改标题=重命名删旧，发起人 2026-10-12 反馈编辑保存变新建） --
@@ -1083,6 +1204,54 @@ def test_suite_save_edit_missing_original_404(tmp_path):
     (tmp_path / "cases" / "c1.json").write_text(_case_json(), encoding="utf-8")
     code, obj = api_suite_save(tmp_path, {"file": "幽灵.suite.json", "title": "x", "cases": ["c1.json"]})
     assert code == 404 and "原套件不存在" in obj["error"]
+
+
+def test_suite_save_with_null_file_creates_not_404(tmp_path):
+    """🔴 回归（2026-10-25 用户实测）：「新建套件」前端传 file: null（JSON null），
+    `str(body.get("file", ""))` 把 None 变成字符串 "None" → 解析出 cases/None.suite.json
+    当"原套件" → 新建永远 404「原套件不存在: None」。null/缺失/空串统一按新建处理。"""
+    from insta_engine.web_api.cases import api_suite_save, list_suites
+    (tmp_path / "cases").mkdir(exist_ok=True)
+    (tmp_path / "cases" / "c1.json").write_text(_case_json(), encoding="utf-8")
+    for file_value in (None, ""):  # null 与空串统一按新建
+        code, obj = api_suite_save(tmp_path, {"file": file_value, "title": "回归套件",
+                                              "cases": ["c1.json"]})
+        assert code == 200, (file_value, obj)
+    assert [s["file"] for s in list_suites(tmp_path)] == ["回归套件.suite.json"]
+
+
+# -- 用例重命名（2026-10-25，目录功能的轻量替代） --------------------------------------
+
+def test_case_rename_updates_suite_references(tmp_path):
+    """🔴 重命名带着套件引用走：条目文件名同步替换,内容原样保留。"""
+    from insta_engine.web_api.cases import api_case_rename, api_suite_save, list_suites
+    (tmp_path / "cases").mkdir(exist_ok=True)
+    (tmp_path / "cases" / "c1.json").write_text(_case_json(), encoding="utf-8")
+    (tmp_path / "cases" / "c2.json").write_text(_case_json(), encoding="utf-8")
+    code, obj = api_suite_save(tmp_path, {"title": "混合", "cases": ["c1.json", "c2.json"]})
+    assert code == 200, obj
+    code, obj = api_case_rename(tmp_path, {"from": "c1.json", "to": "search-bt"})
+    assert code == 200 and obj["file"] == "search-bt.json"
+    assert obj["suites_updated"] == ["混合.suite.json"]
+    suite = json.loads((tmp_path / "cases" / "混合.suite.json").read_text(encoding="utf-8"))
+    assert suite["cases"] == ["search-bt.json", "c2.json"], "引用按位置替换,未引用条目不动"
+    assert (tmp_path / "cases" / "search-bt.json").exists()
+    assert not (tmp_path / "cases" / "c1.json").exists()
+    # 套件清单不受影响
+    assert [s["file"] for s in list_suites(tmp_path)] == ["混合.suite.json"]
+
+
+def test_case_rename_rejections(tmp_path):
+    """撞名 / .suite.json 命名空间 / 源不存在 / 非法名,全部拒绝且不产生半改状态。"""
+    from insta_engine.web_api.cases import api_case_rename
+    (tmp_path / "cases").mkdir(exist_ok=True)
+    (tmp_path / "cases" / "a.json").write_text(_case_json(), encoding="utf-8")
+    (tmp_path / "cases" / "b.json").write_text(_case_json(), encoding="utf-8")
+    assert api_case_rename(tmp_path, {"from": "a.json", "to": "b.json"})[0] == 400
+    assert api_case_rename(tmp_path, {"from": "a.json", "to": "x.suite.json"})[0] == 400
+    assert api_case_rename(tmp_path, {"from": "幽灵.json", "to": "x.json"})[0] == 404
+    assert api_case_rename(tmp_path, {"from": "../a.json", "to": "x.json"})[0] == 400
+    assert (tmp_path / "cases" / "a.json").exists(), "拒绝路径不得动原文件"
 
 
 # -- 编辑器 P0/P1：控件清单查询 + 保存警告（发起人 2026-10-12） --------------------
@@ -1355,3 +1524,282 @@ def test_api_calibrate_apply_marks_ignore_and_false_positive(tmp_path, monkeypat
 
     html = (run_dir / "report.html").read_text(encoding="utf-8")
     assert "已忽略" in html and "误判" in html and "校准原因" in html
+
+
+def test_ios_state_devices_only_wired_and_tagged(monkeypatch):
+    """控制台设备清单（2026-10-19）：iOS **只列 USB** 真机，serial=udid、platform=ios。
+
+    Wi-Fi 设备列出来用户一点投屏就是必失败（USBClient 只认 USB），所以这里守住判据。
+    """
+    from insta_engine.web_api import device as dev_api
+
+    wired = {"udid": "00008101-000A1B2C3D4E5F60", "name": "手机", "model": "iPhone 15",
+             "os_version": "17.4", "transport": "wired"}
+    wifi = dict(wired, udid="00008110-000B2C3D4E5F6071", name="平板",
+                model="iPad Air", transport="localNetwork")
+    monkeypatch.setattr("insta_engine.ios_device.list_devices", lambda: [wifi, wired])
+    dev_api._ios_cache[:] = [0.0, []]  # 清 TTL 缓存，避免命中上一轮
+    out = dev_api.ios_state_devices()
+    assert [d["serial"] for d in out] == ["00008101-000A1B2C3D4E5F60"], "只列 USB 真机"
+    assert out[0]["platform"] == "ios" and out[0]["state"] == "device"
+    assert out[0]["model"] == "iPhone 15" and out[0]["os"] == "17.4"
+
+
+# -- 成员名额：本机恒 1 人；共享模式按授权给（2026-10-23 / 2026-10-25） -------------
+
+def test_seats_endpoint_reports_local_single_seat(server):
+    """本机监听（默认 `mat console`）⇒ 上限 1、shared=false。
+
+    `--share`（共享模式）由 `make_server(host="0.0.0.0")` 触发；绑定全部网卡在测试里
+    不稳定，所以那一侧的口径由 test_seat_quota.py 的 `seat_limit(shared=True)` 成对锁住
+    （2026-10-25：仅团队授权才给名额，未授权恒 1）。
+    """
+    base, _ = server
+    data = requests.get(f"{base}/api/seats", timeout=5).json()
+    assert data["limit"] == 1, "本机控制台不该出现第二个成员名额"
+    assert data["shared"] is False
+
+
+# -- 前置拒跑（P1-7，2026-10-24）：web 与 CLI 同口径 --------------------------------
+
+def _unprovisionable_case_json() -> str:
+    case = TestCase.model_validate({
+        "caseId": "case_perm", "name": "位置权限用例", "target": {"package": "com.insta.demo"},
+        "preconditions": ["位置权限尚未授予"],
+        "steps": [{"id": "s1", "action": "wait", "params": {"ms": 10}}],
+    })
+    return dump_dsl(case)
+
+
+def test_api_run_refuses_unprovisionable_precondition(tmp_path, monkeypatch):
+    """带否定式权限前置的用例：web 必须与 CLI 同口径**拒跑**（P1-7）——
+    此前控制台照跑并产出假定位失败报告，用户按报告排查、方向从源头就错。
+    拒跑发生在取设备之前：job 正常完成（非 error）、事件流有 refused、报告落盘。
+    """
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    root = tmp_path / "ws"
+    (root / "cases").mkdir(parents=True)
+    (root / "cases" / "perm.json").write_text(_unprovisionable_case_json(), encoding="utf-8")
+
+    def no_device(*_a, **_k):  # 拒跑在 get_driver 之前——被调用即失败
+        raise AssertionError("refused case must not touch a device")
+
+    monkeypatch.setattr("insta_engine.web_api.runs.get_driver", no_device)
+    code, obj = web_server.api_run(root, {"case": "perm.json"})
+    assert code == 200, obj
+    job = _wait_job(obj["job_id"])
+    assert job["status"] == "done", f"拒跑应正常完成，实际 {job['status']}"
+    assert any(e.get("status") == "refused" or "拒跑" in str(e.get("detail", ""))
+               for e in job["events"]), job["events"]
+    assert (root / "artifacts" / "perm" / "report.html").exists(), "最小报告必须落盘"
+
+
+def test_api_run_allow_unmet_preconditions_bypasses_refusal(tmp_path, monkeypatch):
+    """allowUnmetPreconditions 放行（与 CLI --allow-unmet-preconditions 同语义）：
+    闸门不能是永远打不开的门——放行后按正常链路走（无设备则优雅落 error）。"""
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    root = tmp_path / "ws"
+    (root / "cases").mkdir(parents=True)
+    (root / "cases" / "perm.json").write_text(_unprovisionable_case_json(), encoding="utf-8")
+
+    def no_device(*_a, **_k):
+        raise RuntimeError("Can't find any android device/emulator")
+
+    monkeypatch.setattr("insta_engine.web_api.runs.get_driver", no_device)
+    code, obj = web_server.api_run(root, {"case": "perm.json", "allowUnmetPreconditions": True})
+    assert code == 200, obj
+    job = _wait_job(obj["job_id"])
+    assert job["status"] == "error", "放行后走正常执行链路（无设备优雅落 error）"
+
+
+def test_api_run_suite_refuses_entry_without_device(tmp_path, monkeypatch):
+    """套件逐条拒跑（P1-7）：refused 条目 emit skipped 事件、不取设备；
+    后续正常条目才走设备链路（无设备时 job 落 error，但拒跑事件已可查）。"""
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    root = tmp_path / "ws"
+    (root / "cases").mkdir(parents=True)
+    # a_perm 排在前面：先拒跑（continue），b 才触发取设备
+    (root / "cases" / "a_perm.json").write_text(_unprovisionable_case_json(), encoding="utf-8")
+    (root / "cases" / "b.json").write_text(_case_json(), encoding="utf-8")
+    (root / "cases" / "s.suite.json").write_text(
+        json.dumps({"name": "s", "cases": ["a_perm.json", "b.json"]}), encoding="utf-8")
+
+    def no_device(*_a, **_k):
+        raise RuntimeError("Can't find any android device/emulator")
+
+    monkeypatch.setattr("insta_engine.web_api.runs.get_driver", no_device)
+    code, obj = web_server.api_run(root, {"case": "s.suite.json"})
+    assert code == 200, obj
+    job = _wait_job(obj["job_id"])
+    assert job["status"] == "error"
+    assert any("拒跑" in str(e.get("detail", "")) for e in job["events"]), \
+        f"拒跑条目必须在事件流可见，实际 {job['events']}"
+    assert (root / "artifacts" / "01_a_perm" / "report.html").exists()
+
+
+def test_api_run_app_batch_no_tmp_file(tmp_path, monkeypatch):
+    """--app 批量（评审附带项，2026-10-24 修）：与多选分支同法内存构建套件，
+    不得再往 cases/ 写 `_batch_<pkg>.json`（污染列表、坏 JSON 曾致 500）。"""
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    root = tmp_path / "ws"
+    (root / "cases").mkdir(parents=True)
+    (root / "cases" / "a.json").write_text(_case_json(), encoding="utf-8")
+
+    def no_device(*_a, **_k):
+        raise RuntimeError("Can't find any android device/emulator")
+
+    monkeypatch.setattr("insta_engine.web_api.runs.get_driver", no_device)
+    code, obj = web_server.api_run(root, {"app": "com.insta.demo"})
+    assert code == 200, obj
+    assert not list((root / "cases").glob("_batch_*")), "--app 批量不得落盘临时套件"
+
+
+def test_api_state_hides_leftover_batch_files(tmp_path, monkeypatch):
+    """兜底过滤：旧工作区残留的 `_batch_*.json`（即使是坏 JSON）不进用例列表。"""
+    monkeypatch.setenv("INSTA_HOME", str(tmp_path / "home"))
+    root = tmp_path / "ws"
+    (root / "cases").mkdir(parents=True)
+    (root / "cases" / "good.json").write_text(_case_json(), encoding="utf-8")
+    (root / "cases" / "_batch_com_x.json").write_text("{broken", encoding="utf-8")
+    code, obj = web_server.api_state(root)
+    assert code == 200
+    assert obj["cases"] == ["good.json"]
+
+
+# -- /api/app/probe 来源门控（MAT 评估 2026-10-24 P1-6） ---------------------------
+
+def test_api_app_probe_local_only_gating(tmp_path):
+    """probe 可探测任意本机安装包 ⇒ 必须与 /api/fs 同门控：局域网来源 403，本机放行。
+
+    此前 docstring 宣称"同信任模型"但实现没有 `_local_only`——`--share` 下持口令的
+    局域网用户可枚举任意 APK 的包名/版本。
+    """
+    from insta_engine.web_api.apps import api_app_probe
+
+    code, obj = api_app_probe(str(tmp_path / "x.apk"), host="192.168.1.23")
+    assert code == 403 and "仅限本机" in obj["error"]
+
+    code, obj = api_app_probe(str(tmp_path / "x.apk"), host="127.0.0.1")
+    assert code == 200 and obj == {"package": "", "label": "", "version": ""}, \
+        "本机来源照常（不存在的路径静默回空）"
+
+
+# -- /live 实时视图页（2026-10-24，T4 演示包组件） ------------------------------
+
+def _make_job(meta=None):
+    import insta_engine.web_server as ws
+
+    def job(emit, cancel):
+        emit("s1", "passed", "ok", 12, "screenshots/step_01.png")
+        return "done", None
+
+    return ws.start_job("run", job, meta=meta or {})
+
+
+def test_live_page_unknown_job_is_404_html(server):
+    base, _ = server
+    r = requests.get(f"{base}/live/nonexistent00", timeout=5)
+    assert r.status_code == 404
+    assert "任务不存在" in r.text
+    assert "text/html" in r.headers["Content-Type"]
+
+
+def test_live_page_renders_job_and_poll_endpoints(server):
+    base, _ = server
+    jid = _make_job(meta={"serial": "SER123", "platform": "android", "operator": "u"})
+    # 等 job 跑完（worker 很快），页面任何状态都必须可渲染
+    _wait_job(jid)
+    r = requests.get(f"{base}/live/{jid}", timeout=5)
+    assert r.status_code == 200 and "text/html" in r.headers["Content-Type"]
+    body = r.text
+    assert jid in body, "页面要内嵌 job_id 供轮询"
+    assert "/api/job/events?id=" in body
+    assert "/api/screenshot?serial=" in body, "带 serial 的任务应显示投屏"
+
+
+def test_live_page_without_serial_shows_hint(server):
+    base, _ = server
+    jid = _make_job(meta={})  # 无 serial（如纯 API 用例/生成任务）
+    _wait_job(jid)
+    r = requests.get(f"{base}/live/{jid}", timeout=5)
+    assert r.status_code == 200
+    assert "该任务不使用设备" in r.text
+    assert '"serial": ""' in r.text, "boot 数据里 serial 必须为空（投屏分支关闭）"
+
+
+def test_live_without_id_picks_latest_job(server):
+    base, _ = server
+    from insta_engine.web_api.live import latest_job_id
+
+    _make_job(meta={"serial": "SER1"})
+    jid2 = _make_job(meta={"serial": "SER2"})
+    _wait_job(jid2)
+    assert latest_job_id() == jid2
+    r = requests.get(f"{base}/live", timeout=5)
+    assert r.status_code == 200 and jid2 in r.text, "/live 应落到最近的任务"
+
+
+def test_live_page_not_swallowed_by_spa_fallback(server):
+    """/live/* 必须在 SPA 兜底之前接管——被 index.html 吞掉 = 空白页。"""
+    base, _ = server
+    jid = _make_job(meta={"serial": "S"})
+    _wait_job(jid)
+    r = requests.get(f"{base}/live/{jid}", timeout=5)
+    assert "MAT 实时视图" in r.text, "必须是 live 页本体，不是 console 的 index.html"
+
+
+def test_api_run_response_carries_live_link(tmp_path, monkeypatch):
+    """run/explore 响应带 live 链接（agent/前端给用户的可点入口）。"""
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    root = tmp_path / "ws"
+    (root / "cases").mkdir(parents=True)
+    (root / "cases" / "r.json").write_text(_case_json(), encoding="utf-8")
+
+    def no_device(*_a, **_k):
+        raise RuntimeError("no device")
+
+    monkeypatch.setattr("insta_engine.web_api.runs.get_driver", no_device)
+    code, obj = web_server.api_run(root, {"case": "r.json"})
+    assert code == 200 and obj["live"] == f"/live/{obj['job_id']}"
+
+
+# -- /live 与 --share 口令门（2026-10-25 评审 P1 回归） ---------------------------
+
+@pytest.fixture()
+def shared_server(tmp_path, monkeypatch):
+    """带访问口令的真 HTTP 服务器（--share 形态）。"""
+    monkeypatch.setenv("INSTA_HOME", str(tmp_path / "home"))
+    key = "share-pass-123"
+    srv = web_server.make_server(0, root=tmp_path, auth_key=key)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(30):
+        try:
+            requests.get(f"{base}/api/state", timeout=1)
+            break
+        except requests.ConnectionError:
+            time.sleep(0.1)
+    yield base, key
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_live_page_requires_auth_under_share(shared_server):
+    """P1 回归：--share 未认证 → /live 必须给门槛页（HTML 非 JSON），且响应体
+    **不得含 serial**（首版曾绕过白名单直读页面元数据，真机探针实证后修）。"""
+    base, key = shared_server
+    jid = _make_job(meta={"serial": "SER_SECRET", "platform": "android", "operator": "u"})
+    _wait_job(jid)
+
+    for path in (f"/live/{jid}", "/live"):
+        r = requests.get(f"{base}{path}", timeout=5)
+        assert r.status_code == 401, path
+        assert "text/html" in r.headers["Content-Type"], "页面类路径应给门槛页而非 401 JSON"
+        assert "SER_SECRET" not in r.text, f"门槛页不得泄漏 serial: {path}"
+
+    # 带口令仍可用（门槛不是死门）：登录换 cookie 后 200 且含 BOOT 元数据
+    s = requests.Session()
+    assert s.post(f"{base}/api/auth", json={"key": key}, timeout=5).status_code == 200
+    r3 = s.get(f"{base}/live/{jid}", timeout=5)
+    assert r3.status_code == 200 and "SER_SECRET" in r3.text

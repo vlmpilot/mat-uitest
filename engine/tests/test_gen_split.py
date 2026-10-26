@@ -110,6 +110,8 @@ def _wait_job(jid: str, timeout: float = 5.0):
 def test_api_gen_splits_bills_once_and_dedups(tmp_path, monkeypatch):
     monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
     monkeypatch.setenv("INSTA_HOME", str(tmp_path / "home"))  # 隔离配额与 license
+    # 官方代理模式：完成提示才带「本月生成用量」（自带 API Key 只说明不占平台额度）
+    monkeypatch.setenv("GEN_PROMPT_MODE", "server")
     root = tmp_path / "ws"
     payload = {"cases": [_case("c1"), _case("c2"), _case("c1")]}  # 第三条重复 caseId
     monkeypatch.setattr(GenClient, "from_env", staticmethod(lambda: _gen_client_stub(payload)))
@@ -150,25 +152,26 @@ def test_api_gen_truncates_over_max_split(tmp_path, monkeypatch):
     assert "截断 2 条" in job["summary"], job["summary"]
 
 
-def test_api_gen_quota_precheck_fails_job(tmp_path, monkeypatch):
-    """额度预检失败 → job error（模型不该被调用）；消息要给可行动提示。"""
+def test_api_gen_survives_exhausted_local_counter(tmp_path, monkeypatch):
+    """P0-2：本地计数耗尽不再拦截 job（拦截归官方代理 429）；模型照常被调用。"""
     monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
     monkeypatch.setenv("INSTA_HOME", str(tmp_path / "home"))
     root = tmp_path / "ws"
 
-    def exhausted(self, amount=1.0):
-        from insta_engine.quota import QuotaExceeded
-        raise QuotaExceeded("本月免费生成额度不足（剩 0 次，本次需 1 次）。")
-
-    monkeypatch.setattr("insta_engine.quota.UsageStore.ensure_capacity", exhausted)
+    from datetime import UTC, datetime
+    month = datetime.now(UTC).strftime("%Y-%m")
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "usage.json").write_text(
+        json.dumps({"month": month, "gen_count": 10 ** 6, "vision_count": 0}),
+        encoding="utf-8")
     monkeypatch.setattr(GenClient, "from_env",
-                        staticmethod(lambda: pytest.fail("预检失败不许调模型")))
+                        staticmethod(lambda: _gen_client_stub({"cases": [_case("ok")]})))
 
     code, obj = web_server.api_gen(root, {"nl": "x", "package": "com.mat.demo"})
     assert code == 200
     job = _wait_job(obj["job_id"])
-    assert job["status"] == "error", job
-    assert "额度不足" in job["error"], job["error"]
+    assert job["status"] == "done", job
 
 
 def test_api_gen_emits_quality_events(tmp_path, monkeypatch):

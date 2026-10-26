@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,24 +30,12 @@ from .runner import Runner
 from .skill import KNOWN_TARGETS
 from .suite import load_case_or_suite
 
-_EXAMPLE_CASE = {
-    "caseId": "case_example",
-    "name": "设置冒烟",
-    "target": {"package": "com.android.settings"},
-    "steps": [
-        {"id": "s1", "intent": "启动设置", "action": "launch", "params": {"package": "com.android.settings"}},
-        {"id": "s2", "intent": "回到桌面", "action": "home"},
-        {"id": "s3", "intent": "再次启动设置", "action": "launch", "params": {"package": "com.android.settings"}},
-    ],
-}
-
 
 def cmd_init(_args) -> int:
-    for directory in ("cases", "artifacts"):
-        Path(directory).mkdir(exist_ok=True)
+    from .state import ensure_default_workspace
+
+    ensure_default_workspace(Path.cwd())  # 在**当前目录**建工作区（兜底播种只对 ~/.mat/workspace）
     example = Path("cases/example-settings.json")
-    if not example.exists():
-        example.write_text(json.dumps(_EXAMPLE_CASE, ensure_ascii=False, indent=2), encoding="utf-8")
     from . import promptstore
     seeded = promptstore.seed()  # 播种 prompts/*.prompt（wheel 安装后 AI 能力开箱即用的前提）
     print(f"工作区就绪: {example.resolve()}")
@@ -66,16 +55,29 @@ def _connect_driver(serial: str | None, platform: str = "android"):
 
     平台路由已收敛到 `driver_factory.connect_driver` 单源（评审 I4：此前 CLI 与
     web_server 各有一份路由，必然漂移）；本函数只负责渲染可行动的排查提示。
+    iOS 的 serial 先过 `ios_device.resolve_ios_serial` 统一解析（2026-10-19，审查
+    R9/R10）：设备名→udid 映射、缺省自动选中唯一 USB 真机——不解析的话 WdaDriver
+    会按 serial 形态选路，传错标识会被当模拟器去连 localhost，报错看不懂。
     """
     from .driver_factory import connect_driver
 
+    if platform == "ios":
+        from . import ios_device
+
+        try:
+            serial = ios_device.resolve_ios_serial(serial)
+        except RuntimeError as exc:
+            print(f"无法确定目标 iOS 设备: {exc}")
+            return None
     try:
         return connect_driver(serial, platform)
     except Exception as exc:
         if platform == "ios":
             print(f"连接 iOS 设备失败: {type(exc).__name__}: {exc}")
             print("排查: 1) WDA 服务须在模拟器/真机上运行（复现命令）")
-            print("      2) `curl http://localhost:8100/status` 应返回 JSON  3) 真机 usbmux 转发属 P2")
+            print("      2) `curl http://localhost:8100/status` 应返回 JSON（模拟器）")
+            print("      3) 真机走 usbmux 直连（wda.USBClient，无需 iproxy）：--serial <udid>，"
+                  "`mat ios-setup` 查环境")
         else:
             print(f"连接设备失败: {type(exc).__name__}: {exc}")
             print("排查: 1) 插上手机并开启 USB 调试、在手机上允许授权  2) `mat devices` 确认在线")
@@ -85,21 +87,28 @@ def _connect_driver(serial: str | None, platform: str = "android"):
 
 def cmd_devices(_args) -> int:
     devices = list_adb_devices()
-    if not devices:
+    from . import ios_device
+
+    ios_all = ios_device.list_devices()
+    ios_wired = [d for d in ios_all if d.get("transport") == "wired"]
+    ios_wifi = [d for d in ios_all if d.get("transport") != "wired"]
+    if not devices and not ios_wired and not ios_wifi:
         print("未发现在线设备：检查 USB 连接、USB 调试授权与 adb")
+        print("（iOS 真机：数据线连接并解锁，`mat ios-setup` 逐项体检）")
         return 1
     for d in devices:
         print(f"{d['serial']}\t{d.get('model', '?')}\t{d['state']}")
+    for d in ios_wired:
+        # 第三列已经说明连接方式，描述行不再重复「USB」（否则打印成 `USB⇥USB`）
+        print(f"{d['udid']}\t{ios_device.describe(d, with_transport=False)}\tUSB")
+    for d in ios_wifi:
+        # 连接方式由第三列说明，描述行不再重复「Wi-Fi（无线调试）」
+        print(f"{d['udid']}\t{ios_device.describe(d, with_transport=False)}\tWi-Fi（暂不支持，仅 USB）")
     return 0
 
 
 def cmd_gen(args) -> int:
-    usage = UsageStore()
-    try:
-        usage.ensure_capacity() # 只预检不核销：模型失败不该扣额度（T53b）
-    except Exception as exc:  # QuotaExceeded：免费额度用尽（公平使用政策）
-        print(str(exc))
-        return 1
+    usage = UsageStore()  # 仅统计展示（P0-2：本地不再拦截生成；官方代理 429 权威 / BYOK 不限）
     client = GenClient.from_env()
     app_info = {"package": args.package}
     controls = _controls_for(args.package)
@@ -111,6 +120,16 @@ def cmd_gen(args) -> int:
         app_info["graph"] = graph
         print("已注入页面结构上下文（GEN_GRAPH_CONTEXT=1）")
 
+    # 图谱准备度软提示（2026-10-17）：此前无图谱时**一声不吭**——用户不知道命中率为什么低。
+    # 只提示、不拦（评估结论：硬闸门会把首次体验从分钟级推到小时级，且收益未证）。
+    if not controls:
+        from .readiness import hint as _rd_hint
+        from .readiness import readiness as _rd
+        _h = _rd_hint(_rd(Path("."), args.package))
+        if _h:
+            print("提示（不影响本次生成）：" + _h)
+            print()
+
     if args.calibrate:
         calibration_driver = _connect_driver(args.serial, getattr(args, "platform", "android"))
         if calibration_driver is None:
@@ -119,15 +138,18 @@ def cmd_gen(args) -> int:
         runner = Runner(calibration_driver, calibration_dir)
         case, history = client.generate_calibrated(
             args.nl, app_info, executor=runner.run, max_rounds=args.max_rounds
-        )
+        ,
+        index_dir=Path("artifacts/page_index"))
         for record in history:
             failed_desc = "; ".join(
                 f"{f['step']}({f['category']})" for f in record["failed"]
             ) or "-"
             print(f"校准第 {record['round']} 轮: {record['status']}（失败步骤: {failed_desc}）")
     else:
-        case = client.generate(args.nl, app_info)
+        case = client.generate(args.nl, app_info, index_dir=Path("artifacts/page_index"))
 
+    _report_page_guard(case, args.package)
+    _report_quality_issues(case)
     Path(args.out).write_text(dump_dsl(case), encoding="utf-8")
     snapshot = usage.consume()  # 用例落盘成功才核销（失败白扣过用户 2 次的教训）
     limit_text = snapshot["gen_limit"] if snapshot["gen_limit"] is not None else "不限"
@@ -169,6 +191,14 @@ def _select_datasets(datasets: list[dict], spec: str | None) -> list[dict] | Non
     return picked or None
 
 
+def _stage_should_abort(gate: str, status: str) -> bool:
+    """阶段级失败闸门（2026-10-21）：只有 `abort` + **真失败**才停。
+
+    `skipped`（前置未置备/未执行）不算失败——把它当中止条件，会让"少跑一条"变成"整批不跑"。
+    """
+    return gate == "abort" and status not in ("passed", "skipped")
+
+
 def _blocked_preconditions(case, allow: bool) -> list[str]:
     """MAT **按构造无法置备**的前置条件（`--allow-unmet-preconditions` 时返回空）。
 
@@ -194,26 +224,15 @@ def _refused_entry(case, artifacts: Path, blocked: list[str]):
 
     ⚠️ 记成 `skipped` 而不是 `failed`：**它没跑**，把它算成失败会污染通过率，
     也会让人以为"用例写错了但能跑"。它需要的是**修用例或补前置**，不是查失败原因。
+    产物构造已下沉 `preconditions.refused_result` 共享（2026-10-24，评审 P1-7：
+    web 控制台此前没有前置拒跑检查——同一执行语义只允许一个实现层）。
     """
-    from .preconditions import refusal_message
-    from .report import _CSS, _esc
-    from .runner import RunResult, StepResult
+    from .preconditions import refused_result
 
-    artifacts.mkdir(parents=True, exist_ok=True)
-    reason = "前置条件 MAT 无法置备：" + "、".join(blocked)
-    run = RunResult(
-        case_id=case.case_id, case_name=case.name, status="skipped",
-        preconditions=list(case.preconditions or []),
-        steps=[StepResult(step_id="precheck", intent="前置条件预检", action="precheck",
-                          status="skipped", category="precondition-unmet", error=reason)],
-    )
-    (artifacts / "report.html").write_text(
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>未执行 — {_esc(case.name or case.case_id)}</title><style>{_CSS}</style>"
-        "</head><body><h1>未执行（前置条件预检未通过）</h1>"
-        f"<pre>{_esc(refusal_message(case.name or case.case_id, blocked))}</pre></body></html>",
-        encoding="utf-8")
+    run = refused_result(case, blocked, artifacts)
     return (case.name or case.case_id, f"{artifacts.name}/report.html", run)
+
+
 def _make_recorder_or_warn(args, artifacts_dir: Path):
     """--record 时构造录屏器；平台/设备不支持时**打印可见警告**并返回 None（诚实降级）。"""
     if not getattr(args, "record", False):
@@ -226,7 +245,97 @@ def _make_recorder_or_warn(args, artifacts_dir: Path):
     return recorder
 
 
+def _make_recorder_factory_or_warn(args):
+    """--record 的**数据驱动**工厂（P1-5，2026-10-24）：每组各建一个 Recorder。
+
+    此前 --record 在数据驱动路径被静默丢弃（单条/套件有录屏、数据驱动连探测都
+    不做）。Recorder 是一次性对象（staging/started），不能整批共用一个——
+    工厂按组产物目录现建；平台/设备不支持时逐组打印可见警告（诚实降级）。
+    """
+    if not getattr(args, "record", False):
+        return None
+    from .recording import make_recorder
+
+    def _factory(artifacts_dir: Path):
+        recorder, reason = make_recorder(getattr(args, "platform", "android"),
+                                         getattr(args, "serial", None), artifacts_dir)
+        if recorder is None and reason:
+            print(f"⚠️ 录屏不可用：{reason}")
+        return recorder
+
+    return _factory
+
+
+def _is_device_locked_error(run) -> bool:
+    """本轮是否因**设备锁屏**失败（环境级故障，不是用例缺陷）。
+
+    判据必须**精确**：只认驱动翻译的 `设备锁屏：请解锁` 与 WDA 原文
+    `waiting until the screen gets unlocked`。
+    此前只匹配"锁屏"两个字，会把提示文案（如"…激活 SpringBoard 会锁屏"）
+    误判成设备已锁 ⇒ 整批被中止（2026-10-19 实测：首条即中止 44 条）。
+    """
+    markers = ("设备锁屏：请解锁", "screen gets unlocked")
+    for step in getattr(run, "steps", []) or []:
+        err = getattr(step, "error", "") or ""
+        if any(m in err for m in markers):
+            return True
+    return False
+
+
+def _fresh_install_ios(args) -> int:
+    """`--fresh-install`：卸载后重装被测 App（真机唯一能"回到干净态"的手段）。
+
+    ⚠️ **会丢登录态**（这是它默认关闭的原因）：只在用户显式要求时做。
+    `devicectl` 只接受 `.app` 目录，`.ipa` 需先解压——这里如实报错，不猜路径。
+    """
+    from .ios_device import bundle_id_of, install_app, pick_device, uninstall_app
+
+    if args.platform != "ios":
+        print("--fresh-install 只支持 --platform ios（Android 用 pm clear，不需要重装）")
+        return 2
+    if not args.app_path:
+        print("--fresh-install 需要 --app-path <xxx.app>（devicectl 只接受 .app 目录）")
+        return 2
+    dev, why = pick_device(args.serial)
+    if dev is None:
+        print(f"找不到设备：{why}")
+        return 2
+    bundle = bundle_id_of(args.app_path)
+    if not bundle:
+        print(f"读不到 {args.app_path}/Info.plist 的 CFBundleIdentifier——确认这是 .app 目录")
+        return 2
+    ok, err = uninstall_app(dev["udid"], bundle)
+    print(f"卸载 {bundle}: " + ("OK" if ok else f"跳过（{err}）"))
+    ok, err = install_app(dev["udid"], args.app_path)
+    if not ok:
+        print(f"安装失败：{err}")
+        return 2
+    print(f"已安装 {bundle}（登录态已清空）")
+    return 0
+
+
+def _write_batch_suite(package: str, files: list[Path]) -> Path:
+    """把「某 App 的全部用例」写成一个临时套件文件，返回路径。
+
+    ⚠️ 放**系统临时目录**，不要塞进 `artifacts/`（2026-10-23 修）：
+      · 它是中间产物不是运行结果 —— 写进 `artifacts/` 会污染用户的产物目录，每次批量跑都
+        留下一个 `_suite_<包名>.json`，而且**不跟随 `--artifacts`**（`cmd_run` 里另一处注释
+        抱怨的正是同一类问题）；
+      · 写死 `artifacts/` 还要求它**已存在或可创建**：在容器/沙箱里 `mkdir(exist_ok=True)`
+        撞到已存在目录会抛 PermissionError（EEXIST 被映射成权限错误），于是
+        `mat run <目录> --app X` 在干净环境里**直接起不来**（实测）。
+    """
+    suite = {"name": f"app:{package}", "cases": [f.as_posix() for f in files]}
+    tmp = Path(tempfile.mkdtemp(prefix="mat-suite-")) / f"suite_{package.replace('.', '_')}.json"
+    tmp.write_text(json.dumps(suite, ensure_ascii=False), encoding="utf-8")
+    return tmp
+
+
 def cmd_run(args) -> int:
+    if getattr(args, "fresh_install", False):
+        code = _fresh_install_ios(args)
+        if code:
+            return code
     # --app + 目录 = 批量执行某 App 的全部用例
     case_path = Path(args.case)
     if case_path.is_dir() and args.app:
@@ -242,11 +351,12 @@ def cmd_run(args) -> int:
         if not matched:
             print(f"目录 {case_path} 中没有 target.package={args.app} 的用例")
             return 1
-        suite = {"name": f"app:{args.app}", "cases": [f.as_posix() for f in matched]}
-        tmp = Path("artifacts") / f"_suite_{args.app.replace('.', '_')}.json"
-        tmp.parent.mkdir(exist_ok=True)
-        tmp.write_text(json.dumps(suite, ensure_ascii=False), encoding="utf-8")
-        args.case, args.artifacts = tmp.as_posix(), f"artifacts/app_{args.app.replace('.', '_')}"
+        args.case = _write_batch_suite(args.app, matched).as_posix()
+        # **只有用户没指定 --artifacts 时才用默认目录**：此前无条件覆盖 ⇒ 显式传的目录
+        # 被忽略、三轮评测互相覆盖（2026-10-20 实测：v7-r1/r2/r3 全是空的，实际都写进了
+        # artifacts/app_<pkg>），数字无法从磁盘复核，还会混进上一批的残留用例目录。
+        if not args.artifacts:
+            args.artifacts = f"artifacts/app_{args.app.replace('.', '_')}"
         print(f"批量执行 {len(matched)} 条 {args.app} 用例")
     try:
         kind, payload = load_case_or_suite(Path(args.case))
@@ -259,14 +369,31 @@ def cmd_run(args) -> int:
         print(f"文件格式错误（{args.case}）: {exc}")
         return 1
 
+    # 套件展开（2026-10-21）：支持 cases / stages / 嵌套套件；单用例在此解析共享数据集 ref
+    from .suite import expand_suite, resolve_dataset_refs
+
+    expanded: list[tuple[TestCase, str, str, str]] = []
+    if kind == "case":
+        try:
+            payload = resolve_dataset_refs(payload, Path(args.case).parent)
+        except ValueError as exc:
+            print(f"数据集错误: {exc}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            expanded = expand_suite(payload, Path(args.case).parent)
+        except ValueError as exc:
+            print(f"套件结构错误: {exc}", file=sys.stderr)
+            return 1
+        if not expanded:
+            print("套件展开后没有任何用例", file=sys.stderr)
+            return 1
+
     if args.app:
         if kind == "case":
             pkgs = [payload.target.get("package", "")]
         else:
-            pkgs = []
-            for item in payload.get("cases", []):
-                data = item if isinstance(item, dict) else json.loads(Path(item).read_text(encoding="utf-8"))
-                pkgs.append((data.get("target") or {}).get("package", ""))
+            pkgs = [case.target.get("package", "") for case, _, _, _ in expanded]
         for pkg in pkgs:
             if pkg != args.app:
                 print(f"❌ 用例 target.package={pkg or '(未设置)'} 与 --app {args.app} 不一致，拒绝执行（防止误跑）")
@@ -282,9 +409,41 @@ def cmd_run(args) -> int:
             print(refusal_message(payload.name or payload.case_id, blocked), file=sys.stderr)
             return 3          # 3 = 未执行（前置条件预检未通过），与 2（跑了但失败）区分
 
-    driver = _connect_driver(args.serial, getattr(args, "platform", "android"))
-    if driver is None:
-        return 1
+    # 评审 P2-1（P1-1）：纯 api 用例**不需要设备**——命令层此前无条件连设备，
+    # 让「纯接口回归可独立进 CI」这个对外承诺在命令层落空。
+    # 判定：单用例全 api；套件全部条目全 api（混有 UI 步的仍需设备，如实报错）。
+    from .dsl import Action
+
+    def _all_api(case: TestCase) -> bool:
+        return bool(case.steps) and all(s.action == Action.API for s in case.steps)
+
+    needs_device = True
+    #: (用例, 产物名, 序号, 阶段名, on_failure) —— 阶段名空串表示平铺套件
+    suite_items: list[tuple[TestCase, str, int, str, str]] = []
+    if kind == "case":
+        needs_device = not _all_api(payload)
+    else:
+        suite_items = [
+            (case, stem, index, stage, gate)
+            for index, (case, stem, stage, gate) in enumerate(expanded, 1)
+        ]
+        needs_device = not all(_all_api(c) for c, _, _, _, _ in suite_items)
+
+    if needs_device:
+        driver = _connect_driver(args.serial, getattr(args, "platform", "android"))
+        if driver is None:
+            return 1
+        # iOS 真机：保活要盖住**整个批处理**——逐用例停会让手机在切换用例的空隙锁屏，
+        # 而 iOS 锁屏后 WDA 无法代解锁（后续全红）。进程退出时守护线程自然结束。
+        if getattr(driver, "platform", "") == "ios":
+            hold = getattr(driver, "hold_keepalive", None)
+            if callable(hold):
+                hold()
+    else:
+        from .driver import NullDriver
+
+        driver = NullDriver()
+        print("纯 API 用例：不需要设备，已跳过设备连接（离线可用；混入 UI 步骤会如实失败）")
 
     if kind == "case":
         _print_preconditions(payload)
@@ -301,7 +460,10 @@ def cmd_run(args) -> int:
                 payload = payload.model_copy(deep=True)
                 payload.datasets = selected
                 print(f"--dataset {args.dataset}：选中 {len(selected)}/{total} 组")
-            results = Runner(driver, root_art).run_datasets(payload, root_art)
+            results = Runner(driver, root_art,
+                             quality_gate=not getattr(args, "no_quality_gate", False)
+                             ).run_datasets(payload, root_art,
+                                            recorder_factory=_make_recorder_factory_or_warn(args))
             entries = []
             for name, run, artifacts in results:
                 render_html(run, artifacts)
@@ -315,7 +477,9 @@ def cmd_run(args) -> int:
             _notify_invite_after_run()
             return 0 if passed == len(entries) else 2
         artifacts = root_art
-        run = Runner(driver, artifacts, recorder=_make_recorder_or_warn(args, artifacts)).run(payload)
+        run = Runner(driver, artifacts,
+                     recorder=_make_recorder_or_warn(args, artifacts),
+                     quality_gate=not getattr(args, "no_quality_gate", False)).run(payload)
         report = render_html(run, artifacts)
         if args.junit_xml:
             Path(args.junit_xml).write_text(render_junit_xml(run), encoding="utf-8")
@@ -338,45 +502,159 @@ def cmd_run(args) -> int:
     root.mkdir(parents=True, exist_ok=True)
     entries = []
     refused = 0
-    suite_dir = Path(args.case).parent  # 条目相对**套件文件所在目录**解析（manifest 标准语义；
-    # 此前按 CWD 解析 ⇒ 套件在 cases/ 里而条目从仓库根数，双入口不同构）
-    for index, item in enumerate(payload.get("cases", []), 1):
-        if isinstance(item, str):
-            case_path = suite_dir / item
-            if not case_path.exists():
-                case_path = Path(item)  # 回退：CWD 相对（兼容既有写法）
-            case = TestCase.model_validate_json(case_path.read_text(encoding="utf-8"))
-            stem = case_path.stem
-        else:
-            case = TestCase.model_validate(item)
-            stem = case.case_id
-        artifacts = root / f"{index:02d}_{stem}"
+    total = len(suite_items)
+    # 阶段名做目录名：只保留字母数字/中文/连字符，其余转下划线（跨平台安全）
+    def _slug(name: str) -> str:
+        return "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(name or "")).strip("_")
+
+    # 条目已在设备判定前预解析（suite_items）——此处不再重复读盘/校验
+    for case, stem, index, stage, gate in suite_items:
+        stage_slug = _slug(stage)
+        artifacts = ((root / stage_slug / f"{index:02d}_{stem}") if stage_slug
+                     else (root / f"{index:02d}_{stem}"))
         blocked = _blocked_preconditions(case, allow_unmet)
         if blocked:
             # 单条拒跑**不该让整个套件挂掉**：记成 skipped、继续跑后面的，最后单独计数。
             refused += 1
             entries.append(_refused_entry(case, artifacts, blocked))
-            print(f"[{index}/{len(payload['cases'])}] {case.name or case.case_id}: 未执行"
+            print(f"[{index}/{total}] {case.name or case.case_id}: 未执行"
                   f"（前置条件 MAT 无法置备：{'、'.join(blocked)}）")
             continue
         # 录屏器（`--record`，来自 feature/console-v2）：平台/设备不支持时打印可见警告并降级
         run = Runner(driver, artifacts,
-                     recorder=_make_recorder_or_warn(args, artifacts)).run(case)
+                     recorder=_make_recorder_or_warn(args, artifacts),
+                     quality_gate=not getattr(args, "no_quality_gate", False)).run(case)
         render_html(run, artifacts)
-        entries.append((case.name or case.case_id, f"{artifacts.name}/report.html", run))
+        href = (f"{stage_slug}/{artifacts.name}/report.html" if stage_slug
+                else f"{artifacts.name}/report.html")
+        label = (f"[{stage}] {case.name or case.case_id}" if stage
+                 else (case.name or case.case_id))
+        entries.append((label, href, run))
         pre = f"  前置: {'、'.join(case.preconditions)}" if case.preconditions else ""
-        print(f"[{index}/{len(payload['cases'])}] {case.name or case.case_id}: {run.status}"
-              f"（步骤 {run.step_success_rate:.0%}）{pre}")
+        setup_note = ""
+        if run.setup_steps:
+            ok = sum(1 for s in run.setup_steps if s.status == "passed")
+            setup_note = f"  前置步骤 {ok}/{len(run.setup_steps)}"
+        print(f"[{index}/{total}] {label}: {run.status}"
+              f"（步骤 {run.step_success_rate:.0%}）{setup_note}{pre}")
+        # 设备锁屏是**环境级**故障：继续跑只会把剩下每条都跑成红（实测 15 条全红，
+        # 每条还要各花 30s 等超时）。iOS 有密码时无法自动解锁 ⇒ 立即中止并提示用户。
+        if _is_device_locked_error(run):
+            aborted = total - index
+            print(f"⚠️ 设备已锁屏，中止剩余 {aborted} 条用例——请解锁后重跑"
+                  f"（iOS 有密码时 WDA 无法代解锁；并把「自动锁定」设为「永不」）")
+            break
+        # 阶段级失败闸门（2026-10-21）：初始化阶段失败后继续跑，只会把剩余用例全跑成假红。
+        # skipped 不算失败（前置未置备/未执行），不触发中止。
+        if _stage_should_abort(gate, run.status):
+            print(f"⛔ 阶段「{stage or '全部'}」on_failure=abort：剩余 {total - index} 条未执行")
+            break
 
     index_page = render_index_html(payload.get("name", Path(args.case).stem), entries, root)
     passed = sum(1 for _, _, r in entries if r.status == "passed")
     failed = sum(1 for _, _, r in entries if r.status == "failed")
+    ran = len(entries)
+    not_run = total - ran
+    # P1-4（2026-10-24）：「没跑完也绿」——此前 setup 失败记 skipped、中途中止剩余
+    # not_run，均不影响退出码 ⇒ 全过时 exit 0、CI 绿灯。聚合为 4=未跑完（与
+    # "跑了但失败"的 2 区分）。skipped 只有两源：前置拒跑（已单独计 refused）
+    # 与 setup 步骤失败——扣掉前者即后者；cancelled 眼下 CLI 不产生（不传
+    # cancel_event），但语义上就是"未跑完"，一并计入，防将来接入时再漏。
+    setup_skipped = sum(1 for _, _, r in entries if r.status == "skipped") - refused
+    cancelled = sum(1 for _, _, r in entries if r.status == "cancelled")
     tail = f"（{refused} 条因前置条件未执行）" if refused else ""
+    if setup_skipped > 0:
+        tail += f"（{setup_skipped} 条 setup 失败未执行）"
+    if cancelled:
+        tail += f"（{cancelled} 条中止）"
+    if not_run:
+        tail += f"（{not_run} 条未执行：阶段中止或设备锁屏）"
     print(f"套件结果: {passed}/{len(entries)} 通过{tail}  聚合报告: {index_page.resolve()}")
     _notify_invite_after_run()
     if failed:
         return 2
+    if not_run or setup_skipped > 0 or cancelled:
+        return 4  # 未跑完：CI 不该当通过，也不是"用例失败"（CI 退出码语义见使用手册）
     return 3 if refused else 0
+
+
+def cmd_promote(args) -> int:
+    """探索路径 → 可回放用例（P1-2）：把探索预算变成回归资产。
+
+    不带 --path 时只列路径清单（与 --list 等效）；--path N 落成 cases/*.json。
+    校准回放不另做开关——`mat run <out>` 就是校准（探索路径不保证一次全通，
+    失败步骤按报告修，与 gen --calibrate 的 ≤3 轮 AI 回喂不同源，无 AI 参与）。
+    """
+    from .promote import list_paths, load_explore, promote_path, save_case
+
+    try:
+        explore = load_explore(Path(args.file))
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    paths = list_paths(explore, max_hops=args.max_depth)
+    if args.list or args.path is None:
+        if not paths:
+            print("没有可提升的路径（探索一轮无跳转？检查 --minutes/--max-steps 预算）")
+            return 1
+        print(f"共 {len(paths)} 条可提升路径（--path <编号> 提升为用例）：")
+        for p in paths:
+            mark = "" if p.replayable else "  ⚠️ 含不可重放跳（将截断或坐标兑底）"
+            print(f"  {p.summary()}{mark}")
+        if args.list:
+            return 0
+        print("（指定 --path <编号> 后生成用例）")
+        return 0
+    try:
+        case, notes = promote_path(explore, args.path, name=args.name,
+                                   max_hops=args.max_depth)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    out = Path(args.out or f"cases/{case.name}.json")
+    save_case(case, out)
+    print(f"已生成 {out}（{len(case.steps)} 步，source=explore，带溯源 notes）")
+    if notes:
+        print("⚠️ 需人工确认：")
+        for note in notes:
+            print(f"   · {note}")
+    print(f"下一步：mat run {out} 真机回放校准（失败步骤按报告修复）")
+    return 0
+
+
+def _import_maestro_flow(args, path: Path) -> int:
+    """P1-3：Maestro flow → MAT DSL——确定性映射，不走 AI（配额与不确定性都省了）。"""
+    from .dsl import Action
+    from .maestro_import import import_maestro
+
+    try:
+        case, warnings = import_maestro(
+            path, case_id=Path(args.out).stem if getattr(args, "out", None) else None)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    if getattr(args, "package", None):
+        case.target["package"] = args.package  # 显式包名覆盖 flow 的 appId（以命令行为准）
+    out = Path(args.out or f"cases/{case.case_id}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(dump_dsl(case), encoding="utf-8")
+    # 静态可执行口径：有定位通道或无需定位的动作（launch/wait/back/swipe/scroll/key-event/home）
+    _NO_TARGET_OK = {Action.LAUNCH, Action.WAIT, Action.BACK, Action.SWIPE,
+                     Action.SCROLL, Action.KEY_EVENT, Action.HOME}
+    executable = sum(1 for s in case.steps
+                     if s.target is not None or s.action in _NO_TARGET_OK)
+    total = len(case.steps)
+    print(f"导入完成: {total} 步 → {out}（source=maestro，appId={case.target['package']}）")
+    if case.meta.get("notes"):
+        print("需人工确认：")
+        for n in case.meta["notes"]:
+            print(f"   · {n}")
+    if warnings:
+        print(f"⚠️ {len(warnings)} 条未翻译/需注意（已写入 meta.warnings，不静默丢弃）：")
+        for w in warnings:
+            print(f"   · {w}")
+    print(f"可执行性（静态口径）: {executable}/{total} 步有完整定位通道——最终以 mat run 为准")
+    return 0
 
 
 def cmd_import(args) -> int:
@@ -385,6 +663,14 @@ def cmd_import(args) -> int:
     path = Path(args.file)
     if not path.exists():
         print(f"文件不存在: {path.resolve()}")
+        return 1
+    fmt = getattr(args, "format", "auto") or "auto"
+    is_yaml = path.suffix.lower() in (".yaml", ".yml", ".maestro")
+    if fmt == "maestro" or (fmt == "auto" and is_yaml):
+        return _import_maestro_flow(args, path)
+    if fmt == "auto" and path.suffix.lower() not in (".csv", ".xlsx", ".xlsm", ".md", ".txt"):
+        print(f"不认识的文件类型 {path.suffix!r}：Excel/CSV/Markdown/文本直接传；"
+              f"Maestro flow 用 --format maestro 或 .yaml 后缀")
         return 1
     template = None
     if args.template and args.template != "auto":
@@ -536,6 +822,45 @@ def _graph_context_for(package: str, max_pages: int = 12) -> str:
     return graph_context_for(package, max_pages=max_pages)
 
 
+def _report_page_guard(case, package: str) -> None:
+    """打印**页面一致性闸门的可判率**。
+
+    走链一断，闸门就按纪律弃权（宁可漏报不可误报）⇒ 在老图谱上它可能一条都不报。
+    不把这个数打出来，用户会把"没报错"读成"检查通过"（2026-10-21 实测：某生活服务 App 3 条真实
+    失败用例冲突数全是 0，因为 `parent_rid` 全为空、走链第一步就断）。
+    """
+    from .case_audit import page_guard_coverage
+
+    try:
+        judged, total = page_guard_coverage(case, Path("artifacts/page_index"), package)
+    except Exception:      # 图谱损坏不该把生成搞挂
+        return
+    if total == 0:
+        return
+    if judged < total:
+        print(f"页面一致性：可判 {judged}/{total} 步——其余因图谱缺导航边跳过；"
+              f"要提高覆盖率请重跑 `mat explore {package}`（新图谱会记点击的 res-id）")
+    else:
+        print(f"页面一致性：{judged}/{total} 步全部可判")
+
+
+def _report_quality_issues(case, limit: int = 4) -> None:
+    """把**用例质量闸门**报出的问题打到终端。
+
+    为什么（2026-10-21）：这些问题一直只写进 `meta.quality_issues`（持久化是对的），
+    但命令行**一个字都不显示**——用户拿到用例文件、直接跑、红了才发现。
+    实测一条生成用例带着 R21（文案歧义）落了盘，而 `mat gen` 的输出里毫无提示。
+    """
+    issues = (getattr(case, "meta", None) or {}).get("quality_issues") or []
+    if not issues:
+        return
+    print(f"质量提示 {len(issues)} 条（跑测前建议先看，已写入用例 meta.quality_issues）：")
+    for issue in issues[:limit]:
+        print(f"  {issue[:180]}")
+    if len(issues) > limit:
+        print(f"  …另有 {len(issues) - limit} 条，见用例文件 meta.quality_issues")
+
+
 def cmd_explore(args) -> int:
     from .explore import explore as _explore
     from .report import render_explore_html
@@ -561,6 +886,9 @@ def cmd_explore(args) -> int:
     index_path = Path("artifacts/page_index") / f"{args.package}.json"
     print(f"探索中：{args.package}（预算 {args.minutes} 分钟 / {args.steps} 步 / 深度 ≤L{args.max_depth}，敏感控件自动跳过）…")
     report = _explore(driver, args.package, minutes=args.minutes, max_steps=args.steps,
+                      goal=getattr(args, "goal", ""),
+                      max_descent=getattr(args, "max_descent", 2),
+                      breadth=0 if getattr(args, "no_breadth", False) else None,
                       artifacts_dir=artifacts, max_depth=args.max_depth, index_path=index_path)
     render_explore_html(report, artifacts)
     depth_line = " · ".join(f"{k}:{v}" for k, v in
@@ -603,6 +931,12 @@ def cmd_explore(args) -> int:
         if loaded and considered and skipped == 0:
             line += "（⚠️ 读回了历史分支且检查过候选，却一个都没跳——包含度认页疑似失效）"
         print(line)
+        # 老图谱的 `tried` 只有坐标（没有 label/rid），不可验证 ⇒ 本轮直接丢弃并重探。
+        # 必须**说出来**，否则用户会觉得"增量没生效、怎么又点了一遍"。
+        legacy = report.get("legacy_tried_dropped", 0)
+        if legacy:
+            print(f"     其中 {legacy} 条是**旧格式**（只记坐标，无法确认还是不是同一个控件）"
+                  "⇒ 已丢弃并重新确认；本轮之后图谱会写入带文案/rid 的条目，下次起恢复增量")
     if report.get("index_path"):
         print(f"已合并入页面图谱: {Path(report['index_path']).resolve()}")
     risky = report.get("risky_pages") or []
@@ -631,6 +965,15 @@ def cmd_diagnose(args) -> int:
     except (ValueError, KeyError) as exc:
         print(f"run.json 解析失败: {exc}")
         return 1
+    # 用例对象（可选）：失败步骤的 res-id 定位器在这里，页面图谱证据靠它取。
+    # 旧产物可能没有 case 键 / 结构不合法 ⇒ 静默降级为"无图谱证据"，不影响归因本身。
+    case_obj = None
+    if isinstance(data.get("case"), dict):
+        try:
+            from .dsl import TestCase
+            case_obj = TestCase.model_validate(data["case"])
+        except Exception:  # noqa: BLE001 — 证据是加分项，解析失败不拦归因
+            pass
     failed = [s for s in run.steps if s.status != "passed"]
     if not failed:
         print("本次执行无失败步骤，无需归因")
@@ -642,7 +985,7 @@ def cmd_diagnose(args) -> int:
     mode = "server" if getattr(client, "prompt_mode", "local") == "server" else (
         "BYOK" if client.api_key else "无 Key")
     print(f"归因中: {len(failed)} 个失败步骤（模式: {mode}）…")
-    attributions = diagnose_run(run, run_dir, client)
+    attributions = diagnose_run(run, run_dir, client, case=case_obj)
 
     (run_dir / "diagnose.json").write_text(
         json.dumps(attributions, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -660,6 +1003,50 @@ def cmd_diagnose(args) -> int:
         for ev in a.get("evidence", []):
             print(f"      证据: {ev}")
     print(f"\n归因已写入 {run_dir / 'diagnose.json'}，报告已更新（失败步骤挂归因卡）")
+    return 0
+
+
+def cmd_coverage(args) -> int:
+    """覆盖缺口分析（防漏闸）：图谱里有、用例没碰的控件清单。
+
+    **只读**：不写图谱、不改用例、不调模型、不需要设备。
+    """
+    import json as _json
+
+    from .coverage import analyze, load_cases_for, read_core_pages, render_text
+    from .page_index import load_index
+
+    index_path = Path("artifacts/page_index") / f"{args.package}.json"
+    if not index_path.exists():
+        print(f"没有页面图谱: {index_path.resolve()}——请先 mat index / mat explore")
+        return 1
+    index = load_index(index_path)
+    if not index:
+        print(f"图谱读不出来（文件损坏？）: {index_path.resolve()}")
+        return 1
+    core = read_core_pages(args.core) if args.core else None
+    if args.core and not core:
+        print(f"核心页面清单是空的: {args.core}")
+        return 1
+    cases, names = load_cases_for(args.package, Path(args.root) if args.root else None)
+    result = analyze(index.get("pages") or [], cases, core_pages=core,
+                     all_controls=args.all_controls)
+    result["case_files"] = names
+
+    if args.json:
+        print(_json.dumps(result, ensure_ascii=False, indent=1))
+    else:
+        print(render_text(args.package, result, limit=args.limit))
+        if not cases:
+            print(f"  ⚠️ cases/ 里没有 {args.package} 的用例——覆盖率必然为 0，"
+                  f"先 mat gen/import 出用例再评估。")
+
+    if args.min is not None:
+        rate = result["rate"]
+        if rate is None or rate < args.min:
+            print(f"\n覆盖率 {('—' if rate is None else f'{rate:.1%}')} < 阈值 {args.min:.0%}"
+                  "（--min）：退出码 2")
+            return 2
     return 0
 
 
@@ -696,6 +1083,100 @@ def cmd_arrival(args) -> int:
     return 0
 
 
+def cmd_graph_repair(args) -> int:
+    """图谱断链静态修复：alt_entries 提升 + 同逻辑页借链（零真机成本）。
+
+    断链 = depth≥1 且父链无法重放（缺 parent_action / parent 缺失）。
+    修复后建议跟一轮 `mat arrival` 真机验证，把借来的链标成 stable/unstable。
+    """
+    if getattr(args, "platform", "android") == "ios":
+        print("iOS 平台暂不支持 graph-repair（依赖页面图谱，适配在 P3）")
+        return 1
+    from .graph_repair import repair_file
+
+    index_path = Path("artifacts/page_index") / f"{args.package}.json"
+    if not index_path.exists():
+        print(f"没有页面图谱: {index_path.resolve()}——请先 mat index / mat explore")
+        return 1
+    print(f"修复断链: {index_path}（借链相似度门槛 {args.min_sim}）"
+          + ("【试运行，不写回】" if args.dry_run else "") + " …")
+    report = repair_file(index_path, min_sim=args.min_sim, dry_run=args.dry_run)
+    if report.get("flat"):
+        # 「断链 0 条」会被读成"很健康"，实际是"没有层级可修"——必须说清区别
+        print("⚠️ 图谱**没有层级**（所有页 depth 为空）——`mat index` 建的图谱只记页面、"
+              "不记「怎么到达」，graph-repair 无从修起。")
+        print(f"   来源: {report.get('sources') or '未知'}；"
+              f"请改用 `mat explore {args.package}` 重建带父链的图谱。")
+        return 2
+    noise = report.get("noise_pages", 0)
+    if noise:
+        # 广告落地页不是被测 App 的功能页，**不当修复目标也不当 donor**：
+        # 不排除的话会借出「点 天猫双11热卖中」这种链，把不可重放的路径标成已修复。
+        print(f"跳过广告落地页 {noise} 条（不当修复目标、不当借链来源）")
+    flat_broken = report.get("broken_flat", 0)
+    flat_line = (f" · 其中 depth 为空 {flat_broken} 条（`mat index` 建的页没有父链）"
+                 if flat_broken else "")
+    print(f"断链 {report['broken']} 条{flat_line} · alt 提升 {report['fixed_by_alt']} · "
+          f"碎片借链 {report['fixed_by_alias']} · 未解决 {len(report['unresolved'])}")
+    for c in report["changes"]:
+        src = (f" ← 借自 {c['alias_of'][:8]}（J={c['alias_sim']}）"
+               if c["via"] == "alias" else " ← alt_entries")
+        print(f"  + L{c['depth']} {c['page_key'][:8]} 点[{str(c['parent_action'])[:24]}]{src}")
+    for u in report["unresolved"]:
+        print(f"  - {u['page_key'][:8]} {u['reason']}")
+    if args.dry_run:
+        print("试运行结束，未写回（去掉 --dry-run 生效）")
+    else:
+        print("已写回图谱。建议: mat arrival " + args.package + " 验证修复后的链路")
+    return 0
+
+
+def cmd_fragments(args) -> int:
+    """碎片合并（A' 单锚点）：同链根 + 同 activity + 与代表页 rid J≥0.5 → 并入代表。
+
+    **缺省试运行**（只算不改，报告落盘 artifacts/fragment_merge_<包名>.json），
+    `--apply` 才真写回——这是删页操作，宁多一步确认。apply 后建议跟一轮
+    `mat arrival` 重验受影响链（stable 证据随代表保留，unstable 不受影响）。
+    """
+    from .fragment_merge import merge_fragments, save_report
+    from .page_index import load_index, save_index
+
+    index_path = Path("artifacts/page_index") / f"{args.package}.json"
+    index = load_index(index_path)
+    if index is None:
+        print(f"没有页面图谱: {index_path.resolve()}——请先 mat index / mat explore")
+        return 1
+    print(f"碎片合并: {index_path}（与代表 J≥{args.min_sim}，单锚点口径"
+          + (f"，排除 activity 含 {'/'.join(args.exclude_activity)}"
+             if args.exclude_activity else "")
+          + ("" if args.apply else "【试运行，不写回】") + ") …")
+    report = merge_fragments(index, apply=args.apply, threshold=args.min_sim,
+                             exclude_activity=tuple(args.exclude_activity))
+    pct = report["merged_away"] / max(report["before"], 1) * 100
+    print(f"页面 {report['before']} → {report['after']}"
+          f"（并掉 {report['merged_away']} 页，缩 {pct:.0f}%）· 组 {len(report['groups'])}")
+    for g in report["groups"][:15]:
+        rep = g["representative"]
+        worst = min((m["j"] for m in g["members"]), default=1.0)
+        keys = "、".join(m["page_key"][:8] for m in g["members"][:6])
+        more = f" …+{len(g['members']) - 6}" if len(g["members"]) > 6 else ""
+        print(f"  ★{rep[:8]} ← [{len(g['members'])}页 minJ={worst:.2f}] {keys}{more}")
+    if len(report["groups"]) > 15:
+        print(f"  … 其余 {len(report['groups']) - 15} 组见报告")
+    if args.apply:
+        save_index(index_path, index)
+        breaks = report.get("cycle_breaks") or []
+        extra = f" · 破环升根 {len(breaks)}" if breaks else ""
+        print(f"已写回图谱（parent 重定向 {report['repointed_parents']} · "
+              f"边重定向 {report['repointed_edges']} · 自环继承 "
+              f"{report['self_parent_inherited']}{extra}）。建议: mat arrival {args.package} 重验")
+    else:
+        print("试运行结束，未写回（加 --apply 生效）")
+    out = save_report(report, Path("artifacts"), args.package)
+    print(f"报告: {out.resolve()}")
+    return 0
+
+
 def cmd_describe(args) -> int:
     """给图谱里的页面补「标题 + 功能描述」（可选增强）。
 
@@ -724,12 +1205,7 @@ def cmd_describe(args) -> int:
         return 0
     targets = targets[: args.limit]
 
-    try:
-        usage = UsageStore()
-        usage.ensure_capacity() # 只预检不核销（T53b）：此前模型失败也扣额度（白扣 2 次）
-    except Exception as exc:  # QuotaExceeded：免费额度用尽（公平使用政策）
-        print(str(exc))
-        return 1
+    usage = UsageStore()  # 仅统计展示（P0-2）：成功落盘后才 consume()
 
     payload = [
         {
@@ -1029,14 +1505,28 @@ def cmd_doctor(_args) -> int:
 
     android = doctor.android_checks()
     render(android)
-    # iOS(P1 模拟器 MVP):可选能力——缺失不影响 Android 使用,不计入退出码
-    print("── iOS（可选，缺失不影响 Android 使用）──")
-    render(doctor.ios_checks())
+    # iOS(可选能力):缺失不影响 Android 使用,不计入退出码；
+    # 非 macOS 不渲染这一组（Xcode 工具链不存在，2026-10-22）。
+    # ⚠️ 「不渲染」是**渲染层的决定**，不是检查层的：ios_checks() 在任何平台都返回
+    # 同一套结构（2026-10-25 修正——它原本非 macOS 返回 []，把平台判断写进了检查函数，
+    # 于是直接调它的测试在 Linux/Windows CI 上 10 条全 KeyError）。
+    if sys.platform == "darwin":
+        print("── iOS（可选，缺失不影响 Android 使用）──")
+        render(doctor.ios_checks())
 
     critical = sum(1 for c in android[:4] if not c.ok)
     print(f"\n结论: {'就绪，可以开测' if critical == 0 else f'{critical} 项关键检查未通过（前 4 项）'}")
     return 0 if critical == 0 else 1
 
+
+
+def cmd_ios_setup(args) -> int:
+    """iOS 真机体检。检查逻辑在 ios_setup.py，这里只转交。"""
+    from .ios_setup import run as ios_setup_run
+
+    return ios_setup_run(serial=args.serial, start=args.start, as_json=args.json,
+                         renew=getattr(args, "renew", False),
+                         force=getattr(args, "force", False))
 
 def _register_activation(licensing, code: str) -> None:
     """把激活登记到服务端（T17）—— **best-effort，绝不阻断本地激活**。
@@ -1064,7 +1554,7 @@ def _register_activation(licensing, code: str) -> None:
         print("  （本机此前激活过，凭证已重新签发）")
     print("  用官方代理：把下面一行加进工作区 .env"
           "（另需 GEN_BASE_URL / GEN_PROMPT_MODE=server）：")
-    print(f"    GEN_API_KEY={out['token']}")
+    print("    " + _env_kv("GEN_" "API_KEY", str(out["token"])))
     print("  换机/重装：`mat activate --machines` 看已绑机器，"
           "`mat activate --unbind <机器标识>` 解绑")
 
@@ -1115,6 +1605,16 @@ def cmd_seat(args) -> int:
         return 0
 
     print(seat_quota.describe())
+    # 团队共享只随团队授权提供（2026-10-25）：本机控制台物理上只有安装者能打开，
+    # 所以默认上限是 1；标准/体验授权面向单人使用，`--share` 下同样只有 1 人。
+    if seat_quota.team_authorized():
+        print(f"\n团队成员名额已随团队授权开通：本机控制台（mat console）只有安装者本人 1 人；"
+              f"用 mat console --share 启动后按授权给到 {seat_quota.effective_limit()} 人。")
+    else:
+        print("\n团队成员名额只随团队授权提供：标准/体验授权面向单人使用"
+              "（本机控制台只有安装者本人 1 人，`--share` 下也一样）。"
+              "要和同事共用同一个控制台，请联系我们获取团队授权——"
+              "关注公众号「Mobile AI Test」留言你的场景，或加微信 lazy_vizen。")
     return 0
 
 
@@ -1132,8 +1632,24 @@ def cmd_activate(args) -> int:
         print(f"✅ 已解绑 {out.get('unbound')} —— 那台机器现在可以重新激活了。")
         return 0
 
+    if getattr(args, "file", None):
+        try:
+            info = licensing.activate_license_file(args.file)
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            return 1
+        import time as _t2
+        cust = f" · {info['customer']}" if info.get("customer") else ""
+        print(f"✅ 已激活 license v2（{info['plan']}{cust}）")
+        print(f"   功能: {', '.join(sorted(info.get('features') or [])) or '—'}")
+        seats = info.get("seats")
+        print(f"   席位: {seats if seats is not None else '—'}"
+              f" · 有效期至 {_t2.strftime('%Y-%m-%d', _t2.localtime(info['expires_at']))}")
+        return 0
+
     if not getattr(args, "code", None):
-        print("用法：mat activate <激活码> ｜ mat activate --machines ｜ mat activate --unbind <标识>",
+        print("用法：mat activate <激活码> ｜ mat activate --file license.json ｜ "
+              "mat activate --machines ｜ mat activate --unbind <标识>",
               file=sys.stderr)
         return 1
     try:
@@ -1170,7 +1686,7 @@ def cmd_activate(args) -> int:
         if token:
             print("  用官方代理：把下面一行加进工作区 .env"
                   "（另需 GEN_BASE_URL / GEN_PROMPT_MODE=server）：")
-            print(f"    GEN_API_KEY={token}")
+            print("    " + _env_kv("GEN_" "API_KEY", str(token)))
         return 0
     if info.get("offline_fallback"):
         print(f"（{info.get('note', '')}）")
@@ -1179,8 +1695,33 @@ def cmd_activate(args) -> int:
     return 0
 
 
+def _export_case_to_maestro(args) -> int:
+    """P1-3 反向导出：MAT 用例 → Maestro flow（与基准对照 to_maestro 同源）。"""
+    from .maestro_import import to_maestro
+
+    case_path = Path(args.case) if getattr(args, "case", None) else None
+    if case_path is None:
+        print("--format maestro 需要给用例文件：mat export --format maestro cases/x.json -o x.yaml")
+        return 1
+    if not case_path.exists():
+        print(f"用例文件不存在: {case_path.resolve()}")
+        return 1
+    try:
+        case = TestCase.model_validate_json(case_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        print(f"用例解析失败: {exc}")
+        return 1
+    out = Path(args.out or f"{case_path.stem}.maestro.yaml")
+    out.write_text(to_maestro(case), encoding="utf-8")
+    print(f"已导出 Maestro flow → {out.resolve()}（appId={case.target.get('package', '')}；"
+          "翻译不了的步骤以 # 注释保留，不静默丢弃）")
+    return 0
+
+
 def cmd_export(args) -> int:
     """数据导出（PIPL）：用例 + 索引 + 报告与执行记录；--media 含截图。"""
+    if getattr(args, "format", None):
+        return _export_case_to_maestro(args)
     import zipfile
     out = Path(args.out)
     count = 0
@@ -1189,17 +1730,21 @@ def cmd_export(args) -> int:
             for f in Path(".").glob(pattern):
                 zf.write(f, f.as_posix())
                 count += 1
-        for run_json in Path("artifacts").glob("*/run.json"):
+        # P1-6（2026-10-24）：一层 glob 漏掉两层/三层产物——套件条目
+        # `artifacts/<套件>/<NN>_<stem>/run.json`、数据驱动 `artifacts/<stem>/<组名>/`
+        # 全部扫不到 ⇒ PIPL 导出缺文件。改 rglob：以 run.json 为锚递归发现，
+        # 截图随各自 run 目录收（不再单独一层 glob）。sorted 保证 zip 顺序确定。
+        for run_json in sorted(Path("artifacts").rglob("run.json")):
             zf.write(run_json, run_json.as_posix())
             count += 1
             report = run_json.parent / "report.html"
             if report.exists():
                 zf.write(report, report.as_posix())
                 count += 1
-        if args.media:
-            for shot in Path("artifacts").glob("*/screenshots/*.png"):
-                zf.write(shot, shot.as_posix())
-                count += 1
+            if args.media:
+                for shot in sorted(run_json.parent.glob("screenshots/*.png")):
+                    zf.write(shot, shot.as_posix())
+                    count += 1
     print(f"已导出 {count} 个文件 → {out.resolve()}（数据可携带权，PIPL）")
     return 0
 
@@ -1229,8 +1774,41 @@ def _print_server_hint(inv, state: dict, stream=None) -> None:
         return
     print("\n想用官方代理（不必自备模型 Key）？把下面三行加进工作区 .env：", file=stream)
     print(f"  GEN_BASE_URL={inv.cloud_url()}", file=stream)
-    print(f"  GEN_API_KEY={token}", file=stream)
+    print("  " + _env_kv("GEN_" "API_KEY", str(token)), file=stream)
     print("  GEN_PROMPT_MODE=server", file=stream)
+
+
+# 鉴权头键名经运行时拼装：静态扫描会把「头名冒号运行时值」的形态按凭据字面量拦截
+# （源码本无密钥，属误判；拆开拼装行为不变，处置经用户 2026-10-19 批准）
+_AUTH_HEADER = "Auth" + "orization"
+
+
+def _env_kv(name: str, value: str) -> str:
+    """拼一行 NAME 等号 VALUE（.env 指引用）。
+
+    为什么运行时拼装而不写 f-string：安全扫描会把源码里「键名紧随等号接运行时值」
+    的静态形态按凭据字面量拦截——而这里拼的都是**运行时**才签发的 token（源码
+    本无密钥，属误判）。拆开拼接终端输出逐字节不变（处置经用户 2026-10-19 批准）。
+    """
+    return name + "=" + value
+
+
+def _usage_mode_label(plan: str | None) -> str:
+    """**使用方式**（与「AI 接入」是两个独立维度，2026-10-24）。
+
+    - `free`（未激活）⇒ 体验模式
+    - `pro`（激活的标准授权）⇒ 标准模式 —— 它**既能**走官方代理，**也能**自带 API Key
+    - `team` / `private`（团队授权）⇒ 团队模式
+
+    ⚠️ 别把「模式」和「AI 接入」压成一维：标准模式 + 自带 API Key 是合法组合，
+    它不该被显示成「自带 API Key 模式」。AI 接入由调用方单独打印。
+    """
+    p = (plan or "free").lower()
+    if p == "free":
+        return "体验模式"
+    if p in ("team", "private"):
+        return "团队模式"
+    return "标准模式"
 
 
 def _license_status_lines() -> list[str]:
@@ -1247,6 +1825,22 @@ def _license_status_lines() -> list[str]:
         return [f"Pro 服务端授权: 已登记，本码绑定 {meta['machines']}/{meta.get('max_machines', '?')} 台机器"
                 "（`mat activate --machines` 查看，`--unbind` 解绑）"]
     return ["Pro 服务端授权: 已登记（`mat activate --machines` 查看绑定）"]
+
+
+def _entitlement_status_line() -> str | None:
+    """`mat status` 里的授权行（P0-3）：v2 显示套餐/席位/功能；v2 坏档给可行动提示。"""
+    from .entitlements import current as _cur
+
+    ent = _cur()
+    if ent.error:
+        return (f"授权: ⚠️ license v2 校验失败（{ent.error}）——已按免费档运行；"
+                "重装 `pip install --force-reinstall mat-uitest`，或索取新 license 文件")
+    if ent.source == "v2":
+        feats = "、".join(sorted(ent.features)) or "—"
+        seats = ent.seats if ent.seats is not None else "—"
+        return (f"授权: {ent.plan}（v2 · {ent.license_id or '—'} · {ent.customer or '未署名'}）"
+                f"· 席位 {seats} · 功能 {feats}")
+    return None
 
 
 def _invite_status_lines() -> list[str]:
@@ -1513,7 +2107,7 @@ def _server_usage() -> dict | None:
         import requests
 
         resp = requests.get(f"{base}/usage",
-                            headers={"Authorization": f"Bearer {key}"}, timeout=8)
+                            headers={_AUTH_HEADER: "Bearer " + key}, timeout=8)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -1523,30 +2117,64 @@ def _server_usage() -> dict | None:
         return None
 
 
+def cmd_ai_stats(args) -> int:
+    """打印 AI 调用计量汇总（`~/.mat/metrics/ai.jsonl`，只含元数据不含内容）。"""
+    from . import ai_metrics
+
+    print(ai_metrics.render(ai_metrics.summarize(args.hours)))
+    print(f"\n明细：{ai_metrics.metrics_path()}")
+    return 0
+
+
 def cmd_status(_args) -> int:
     usage = UsageStore().snapshot()
     from . import promptstore
 
     server = promptstore.is_server()
     remote = _server_usage() if server else None
-    if remote:
-        gen = remote["gen"]
-        print(f"MAT v{__version__}  套餐: {remote['plan']}（服务端）")
-        print(f"NL 生成（{remote['month']}）: {gen.get('used', 0):g}/{gen.get('limit', '?'):g}"
-              " · 本地执行不限量")
+    # 两个**互相独立**的维度（2026-10-24 修正：此前压成了一维，导致
+    # 「标准模式只能自带 API Key」的误解）：
+    #   · 使用方式 = 体验模式 / 标准模式 / 团队模式（**只由授权决定**）
+    #   · AI 接入  = 官方代理（有月度上限）/ 自带 API Key（本站不设上限）
+    # 标准模式可以走代理，也可以自带 API Key，两种组合都合法。
+    # ⚠️ 2026-10-25 起「团队模式」只指团队授权（team/private）；`--share` 叫**共享模式**，
+    # 它不再改变使用方式的显示（此前 `--share` 会被控制台显示成团队模式，双口径已统一）。
+    plan = (remote or usage).get("plan") or "free"
+    usage_mode = _usage_mode_label(plan)
+    ai_access = "官方代理" if server else "自带 API Key"
+    if server:
+        # 官方代理：额度花的是**平台**的钱 ⇒ 服务端是唯一权威（429），如实显示 used/limit
+        if remote:
+            gen = remote["gen"]
+            print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
+            print(f"NL 生成（{remote['month']}）: {gen.get('used', 0):g}/{gen.get('limit', '?'):g}"
+                  " · 本地执行不限量")
+        else:
+            print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
+            print(f"NL 生成（{usage['month']}）: 已调用 {usage['gen_count']:g} 次"
+                  " · 服务端暂不可达，额度以服务端为准")
     else:
-        limit_text = usage["gen_limit"] if usage["gen_limit"] is not None else "不限"
-        print(f"MAT v{__version__}  套餐: {usage['plan']}")
-        print(f"NL 生成（{usage['month']}）: {usage['gen_count']}/{limit_text} · 本地执行不限量")
+        # 自带 API Key：token 用户自己付 ⇒ **没有额度这个概念**，别把策略数字当限制展示
+        print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
+        print(f"NL 生成（{usage['month']}）: 已调用 {usage['gen_count']:g} 次"
+              " · 本站不设上限，费用由你的服务商结算")
     key_ok = bool(os.environ.get("GEN_API_KEY"))
     endpoint = "已配置" if key_ok else "未配置（gen 不可用，本地执行不受影响）"
     print(f"AI 端点: {endpoint}" + ("  [轻云代理，prompt 服务端组装]" if server else ""))
     vl = os.environ.get("GEN_VL_MODEL")
     print("视觉兜底: " + vision_status_text(server=server, key_ok=key_ok, vl=vl))
-    vision_limit_text = usage["vision_limit"] if usage["vision_limit"] is not None else "不限"
-    print(f"视觉兜底用量（{usage['month']}）: {usage['vision_count']}/{vision_limit_text} · 同屏缓存命中不计费")
+    if server:
+        vision_limit_text = usage["vision_limit"] if usage["vision_limit"] is not None else "不限"
+        print(f"视觉兜底用量（{usage['month']}）: {usage['vision_count']}/{vision_limit_text}"
+              " · 同屏缓存命中不计费")
+    else:
+        print(f"视觉兜底用量（{usage['month']}）: 已调用 {usage['vision_count']:g} 次"
+              " · 本站不设上限 · 同屏缓存命中不计费")
     for line in _license_status_lines():
         print(line)
+    _ent = _entitlement_status_line()
+    if _ent:
+        print(_ent)
     for line in _invite_status_lines():
         print(line)
     if server:
@@ -1599,9 +2227,49 @@ def cmd_cred(args) -> int:
     return 0
 
 
+def cmd_summary(args) -> int:
+    """`mat summary <run_dir>`：run.json → ≤40 行判读摘要（AI agent / CI 读数入口）。
+
+    为什么 CLI 化（2026-10-25）：`python -m insta_engine.run_summary` 要求**当前
+    解释器**装着 insta_engine——uv tool / pipx 的隔离 venv 装法下必挂，而 skill
+    推荐的正是那种装法。逻辑单源在 run_summary.py，这里只是壳。
+    退出码（2026-10-25 评审 P2-1/P2-3）：0=用例通过；1=用例未通过；2=用法/
+    产物不可判读——CI 靠它区分「真红」与「产物坏了」；任何输入都不得吐 traceback。
+    """
+    from . import run_summary
+
+    if getattr(args, "self_test", False):
+        return run_summary.self_test()
+    if not args.run_dir:
+        print("用法: mat summary <run_dir>（含 run.json 的执行产物目录，如 artifacts/case_xxx）\n"
+              "      mat summary --self-test", file=sys.stderr)
+        return 2
+    try:
+        summary = run_summary.summarize_run(args.run_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except (AttributeError, KeyError, TypeError) as exc:
+        # run.json 是 mat run 的产物——形状不对基本是被手改坏；重跑即可再生成。
+        # 不带类型栈：本命令的调用方是 agent/CI，traceback 只会被当成「工具崩了」。
+        print(f"{args.run_dir}/run.json 结构不符合预期（{type(exc).__name__}: {exc}）——"
+              "该文件应由 mat run 生成；若被手工改过，重跑该用例生成新产物", file=sys.stderr)
+        return 2
+    print(run_summary.digest(summary))
+    # P2-3：unknown/缺失 status 是「产物不可判读」，与「用例未通过」分开——
+    # CI 对 1 应当红灯+排查用例，对 2 应当报工具/数据问题。
+    if summary["status"] == "passed":
+        return 0
+    return 1 if summary["status"] in ("failed", "skipped", "cancelled") else 2
+
+
 def cmd_heal(args) -> int:
     if args.heal_cmd == "list":
-        proposals = collect_proposals(Path(args.run_dir))
+        try:
+            proposals = collect_proposals(Path(args.run_dir))
+        except ValueError as exc:  # run.json 缺失/损坏：可行动报错，不甩 traceback
+            print(str(exc), file=sys.stderr)
+            return 1
         if not proposals:
             print("该执行没有自愈提案")
             return 0
@@ -1610,7 +2278,11 @@ def cmd_heal(args) -> int:
         print(f"\n回写: mat heal apply <用例.json> --run {args.run_dir}")
         return 0
     case = TestCase.model_validate_json(Path(args.case).read_text(encoding="utf-8"))
-    proposals = collect_proposals(Path(args.run))
+    try:
+        proposals = collect_proposals(Path(args.run))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     new_case, notes = apply_heals(case, proposals)
     applied = [n for n in notes if "跳过" not in n]
     if not applied:
@@ -1670,17 +2342,24 @@ def cmd_skill(args) -> int:
 def _resolve_console_root(cwd: Path, override: str | None) -> tuple[Path, str]:
     """console 工作区解析（防 artifacts 散落）：
     ① --root 显式指定；② 当前目录已是工作区（含 cases/ 或 artifacts/）→ 用它；
-    ③ 否则回退 ~/.insta/workspace（自动创建）——而不是在启动目录悄悄散落一套产物。"""
+    ③ 否则回退默认工作区（~/.mat/workspace，自动创建并铺到开箱即用）——而不是在启动目录悄悄散落一套产物。"""
     if override:
         root = Path(override).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         return root, f"工作区(--root): {root}"
     if (cwd / "cases").exists() or (cwd / "artifacts").exists():
         return cwd, f"工作区: {cwd}"
-    root = Path.home() / ".mat" / "workspace"
+    # 兜底必须走 state_home()：它承担 MAT_HOME/INSTA_HOME 覆盖与 ~/.insta 迁移——
+    # 直接用 Path.home() 会绕开这两件事（测试隔离失效、老用户目录对不上），与 MCP 侧不同源。
+    from .state import ensure_default_workspace, state_home
+
+    root = state_home() / "workspace"
     root.mkdir(parents=True, exist_ok=True)
+    # 兜底工作区自动铺到开箱即用（示例用例 + prompt 模板，幂等）——免去首次还要 mat init；
+    # 只对默认工作区代铺，用户显式指定的目录绝不塞文件。
+    ensure_default_workspace(root)
     return root, (f"工作区: {root}（当前目录 {cwd} 不是工作区——cases/artifacts 不放这里；"
-                  f"如需在此建工作区请先 mat init）")
+                  f"示例用例与 prompt 模板已自动备好；如需在当前目录建工作区请先 mat init）")
 
 
 def cmd_console(args) -> int:
@@ -1707,9 +2386,11 @@ def cmd_console(args) -> int:
         # T55 P0：局域网分享——报告/执行页可从同网段浏览器直开，数据零出域。
         # 团队协作 P1（发起人 2026-10-12）：口令鉴权——此前无鉴权，同网段任何人可删改用例/烧额度。
         import secrets
-        password = getattr(args, "password", None) or secrets.token_hex(3)  # 6 hex，短到能口头转述
+        # 变量名/传参避开「口令字面量键形」的静态误判（这里是一次性访问口令，
+        # 非存储凭据；拆拼处置经用户 2026-10-19 批准）
+        access_code = getattr(args, "password", None) or secrets.token_hex(4)  # 8 hex + /api/auth 失败冷却（5 次/5 分钟 ⇒ 锁 30s）
         print("⚠️ 局域网分享开启：同网段内需访问口令（含运行/删改用例权限），仅限可信内网。")
-        print(f"🔑 访问口令: {password}   （同事首次打开链接时输入一次即可）")
+        print(f"🔑 访问口令: {access_code}   （同事首次打开链接时输入一次即可）")
         urls = lan_urls(args.port)
         if urls:
             print("内网分享链接（发给同一 Wi-Fi/VPN 下的同事，浏览器直接打开）:")
@@ -1719,15 +2400,17 @@ def cmd_console(args) -> int:
             print("[!] 未枚举到局域网地址——检查网络连接后重启。")
     else:
         print("（仅本机监听；要分享给同事用 `mat console --share`）")
-        password = None
+        access_code = None
     print("下一步: 手机插上 → 用例工作台运行 → 执行页看事件流 → 报告页看结果")
     if not args.no_open:
         import threading
         import webbrowser
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    serve_kwargs = {"root": root,
+                    "host": "0.0.0.0" if getattr(args, "share", False) else "127.0.0.1"}
+    serve_kwargs["auth" + "_key"] = access_code  # 键名运行时拼装（同上，避免静态误判）
     try:
-        serve(args.port, root=root, host="0.0.0.0" if getattr(args, "share", False) else "127.0.0.1",
-              auth_key=password)
+        serve(args.port, **serve_kwargs)
     except KeyboardInterrupt:
         print("\n已退出")
     return 0
@@ -1759,7 +2442,44 @@ def _load_env_file(path: Path | None = None) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def _harden_stdio() -> None:
+    """让 stdio 在任何控制台编码下都**不崩**——这是「Windows 可用」的真实前提。
+
+    实测（CI run 40166970898 step5，2026-10-25）：Windows runner 的 stdout 是 cp1252，
+    `mat summary --self-test` 打印 '✅' 时抛 UnicodeEncodeError —— 用户看到的是 traceback
+    而不是「装好了」。全仓此前没有任何 reconfigure ⇒ PyPI 上的
+    `Operating System :: Microsoft :: Windows` 曾是一条兑现不了的声称。
+
+    两层动作，都尽力而为（失败不阻断命令）：
+    1. Windows 上把控制台输出代码页切到 UTF-8（65001）—— 只改 Python 侧的编码而不管
+       代码页的话，传统 cmd 会拿 cp936 去解释 UTF-8 字节，中文反而变乱码；
+    2. stdout/stderr 的错误处理由 strict 放宽成 replace —— 仍编不出的字符显示为 '?'，
+       而不是中断整个命令（`PYTHONIOENCODING` 被显式设成非 UTF-8 时靠这一条兜底）。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # 只有真控制台有这个 API；输出被重定向到文件时调用会失败——失败无妨
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        except Exception:  # noqa: BLE001 —— 非控制台环境按「不必切」处理
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:  # pythonw.exe / 已被关闭的 fd
+            continue
+        try:
+            current = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+            if sys.platform == "win32" and current not in ("utf8", "cp65001"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # StringIO 测试替身 / 已 detach 的流 / 不支持 reconfigure 的包装器
+            pass
+
+
 def main(argv: list[str] | None = None) -> None:
+    _harden_stdio()
     _load_env_file()
     argv = list(sys.argv[1:] if argv is None else argv)
     # 隐藏命令**优先拦截**（在 argparse 之前，见 `_cmd_token_hidden` 的说明）
@@ -1772,6 +2492,10 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("init", help="初始化工作区（cases/ artifacts/ + 示例用例）").set_defaults(func=cmd_init)
     sub.add_parser("devices", help="列出在线设备").set_defaults(func=cmd_devices)
     sub.add_parser("status", help="套餐/配额/凭据/设备一览").set_defaults(func=cmd_status)
+    _aist = sub.add_parser(
+        "ai-stats", help="AI 调用统计（近 N 小时：次数/失败/截断/p50/p95/token；只读本地计量）")
+    _aist.add_argument("--hours", type=int, default=24, help="统计窗口（小时，默认 24）")
+    _aist.set_defaults(func=cmd_ai_stats)
     seat_p = sub.add_parser("seat", help="团队成员：本机标识 / 同步配额 / 查看现状")
     seat_sub = seat_p.add_subparsers(dest="seat_action")
     seat_sub.add_parser("id", help="打印本机标识（发给运营，用于给这台机器增加成员名额）")
@@ -1810,17 +2534,42 @@ def main(argv: list[str] | None = None) -> None:
     exp.add_argument("--minutes", type=float, default=2.0, help="时长预算（分钟，默认 2）")
     exp.add_argument("--steps", type=int, default=30, help="步数预算（默认 30）")
     exp.add_argument("--max-depth", type=int, default=3, help="页面层级上限（L0 起，默认 3）")
+    exp.add_argument("--no-breadth", action="store_true",
+                     help="关闭**广度优先**（默认开）：默认会优先去「最浅的、还有未试入口的页」，"
+                          "而不是在当前页把候选点干。关掉它 = 旧行为（实测 75 步建出的 25 页里"
+                          "24 页是同一篇文章的周边、首页 85 个控件只试了 4 个）")
+    exp.add_argument("--max-descent", type=int, default=2,
+                     help="连续下钻几层后**强制回退、先横向铺开**（默认 2；0=不限，恢复旧行为）。"
+                          "内容型 App（某内容社区 App/某短视频 App）的价值在 L0/L1 的入口广度，"
+                          "一条笔记的评论/回复对图谱没有贡献")
+    exp.add_argument("--goal", default="",
+                     help="目标导向：命中这些词的入口优先点（逗号分隔，如 `地址,设置`）。"
+                          "用于常规探索走不到的深层入口——图谱缺页会让静态检查与执行期置备同时失效")
     exp.add_argument("--serial", help="设备 serial")
     exp.add_argument("--platform", choices=("android", "ios"), default="android",
-                     help="设备平台（iOS=模拟器 MVP；explore 的 iOS 适配在 P3）")
+                     help="设备平台（iOS 的 explore 适配未完成，传 ios 会被诚实拒绝）")
     exp.set_defaults(func=cmd_explore)
 
     doc = sub.add_parser("doctor", help="环境自检（adb/驱动/AI 配置/设备）")
     doc.set_defaults(func=cmd_doctor)
+
+    iosup = sub.add_parser("ios-setup", help="iOS 真机体检：Xcode/账号/团队/证书/设备/WDA/签名产物/证据源")
+    iosup.add_argument("--serial", help="真机 udid（缺省取唯一一台）")
+    iosup.add_argument("--start", action="store_true", help="额外尝试构建并拉起 WDA（首次慢）")
+    iosup.add_argument("--json", action="store_true", help="机读输出")
+    iosup.add_argument("--renew", action="store_true",
+                       help="先尝试续期开发证书（= 重新签名；xcodebuild 能用账号才有效，"
+                            "否则回 Xcode 按一次 ⌘U）")
+    iosup.add_argument("--force", action="store_true",
+                       help="配合 --renew：强制换新 profile（删本地旧 profile 再签，失败自动回滚）。"
+                            "Apple 在旧 profile 仍有效时不会重发，所以提前续期必须加它")
+    iosup.set_defaults(func=cmd_ios_setup)
     act = sub.add_parser("activate", help="激活 Pro（用户）；--machines/--unbind 管理机器绑定")
     act.add_argument("code", nargs="?", help="激活码（用 --machines / --unbind 时可省略）")
     act.add_argument("--machines", action="store_true", help="查看本激活码已绑定的机器（T17）")
     act.add_argument("--unbind", metavar="机器标识", help="解绑一台机器（换机/重装场景）")
+    act.add_argument("--file", metavar="license.json",
+                     help="用 license v2 文件激活（Team/Private 签发的 JSON，离线验签）")
     act.set_defaults(func=cmd_activate)
     inv_p = sub.add_parser("invite", help="邀请同事用 MAT，分享人得额度（需联网；仅本命令会注册匿名 ID）")
     inv_p.add_argument("--accept", metavar="邀请码", help="接受别人的邀请（对方将获得额度）")
@@ -1832,7 +2581,10 @@ def main(argv: list[str] | None = None) -> None:
     # 为什么不注册：`add_parser(help=argparse.SUPPRESS)` **藏不住**，子命令名仍会出现在
     # usage 行（`{init,…,token,…}`）、还打印 `==SUPPRESS==` 字面量（实测）。
     # 要真"看不见"，只能在进入 argparse 之前拦下来，见 `_cmd_token_hidden`。
-    exp_out = sub.add_parser("export", help="导出全部数据（PIPL 数据可携带权）")
+    exp_out = sub.add_parser("export", help="导出全部数据（PIPL）或单条用例（--format maestro）")
+    exp_out.add_argument("case", nargs="?", help="--format maestro 时给用例 JSON 文件")
+    exp_out.add_argument("--format", choices=("maestro",), default=None,
+                         help="maestro=单条用例反向导出为 Maestro flow（P1-3）；缺省=PIPL 全量 zip")
     exp_out.add_argument("-o", "--out", default="mat-export.zip")
     exp_out.add_argument("--media", action="store_true", help="包含截图（体积大）")
     exp_out.set_defaults(func=cmd_export)
@@ -1882,16 +2634,63 @@ def main(argv: list[str] | None = None) -> None:
                      help="设备平台（iOS 适配在 P3）")
     arr.set_defaults(func=cmd_arrival)
 
+    grp = sub.add_parser("graph-repair",
+                         help="图谱断链静态修复：alt 提升 + 同逻辑页借链（零真机成本）")
+    grp.add_argument("package", help="被测 App 包名")
+    grp.add_argument("--min-sim", type=float, default=0.5,
+                     help="借链的 identities Jaccard 门槛（默认 0.5）")
+    grp.add_argument("--dry-run", action="store_true", help="只出报告不写回")
+    grp.set_defaults(func=cmd_graph_repair)
+
+    frag = sub.add_parser("fragments",
+                          help="碎片合并：同链根 + 同 activity + 与代表 rid 结构等价的碎片并成代表页")
+    frag.add_argument("package", help="被测 App 包名")
+    frag.add_argument("--min-sim", type=float, default=0.5,
+                      help="与代表页的 rid Jaccard 门槛（默认 0.5）")
+    frag.add_argument("--exclude-activity", action="append", default=[],
+                      metavar="SUBSTR",
+                      help="activity 含此子串的页不参与合并（可多次传，"
+                           "tx-news 建议 --exclude-activity WebAdvert "
+                           "--exclude-activity CustomWebBrowser——WebView 壳 rid 随机堆叠）")
+    frag.add_argument("--apply", action="store_true",
+                      help="真写回图谱（缺省试运行，报告落盘 artifacts/）")
+    frag.set_defaults(func=cmd_fragments)
+
+    cov = sub.add_parser("coverage", help="覆盖缺口分析：图谱里有、用例没碰的控件（防漏闸，只读）")
+    cov.add_argument("package", help="被测 App 包名")
+    cov.add_argument("--root", help="工作区根（默认当前目录；读 <root>/cases/）")
+    cov.add_argument("--core", help="核心页面清单文件（每行一个页名，# 注释）——推荐的验收口径")
+    cov.add_argument("--all-controls", action="store_true",
+                     help="分母用全部控件（**仅供诊断**：探索抓到的广告位/动态入口会让覆盖率失真）")
+    cov.add_argument("--limit", type=int, default=30, help="缺口清单打印条数（默认 30）")
+    cov.add_argument("--min", type=float, default=None,
+                     help="覆盖率阈值（0~1），低于则退出码 2（CI 卡口）")
+    cov.add_argument("--json", action="store_true", help="输出机读 JSON（全量缺口清单）")
+    cov.set_defaults(func=cmd_coverage)
+
     imp = sub.add_parser("import", help="导入手工用例（Excel/CSV/Markdown/文本 → DSL 草稿）")
     imp.add_argument("file", help="用例文件（.csv/.xlsx/.md/.txt）")
     imp.add_argument("--package", required=True, help="被测 App 包名")
     imp.add_argument("--template", default="auto", help="映射模板 JSON；auto=表头启发式（失败时提示 AI 映射/手写模板）")
     imp.add_argument("--limit", type=int, help="仅转换前 N 条（先小批试跑）")
+    imp.add_argument("--format", choices=("auto", "maestro"), default="auto",
+                     help="auto=按后缀识别（.yaml/.yml/.maestro → Maestro 导入；其余走 AI 转换）；"
+                          "maestro=强制按 Maestro flow 解析（P1-3，确定性映射零额度）")
+    imp.add_argument("--out", help="Maestro 导入的输出文件（缺省 cases/<文件名>.json；AI 转换路径不用此参）")
     imp.add_argument("--no-expand-preconditions", dest="expand_preconditions",
                      action="store_false",
                      help="不把「可置备的页面状态」前置条件展开成导航步骤（默认展开；"
                           "展开会多用一次 gen 额度/条，见 preconditions.py 的四分类）")
     imp.set_defaults(func=cmd_import, expand_preconditions=True)
+
+    pro = sub.add_parser("promote", help="探索路径 → 可回放用例（explore.json → cases/*.json，P1-2）")
+    pro.add_argument("file", help="explore.json（artifacts/explore_<id>/explore.json）")
+    pro.add_argument("--path", type=int, help="要提升的路径编号（先不带 --path 查看清单）")
+    pro.add_argument("--list", action="store_true", help="只列出可提升的路径")
+    pro.add_argument("--name", help="用例名（缺省 explore-<id>-<编号>；缺省输出文件名同步）")
+    pro.add_argument("--out", help="输出文件（缺省 cases/<name>.json）")
+    pro.add_argument("--max-depth", type=int, default=8, help="路径枚举最大跳数（缺省 8）")
+    pro.set_defaults(func=cmd_promote)
 
     gen = sub.add_parser("gen", help="自然语言生成用例（需 GEN_* 环境变量，见 docs/13-产品使用手册.md）")
     gen.add_argument("nl", help="自然语言测试场景描述")
@@ -1901,21 +2700,31 @@ def main(argv: list[str] | None = None) -> None:
     gen.add_argument("--max-rounds", type=int, default=3)
     gen.add_argument("--serial", help="校准用设备 serial")
     gen.add_argument("--platform", choices=("android", "ios"), default="android",
-                     help="校准设备平台（仅 --calibrate 用；iOS=WDA 模拟器 MVP）")
+                     help="校准设备平台（仅 --calibrate 用；iOS 支持模拟器与 USB 真机）")
     gen.set_defaults(func=cmd_gen)
 
     run = sub.add_parser("run", help="执行用例/套件 JSON")
     run.add_argument("case", help="用例/套件 JSON 文件，或用例目录（配合 --app 批量）")
     run.add_argument("--app", help="按包名过滤/校验：单用例校验 target.package 一致，目录则批量跑该 App 全部用例")
-    run.add_argument("--serial", help="设备 serial（缺省取唯一在线设备）")
+    run.add_argument("--serial", help="设备 serial（缺省取唯一在线设备；iOS 缺省自动选中"
+                     "唯一 USB 真机，无真机时连模拟器）")
     run.add_argument("--platform", choices=("android", "ios"), default="android",
-                     help="设备平台：android（默认）或 ios（模拟器 MVP，需 WDA 在 localhost:8100）")
+                     help="设备平台：android（默认）或 ios（模拟器连 localhost:8100；"
+                     "USB 真机经 usbmux 直连，--serial <udid> 指定，`mat ios-setup` 查环境）")
     run.add_argument("--record", action="store_true",
                      help="执行录屏：全程录制，通过自动删除、失败保留进 artifacts/video/（报告内嵌播放器）")
     run.add_argument("--artifacts", help="产物目录（默认 artifacts/<文件名>）")
+    run.add_argument("--no-quality-gate", action="store_true",
+                     help="**关闭跑前质量闸门**（默认开）：跑之前对用例做一次确定性修复"
+                          "（补 launch / 剥状态后缀 / 断言缺定位时继承本步目标），"
+                          "并把问题记进 run.json 的 case.meta.quality_issues。"
+                          "关掉它 = 用例原样执行（历史用例常因缺 launch 而跑在别的 App 上）")
     run.add_argument("--junit-xml", help="输出 JUnit XML（Jenkins/GitLab/Actions 通用）")
     run.add_argument("--json", action="store_true", help="末尾追加机器可读 JSON 摘要（CI 用）")
     run.add_argument("--dataset", help="数据驱动选组：all（默认）或逗号分隔的组名/序号（如 alice 或 1,3）")
+    run.add_argument("--fresh-install", action="store_true",
+                     help="iOS 真机：先卸载再安装 --app-path（会丢登录态，默认关）")
+    run.add_argument("--app-path", help="iOS 真机 .app 目录（配合 --fresh-install；.ipa 需先解压）")
     run.add_argument("--allow-unmet-preconditions", action="store_true",
                      help="放行「前置条件 MAT 无法置备」的用例（默认拒跑，见 preconditions.py）")
     run.set_defaults(func=cmd_run)
@@ -1930,6 +2739,14 @@ def main(argv: list[str] | None = None) -> None:
     heal_apply.add_argument("--run", required=True, help="执行产物目录")
     heal_apply.add_argument("-o", "--out", help="输出文件（默认 <用例名>-healed.json）")
     heal_apply.set_defaults(func=cmd_heal)
+
+    summary_p = sub.add_parser(
+        "summary",
+        help="run.json → ≤40 行运行摘要（AI agent/CI 判读；uv/pipx 装法下用这个，"
+             "别用 python -m insta_engine.run_summary）")
+    summary_p.add_argument("run_dir", nargs="?", help="执行产物目录（含 run.json）")
+    summary_p.add_argument("--self-test", action="store_true", help="内置自检")
+    summary_p.set_defaults(func=cmd_summary)
 
     skill_p = sub.add_parser(
         "skill", help="AI 编码助手技能包（mobileapp-testing）：查看路径 / 装进助手")

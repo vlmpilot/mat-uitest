@@ -1,7 +1,7 @@
 import {
   Alert, Badge, Button, Card, Empty, Input, Modal, Select, Space, Table, Tag, Tooltip, Typography, message,
 } from "antd";
-import { ReloadOutlined, SaveOutlined, UndoOutlined } from "@ant-design/icons";
+import { CheckOutlined, ReloadOutlined, SaveOutlined, UndoOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getJob, getReview, ReviewPage, ReviewResp, saveReview, startDescribe, startIndex, StateResp } from "../api";
 import PageHeader from "../components/PageHeader";
@@ -23,8 +23,6 @@ const AUTO_BATCHES = 4;
 
 export default function Review({ state }: { state: StateResp }) {
   const indexes = state.indexes ?? [];
-  // 标准版(gen_limit=null)不限额——「计 1 次生成额度」类提示只对体验版有意义（2026-10-13）
-  const unlimited = state.usage.gen_limit == null;
   const [pkg, setPkg] = useState<string>(indexes[0]?.package ?? "");
   const [data, setData] = useState<ReviewResp | null>(null);
   const [loading, setLoading] = useState(false);
@@ -34,11 +32,48 @@ export default function Review({ state }: { state: StateResp }) {
   const [missing, setMissing] = useState<string[]>([]);
   const [q, setQ] = useState("");
   const [graphBusy, setGraphBusy] = useState<string | null>(null);
+  // 批量复核（2026-10-25）：选中页按**当前值**落章成 manual——认可 AI 的标题/描述
+  // 不必挨个进输入框改一个字。走既有保存接口（幂等；结论同样落 review/<包名>.json，
+  // 重建图谱后可重放恢复）。空标题页跳过：没起名谈不上认可，升级了 describe 会永不补名。
+  const [selected, setSelected] = useState<string[]>([]);   // page_key 集
+  const [confirming, setConfirming] = useState(false);
+  const confirmSelected = () => {
+    if (!data || !selected.length) return;
+    const corrections: Record<string, string> = {};
+    const summaryCorrections: Record<string, string> = {};
+    let skipped = 0;
+    for (const key of selected) {
+      const p = pages.find((x) => x.page_key === key);
+      if (!p) continue;
+      const title = (draft[key] ?? p.title).trim();
+      if (!title) { skipped += 1; continue; }   // 还没起名的页确认无意义
+      corrections[key] = title;
+      const summary = (draftSum[key] ?? p.summary ?? "").trim();
+      if (summary) summaryCorrections[key] = summary;
+    }
+    if (!Object.keys(corrections).length) {
+      message.info("选中的页都还没有标题——先起名（或让 AI 补全）再确认。");
+      return;
+    }
+    setConfirming(true);
+    saveReview(data.package, corrections, Object.keys(summaryCorrections).length ? summaryCorrections : undefined)
+      .then((r) => {
+        setMissing(r.missing ?? []);
+        message.success(`已确认 ${Object.keys(corrections).length} 页（新认可 ${r.promoted ?? 0} 页）`
+          + (skipped ? ` · 跳过 ${skipped} 页（还没有标题）` : "")
+          + "——此后 AI 不再覆盖这些标题与描述");
+        setSelected([]);
+        setDraft({}); setDraftSum({});
+        load(data.package);
+      })
+      .catch((e) => message.error(String(e)))
+      .finally(() => setConfirming(false));
+  };
   // 自动 AI 填充（2026-10-12）：打开复核页/切包时，对还没有 AI 描述且非人工命名的
   // 页面自动跑「AI 补全」——免去单独点按钮。**按包记已自动跑的批数**（Map），
   // 一批 ≤50 页；一批补完刷新后若仍有空缺会自动续批，最多 AUTO_BATCHES 批
   // （4×50=200 页覆盖最大图谱）——防「永远补不满」导致无限循环扣额度。
-  // 额度显性告知：每批是 1 次 AI 调用计 1 次生成额度（后端 T53b：失败不扣）；
+  // 每批是 1 次 AI 调用（口径见概览页「AI 生成」卡；后端 T53b：失败不扣）；
   // 人工命名过的页永不覆盖。超出自动批数的空缺可点「刷新」手动续补。
   const autoDescribed = useRef<Map<string, number>>(new Map());
 
@@ -60,11 +95,10 @@ export default function Review({ state }: { state: StateResp }) {
           return;
         }
         job_id = r.job_id;
+        // 额度口径收敛到概览页「AI 生成」卡（2026-10-26）——此处只报进度
         message.info(batch > 1
-          ? `正在 AI 补全（第 ${batch} 批${unlimited ? "" : "，1 次 AI 调用计 1 次生成额度"}）…`
-          : unlimited
-          ? "正在 AI 补全页面标题与功能描述…"
-          : "正在 AI 补全页面标题与功能描述（1 次 AI 调用，计 1 次生成额度）…");
+          ? `正在 AI 补全（第 ${batch} 批）…`
+          : "正在 AI 补全页面标题与功能描述…");
       }
       for (let i = 0; i < 400; i++) {           // 上限 ~10 分钟（与看门狗一致）
         const job = await getJob(job_id);
@@ -85,7 +119,7 @@ export default function Review({ state }: { state: StateResp }) {
   const load = (target: string) => {
     if (!target) { setData(null); return; }
     setLoading(true);
-    setDraft({}); setDraftSum({}); setMissing([]);
+    setDraft({}); setDraftSum({}); setMissing([]); setSelected([]);
     getReview(target)
       .then((d) => {
         setData(d);
@@ -157,8 +191,7 @@ export default function Review({ state }: { state: StateResp }) {
     <>
       <PageHeader title="页面复核"
         desc={<>页面标题与功能描述由 <b>AI 自动补全</b>（打开本页时对未命名的页面分批跑，
-          {unlimited ? "每批 ≤50 页，最多自动 4 批；更大的图谱点「刷新」续补）"
-                    : "每批 ≤50 页计 1 次生成额度，最多自动 4 批；更大的图谱点「刷新」续补）"}，
+          {"每批 ≤50 页，最多自动 4 批；更大的图谱点「刷新」续补）"}，
           两者都<b>可人工修改</b>——人工写的永不被 AI 覆盖，并注入 AI 生成/转换的 prompt。
           AI 起名的粒度可能不对——同一类页被拆成很多名字;
           这里可以逐页改名,<b>你比 AI 更懂你的 App</b>,把同类页改成同一个名字价值最大。</>}
@@ -198,6 +231,12 @@ export default function Review({ state }: { state: StateResp }) {
             <Button type="primary" icon={<SaveOutlined />} loading={saving}
               disabled={!changed.length} onClick={doSave}>保存修改</Button>
           </Badge>
+          <Tooltip title="认可选中页的当前标题与描述,标为已复核——此后 AI 补全与重建索引都不会覆盖它们">
+            <Button icon={<CheckOutlined />} loading={confirming}
+              disabled={!selected.length} onClick={confirmSelected}>
+              批量复核{selected.length ? `（${selected.length}）` : ""}
+            </Button>
+          </Tooltip>
           <Tooltip title="把所有输入框恢复成图谱里的当前值(不写盘)">
             <Button icon={<UndoOutlined />} disabled={!changed.length}
               onClick={() => { setDraft({}); setDraftSum({}); }}>撤销</Button>
@@ -224,12 +263,14 @@ export default function Review({ state }: { state: StateResp }) {
           </Typography.Text>} />
       )}
 
-      {!pkg && <Card><Empty description="还没有页面图谱——先跑一次 mat index 或 mat explore" /></Card>}
+      {!pkg && <Card><Empty description="还没有页面图谱——选择应用后点右上角「重建页面索引」,或到「遍历探索」页真机遍历(还能发现崩溃/白屏)" /></Card>}
       {pkg && !loading && pages.length === 0 && <Card><Empty description="这个应用的图谱里还没有页面" /></Card>}
 
       {pkg && pages.length > 0 && (
         <Table size="small" rowKey="page_key" loading={loading} dataSource={rows}
           pagination={{ pageSize: 50, showSizeChanger: true, showTotal: (t) => `共 ${t} 页` }}
+          rowSelection={{ selectedRowKeys: selected,
+            onChange: (keys) => setSelected(keys as string[]) }}
           columns={[
             { title: "截图", dataIndex: "screenshot_url", width: 96,
               render: (u: string) => (u

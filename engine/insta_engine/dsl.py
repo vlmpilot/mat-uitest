@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class LocatorStrategy(StrEnum):
@@ -32,12 +32,42 @@ VISION_LLM_MISUSE_HINT = (
 )
 
 
+#: 能「同条件匹配多个控件」的策略——只有这些策略上的 `index` 有语义。
+#: `point` 是一个坐标、`image-template` 是最佳匹配点，都不存在"第 N 个"。
+_INDEXABLE = frozenset({
+    LocatorStrategy.RES_ID, LocatorStrategy.ID, LocatorStrategy.TEXT,
+    LocatorStrategy.TEXT_CONTAINS, LocatorStrategy.DESCRIPTION, LocatorStrategy.XPATH,
+})
+
+
 class Locator(BaseModel):
     """元素定位；fallback 链按成本递增逐级降级（02 §3.2 策略链）。"""
 
     strategy: LocatorStrategy
     value: str
+    #: 同条件多命中时取**第 N 个**（`0` = 第一个，与 u2 的 `instance` 同义）；
+    #: `None`（缺省）= 引擎取第一个，行为与旧版完全一致。
+    #:
+    #: 解决的是**位置型意图**：内容型 App 的信息流标题每次都变，用文案定位必然失败
+    #: （2026-10-25 实测 `gen-191453-4`：`intent="点击任意新闻卡片"`，用例写死
+    #: `text=德约中网七冠王`，执行时首页已换成「时政微观察…」⇒ 3 轮全挂）。
+    #: 这类意图的正确表达是 `res-id=<卡片容器> + index=0`：**用位置而非内容**。
+    #:
+    #: ⚠️ 代价说清：位置定位在"页面结构变化"时也会错（多一条置顶就整体位移）。
+    #: 但那是**可感知的错**（点到了另一条，断言会红），而内容定位是**必然失败**。
+    #:
+    #: ⚠️ `exclude_if`：未写 index 的定位序列化时**不产生 `"index": null`**——
+    #: 否则每次保存用例都会给全仓定位块加一行噪声（存量用例文件会被批量改写）。
+    index: int | None = Field(default=None, exclude_if=lambda v: v is None)
     fallback: Locator | None = None
+
+    @field_validator("index")
+    @classmethod
+    def _index_non_negative(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("index 必须是 >= 0 的整数（0 = 第一个匹配）——"
+                             "负索引会让「第几个」的语义含混，需要「最后一个」请显式写成具体序号")
+        return v
 
     @model_validator(mode="after")
     def _reject_vision_llm(self) -> Locator:
@@ -48,6 +78,19 @@ class Locator(BaseModel):
         """
         if self.strategy == LocatorStrategy.VISION_LLM:
             raise ValueError(VISION_LLM_MISUSE_HINT)
+        return self
+
+    @model_validator(mode="after")
+    def _index_only_where_enumerable(self) -> Locator:
+        """`index` 只能配「可能匹配多个」的策略；其余策略上写了也没人执行 ⇒ 解析期报错。
+
+        宁可在这里红一次，也不要运行期静默按"第一个/最佳匹配"走——那正是
+        `vision-llm` 写进定位链被拒绝的同一个理由（写了不生效比报错更贵）。
+        """
+        if self.index is not None and self.strategy not in _INDEXABLE:
+            allowed = " / ".join(sorted(s.value for s in _INDEXABLE))
+            raise ValueError(f"index 只对「同条件可能匹配多个控件」的策略有意义（{allowed}）；"
+                             f"策略 {self.strategy.value} 定位的是单个目标，写 index 不会生效")
         return self
 
 
@@ -113,6 +156,7 @@ class Action(StrEnum):
     HOME = "home"
     KEY_EVENT = "key-event"
     WAIT = "wait"
+    API = "api"  # P1-1：HTTP 业务数据断言（不需要设备的纯网络步骤，见 api_client.py）
 
 
 # DSL JSON 规范为 camelCase，Python 字段为 snake_case；
@@ -143,6 +187,32 @@ class Step(BaseModel):
     source_step: int | None = Field(default=None, alias="sourceStep")  # 导入溯源：IR 步骤序号
     assertions: list[Assertion] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _validate_launch_params(self) -> Step:
+        # C31/P1-1（2026-10-24）：launch 的 params.package/activity 会拼进
+        # `am start -W -n <component>` 交设备端 sh 执行——target.package 有闸口
+        # （见 TestCase._validate_shape），Step.params 这一侧曾漏网。边界一次收口。
+        if self.action == Action.LAUNCH:
+            from .pkgname import safe_component, safe_package_name
+
+            pkg = self.params.get("package")
+            if pkg is not None:
+                if not isinstance(pkg, str):
+                    raise ValueError("launch params.package 必须是字符串")
+                try:
+                    safe_package_name(pkg)
+                except ValueError as exc:
+                    raise ValueError(f"launch params.package {exc}") from exc
+            act = self.params.get("activity")
+            if act is not None:
+                if not isinstance(act, str):
+                    raise ValueError("launch params.activity 必须是字符串")
+                try:
+                    safe_component(act)
+                except ValueError as exc:
+                    raise ValueError(f"launch params.activity {exc}") from exc
+        return self
+
 
 class TestCase(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -158,7 +228,16 @@ class TestCase(BaseModel):
     #: 所以运行期要**可见**（打印 / 报告 / run.json），无法置备的要**拒跑** —— 见
     #: `preconditions.py` 的模块说明。
     preconditions: list[str] = Field(default_factory=list)
-    datasets: list[dict[str, Any]] | None = None  # 数据驱动（CASE-06）：[{"name": "组名", "vars": {...}}]
+    #: 数据驱动（CASE-06）：[{"name": "组名", "vars": {...}}]。
+    #: 2026-10-21 起支持**共享数据集**：条目可写 `{"name": "...", "ref": "data/accounts.json#vip"}`，
+    #: 加载期把 ref 指向的 JSON（可带 #锚点）解析进 vars —— 见 suite.resolve_dataset_refs。
+    datasets: list[dict[str, Any]] | None = None
+    #: 前置步骤（2026-10-21）：主步骤前执行。失败 ⇒ 整条用例记 **skipped**（未执行，不算 failed），
+    #: 避免"数据/状态没准备好"被报成定位失败（与 preconditions 的拒跑同一纪律）。
+    setup: list[Step] = Field(default_factory=list)
+    #: 收尾步骤（2026-10-21）：主步骤后 best-effort 执行（清数据/退回首页）。
+    #: 失败只记录、不改变用例状态——收尾不该反过来判定用例成败。
+    teardown: list[Step] = Field(default_factory=list)
     steps: list[Step] = Field(min_length=1)
 
     @model_validator(mode="after")

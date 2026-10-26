@@ -28,6 +28,14 @@ def api_diagnose(root: Path, body: dict) -> tuple[int, dict]:
         run_obj = RunResult.model_validate(data["run"])
     except (ValueError, KeyError) as exc:
         return 400, {"error": f"run.json 解析失败: {exc}"}
+    # 用例对象（可选）：给归因注入页面图谱证据用；旧产物没有就静默降级。
+    case_obj = None
+    if isinstance(data.get("case"), dict):
+        try:
+            from ..dsl import TestCase
+            case_obj = TestCase.model_validate(data["case"])
+        except Exception:  # noqa: BLE001 — 证据是加分项，解析失败不拦归因
+            pass
     failed = [s for s in run_obj.steps if s.status != "passed"]
     if not failed:
         return 400, {"error": "本次执行无失败步骤，无需归因"}
@@ -42,7 +50,8 @@ def api_diagnose(root: Path, body: dict) -> tuple[int, dict]:
         mode = "server" if getattr(client, "prompt_mode", "local") == "server" else (
             "BYOK" if client.api_key else "无 Key")
         emit("diagnose", "running", f"归因 {len(failed)} 个失败步骤（模式: {mode}）")
-        attributions = diagnose_run(run_obj, run_dir, client)
+        attributions = diagnose_run(run_obj, run_dir, client, case=case_obj,
+                                    page_index_dir=root / "artifacts" / "page_index")
         (run_dir / "diagnose.json").write_text(
             json.dumps(attributions, ensure_ascii=False, indent=2), encoding="utf-8")
         render_html(run_obj, run_dir)  # 重渲染报告，挂上归因卡（含顶部汇总区 AI 归因列）

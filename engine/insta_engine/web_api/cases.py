@@ -189,11 +189,15 @@ def api_import_convert(root: Path, body: dict) -> tuple[int, dict]:
         # cancel 接入 convert_batch：中止在「下一条开始前」生效（当前条 AI
         # 调用无法强杀），已完成条目照常落盘；此前 cancel 在本任务中无人检查——
         # 点中止要等整批转完才退出（发起人 2026-10-12 反馈「中止的比较慢」）。
-        # 逐条进度事件不再发（发起人 2026-10-12：转换不需要每条用例的进展提示），
-        # 结果由任务 summary 汇报。
+        # 逐条进度（2026-10-21 恢复）：此前按「不需要每条提示」关掉，结果 16 条串行
+        # 转换是十几分钟的黑盒，且看门狗没有任何活动信号可判 ⇒ 误杀后提示去解锁手机。
+        # 这里只发「已转换 k/n 条」一条事件，不做每步 UI 步骤条。
+        def progress(done: int, total: int) -> None:
+            emit("convert", "running", f"已转换 {done}/{total} 条")
+
         batch = convert_batch(GenClient.from_env(), cases, package, UsageStore(),
                               controls=controls, graph=graph, cancel_event=cancel,
-                              index_dir=base_dir)
+                              index_dir=base_dir, on_progress=progress)
         _, bundle = save_import_bundle(root, upload, package, batch, used)
         summary = batch["summary"]
         scope = (f"已中止：完成 {summary['total']}/{len(cases)} 条" if cancel.is_set()
@@ -257,7 +261,10 @@ def api_suite_save(root: Path, body: dict) -> tuple[int, dict]:
     # 编辑语义（发起人 2026-10-12 反馈「编辑套件保存，会创建一个新的套件」）：body 带
     # file（原文件名）即为编辑——标题没改就原地覆盖；改了标题=重命名（写新删旧），
     # 且不得撞名覆盖别的套件。不传 file 视为新建，按标题落盘（同名覆盖保持旧序）。
-    orig = _suite_file(root, str(body.get("file", "")))
+    # ⚠️ `str(body.get("file", ""))` 会把 JSON null 变成字符串 "None"（「新建套件」的
+    # 前端就传 null）——解析出 cases/None.suite.json 当"原套件"，新建永远 404
+    # （2026-10-25 用户实测踩中）。`or ""` 把 null/缺失/空串统一成"新建"。
+    orig = _suite_file(root, str(body.get("file") or ""))
     if orig is not None:
         if not orig.exists():
             return 404, {"error": f"原套件不存在: {body.get('file')}（可能已被删除，请关闭后重开）"}
@@ -271,7 +278,7 @@ def api_suite_save(root: Path, body: dict) -> tuple[int, dict]:
 
 
 def api_suite_delete(root: Path, body: dict) -> tuple[int, dict]:
-    f = _suite_file(root, str(body.get("file", "")))
+    f = _suite_file(root, str(body.get("file") or ""))
     if f is None or not f.exists():
         return 404, {"error": "套件不存在"}
     f.unlink()
@@ -306,3 +313,49 @@ def api_case_delete(root: Path, body: dict) -> tuple[int, dict]:
                      "refs": refs}
     f.unlink()
     return 200, {"ok": True, "deleted": name}
+
+
+def api_case_rename(root: Path, body: dict) -> tuple[int, dict]:
+    """POST /api/case/rename：用例文件重命名（2026-10-25，目录功能的轻量替代）。
+
+    为什么不做目录：套件引用（纯文件名）、报告对账、`-calibrated/-healed/-ds`
+    派生约定、CLI 路径全部绑在平铺结构上，目录化要动全部调用方并重设计文件名
+    安全面；而「组织用例」的真实缺口是无语义的生成文件名（gen-082850.json）——
+    重命名 + 已有的按 App 分组/筛选已覆盖。重命名视为新用例（caseMeta 编号不回收，
+    见 workspace.case_meta 的既有注释）。
+
+    **套件引用同步替换**（不是拒绝）：重命名就该带着引用走——从套件移除再加回
+    是让用户替机器搬家。旧文件名在套件条目里按 Path(c).name 匹配（与删除同口径）。
+    """
+    src_name = str(body.get("from", "")).strip()
+    dst_name = str(body.get("to", "")).strip()
+    for label, name in (("原", src_name), ("新", dst_name)):
+        if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+            return 400, {"error": f"非法{label}用例名: {name!r}"}
+    if not dst_name.endswith(".json"):
+        dst_name += ".json"          # 与前端约定一致：省略后缀按 .json 补齐
+    if dst_name.endswith(".suite.json"):
+        return 400, {"error": "新文件名不能以 .suite.json 结尾（那是套件的命名空间）"}
+    src = root / "cases" / Path(src_name).name
+    dst = root / "cases" / Path(dst_name).name
+    if not src_name.endswith(".json") or not src.exists():
+        return 404, {"error": f"用例不存在: {src_name}"}
+    if dst.exists():
+        return 400, {"error": f"已存在同名文件 {dst_name}，换个名字"}
+    # 套件引用同步：遍历全部套件，条目文件名匹配则替换（原样写回其它字段）
+    updated: list[str] = []
+    for sf in sorted((root / "cases").glob("*.suite.json")):
+        try:
+            data = json.loads(sf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        entries = data.get("cases", [])
+        new_entries = [dst_name if isinstance(c, str) and Path(c).name == src_name else c
+                       for c in entries]
+        if new_entries != entries:
+            data["cases"] = new_entries
+            sf.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                          encoding="utf-8")
+            updated.append(sf.name)
+    src.rename(dst)
+    return 200, {"ok": True, "file": dst_name, "suites_updated": updated}

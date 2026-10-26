@@ -29,7 +29,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install ruff==0.16.9 pytest
           # ios extra：装上 facebook-wda，让 test_wda_contract.py 真正生效而非 skip（评审 F5）
-          pip install -e './engine[mcp,ios]'
+          # maestro extra：它只是 pyyaml（engine/pyproject.toml）。**不能省** ——
+          # test_maestro_import.py 需要 yaml，缺了就是 9 条红（2026-10-25 实测 ci 的
+          # 19 条 = 9 maestro + 10 平台）；而 ci-cloud 恰好因为多装了 `./cloud`
+          # （uvicorn[standard] 传递带入 pyyaml）只红 10 条 ⇒「CI 红不红取决于装没装过
+          # uvicorn」这种假绿/假红必须从依赖清单上消掉，不能靠运气。
+          pip install -e './engine[mcp,ios,maestro]'
       - name: Lint
         run: ruff check engine scripts
       - name: Test

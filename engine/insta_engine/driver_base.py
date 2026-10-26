@@ -130,6 +130,60 @@ class BaseDriver(ABC):
         """
         return None
 
+    # -- 证据链（2026-10-17 P2.2：从"adb 专用"改成驱动契约） ---------------------
+    # 为什么是契约而不是在 runner 里写平台 if：证据源本来就是平台相关的
+    # （Android=logcat，iOS=syslog），而 runner 是平台无关的编排层。
+    # 之前 runner 直接 import adb.logcat_* ⇒ iOS 上**静默返回空**（失败被吞），
+    # 失败步没有任何系统日志证据，而 app-crash 的唯一硬证据就在这里。
+
+    def start_evidence(self) -> None:
+        """开始采集本轮证据（Android=清 logcat 缓冲区；iOS=清 syslog 环形缓冲）。
+
+        **必须每轮开始调用**：窗口开大后，上一轮留下的崩溃会让这一轮的无关失败
+        被误判成 app-crash（T76 踩过）。默认无操作（无证据源的驱动）。
+        """
+        return None
+
+    def evidence_tail(self) -> str:
+        """取本轮证据尾部（只在失败步骤调用，避免通过步骤付往返成本）。
+
+        默认空串 = **没有证据源**，不是"没有日志"。调用方要把"空"如实暴露成 warning。
+        """
+        return ""
+
+    def start_keepalive(self, interval: float = 20.0) -> None:
+        """开始"防锁屏"保活（默认无操作）。
+
+        为什么需要：设备「自动锁定」若没设成「永不」，长跑会在中途锁屏；iOS 有密码时
+        WDA **无法代解锁** ⇒ 整批用例全红（实测 15 条里第 5 条开始全红）。
+        实现方只允许用**不改变前台、不改变网络状态**的手段（见 WdaDriver 的音量键方案）。
+        """
+        return None
+
+    def stop_keepalive(self) -> None:
+        return None
+
+    def hold_keepalive(self) -> None:
+        """批次级保活（默认等同 start_keepalive）。
+
+        为什么单独一个方法：`Runner.run` 每条用例结束会 stop（避免长驻控制台
+        一直按音量键）；但**批跑时用例之间的空隙也会耗 idle**，逐用例停会让真机
+        在切换用例时锁屏（iOS 锁屏后 WDA 无法代解锁）。CLI/控制台在**整个批次**
+        期间 hold，结束时 release。
+        """
+        self.start_keepalive()
+
+    def release_keepalive(self) -> None:
+        self.stop_keepalive()
+
+    def device_meta(self) -> dict:
+        """设备身份（`model` / `os_version`），写进产物做溯源。
+
+        为什么放在驱动层：**只有驱动知道怎么问**（Android=getprop，iOS=WDA device_info）。
+        默认空 dict（桩/未知平台），上层按缺省值渲染。
+        """
+        return {}
+
     # -- App 生命周期 -----------------------------------------------------------
 
     @abstractmethod
@@ -150,17 +204,21 @@ class BaseDriver(ABC):
     def app_info(self, package: str) -> dict:
         """已装 App 信息（versionName 等，供靶场指纹）；平台不支持/未装返回 {}。
 
-        Android 覆盖实现（u2 app_info）；iOS 暂用默认（WDA appInfo 属 P2）。
+        Android 覆盖实现（u2 app_info）；iOS 走默认实现（WDA 的 appInfo 未接，返回 {}）。
         """
         return {}
 
     # -- 定位（选择器构造收进驱动，上层不见平台 API） -----------------------------
 
     @abstractmethod
-    def find(self, by: str, value: str, timeout: float) -> Any:
+    def find(self, by: str, value: str, timeout: float, index: int | None = None) -> Any:
         """按属性构造选择器并等待出现；返回 Node（调用方以 `.exists` 判命中）。
 
         `timeout=0` 表示不等待只构造——text 语义等价链末级回退的既有语义。
+
+        `index`：同条件多命中时取**第 N 个**（0 基）。`None` = 第一个，与旧版一致。
+        ⚠️ 上层（`locator._try`）**只在 index 非 None 时**才以关键字传参，
+        所以三参签名的历史实现/测试桩不需要改；实现方按需声明该参数即可。
         """
 
     @abstractmethod

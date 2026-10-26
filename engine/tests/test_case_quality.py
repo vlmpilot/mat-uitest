@@ -155,7 +155,9 @@ def test_ensure_launch_skips_without_package():
 def test_ensure_launch_does_not_duplicate():
     raw = {"target": {"package": "com.a"},
            "steps": [{"id": "s0", "action": "launch", "params": {"package": "com.a"}}]}
-    assert review(raw) == []
+    issues = review(raw)
+    # ⚠️ 这条用例**没有断言** ⇒ R12 会报（那是正确行为，不是回归）；这里只验"没重复补 launch"
+    assert not any("已自动补" in i for i in issues), issues
     assert sum(1 for s in raw["steps"] if s["action"] == "launch") == 1
 
 
@@ -301,7 +303,145 @@ def test_quality_flags_unprovisionable_system_precondition():
 def test_environment_precondition_does_not_trigger_r17():
     """反向：**环境前提**（App 已安装）不该被 R17 误报 —— 它不会被拒跑。"""
     raw = {"steps": [{"id": "s0", "action": "launch", "params": {"package": "com.a"}},
-                     {"id": "s1", "action": "tap", "target": {"strategy": "text", "value": "要闻"}}]}
+                     {"id": "s1", "action": "tap", "target": {"strategy": "text", "value": "要闻"},
+                      "assertions": [{"type": "exists",
+                                      "target": {"strategy": "text", "value": "要闻要论"}}]}]}
     issues = quality_issues(raw, preconditions=["App 已安装"])
     assert not any(case_quality.rule_code_of(i) == "R17" for i in issues), issues
     assert issues == [], issues
+
+
+# -- R22：一次性启动噪声（跳过广告 / 首启弹窗确认）自动改为可选 -----------------------------
+
+
+def _raw_steps(steps: list[dict]) -> dict:
+    return {"target": {"package": "com.a"}, "steps": steps}
+
+
+def test_r22_marks_splash_skip_step_optional():
+    """`tap 跳过` ⇒ onFailure=continue。
+
+    实测（2026-10-21 tx-news 4/16）：引擎每次 launch 后都 `_skip_splash_ad`，用例再点
+    「跳过」时目标必然不存在；而 DSL 默认 abort ⇒ 整条用例停在第 2 步（25% 步骤）。
+    """
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch"},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "跳过"}},
+    ])
+    issues = review(raw)
+    assert raw["steps"][1]["onFailure"] == "continue"
+    assert any("[R22]" in i and "跳过" in i for i in issues), issues
+
+
+def test_r22_marks_first_launch_dialog_confirm_optional():
+    """启动后前 2 步里的 `res-id=...dialog_confirm` 也改可选。
+
+    实测：tx-news 4 条用例的第 3 步都点 `tv_dialog_confirm`（隐私弹窗），而首次同意后
+    弹窗再不会出现 ⇒ 重跑必然 LocateFailed。
+    """
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch"},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "跳过"}},
+        {"id": "s3", "action": "tap",
+         "target": {"strategy": "res-id", "value": "com.a:id/tv_dialog_confirm"}},
+    ])
+    review(raw)
+    assert raw["steps"][1]["onFailure"] == "continue"
+    assert raw["steps"][2]["onFailure"] == "continue"
+
+
+def test_r22_does_not_weaken_late_confirm_steps():
+    """**流程中**的确认步骤（启动 2 步之后）不许被改成可选——那是真断言。"""
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch"},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "我的"}},
+        {"id": "s3", "action": "tap", "target": {"strategy": "text", "value": "设置"}},
+        {"id": "s4", "action": "tap",
+         "target": {"strategy": "res-id", "value": "com.a:id/dialog_confirm"}},
+    ])
+    review(raw)
+    assert raw["steps"][3].get("onFailure") in (None, "abort"), "第 4 步不该被改成可选"
+
+
+def test_r22_ignores_non_tap_and_already_optional():
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch"},
+        {"id": "s2", "action": "wait", "target": {"strategy": "text", "value": "跳过"}},
+        {"id": "s3", "action": "tap", "onFailure": "continue",
+         "target": {"strategy": "text", "value": "跳过广告"}},
+    ])
+    issues = review(raw)
+    assert raw["steps"][1].get("onFailure") in (None, "abort"), "wait 不改"
+    assert raw["steps"][2]["onFailure"] == "continue", "本来就可选，保持"
+    assert not [i for i in issues if "[R22]" in i and "s3" in i], issues
+
+
+# -- R23：平凡断言（断言的就是本步刚点的那个控件）------------------------------------
+#
+# 这条规则来自 2026-10-22 的 A1（假绿率）复核：tx-news 4 条「频道切换」用例**全部报绿**，
+# 而截图显示页面压根没切（还停在 7x24）。链条是：
+#   `res-id=channelbar_text`（7 个 tab 共用，实际点中的是第一个） + `params.text=要闻`
+#   → 页面没变 → 断言 `exists text=要闻` 因为**频道栏本来就有这个字**而通过。
+# 旧 R2 只看「策略+值完全相同」，`res-id` 与 `text` 不同策略 ⇒ 漏网。
+
+
+def test_r23_flags_assertion_on_the_element_it_just_tapped():
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch", "params": {"package": "com.a"}},
+        {"id": "s2", "action": "tap",
+         "target": {"strategy": "res-id", "value": "com.a:id/channelbar_text"},
+         "params": {"text": "要闻"},
+         "assertions": [{"type": "exists", "target": {"strategy": "text", "value": "要闻"}}]},
+    ])
+    issues = quality_issues(raw)
+    assert any(case_quality.rule_code_of(i) == "R23" for i in issues), issues
+
+
+def test_r23_does_not_flag_assertion_about_another_control():
+    """断言的是**别的**控件（"点我的 → 断订单列表在"）⇒ 不报，那是有意义的断言。"""
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch", "params": {"package": "com.a"}},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "我的"},
+         "assertions": [{"type": "exists", "target": {"strategy": "text", "value": "我的订单"}}]},
+    ])
+    issues = quality_issues(raw)
+    assert not any(case_quality.rule_code_of(i) == "R23" for i in issues), issues
+
+
+def test_r23_ignores_not_exists():
+    """`tap 跳过` + `not-exists 跳过` 是**正确**写法（证明按钮消失了），不许报。"""
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch", "params": {"package": "com.a"}},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "跳过"},
+         "assertions": [{"type": "not-exists",
+                         "target": {"strategy": "text", "value": "跳过"}}]},
+    ])
+    issues = quality_issues(raw)
+    assert not any(case_quality.rule_code_of(i) in ("R2", "R23") for i in issues), issues
+
+
+# -- R12：整条用例没有任何断言（原先只有导入路径在管）----------------------------------
+
+
+def test_r12_flags_case_without_any_assertion():
+    """实测 `gen-225111`：某生活服务 App「启动应用并进入个人中心」2 步 0 断言，真机必绿。
+
+    这条规则原先**只写在导入路径**里（`manual_import`），生成路径漏掉 —— 正是
+    `case_quality` 模块说明要消灭的"两条路径各一套"。
+    """
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch", "params": {"package": "com.a"}},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "我的"}},
+    ])
+    issues = quality_issues(raw)
+    assert any(case_quality.rule_code_of(i) == "R12" for i in issues), issues
+
+
+def test_r12_silent_when_any_step_has_an_assertion():
+    raw = _raw_steps([
+        {"id": "s1", "action": "launch", "params": {"package": "com.a"}},
+        {"id": "s2", "action": "tap", "target": {"strategy": "text", "value": "我的"},
+         "assertions": [{"type": "selected", "target": {"strategy": "text", "value": "我的"}}]},
+    ])
+    issues = quality_issues(raw)
+    assert not any(case_quality.rule_code_of(i) == "R12" for i in issues), issues

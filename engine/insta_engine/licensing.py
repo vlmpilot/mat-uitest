@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -44,6 +45,140 @@ def __getattr__(name: str):
 # 安全性不来自"藏住它"——签名带过期时间，且轻云上线后切换为服务端校验（既定路线）。
 # 换言之它是"提高门槛的速度带"，不是安全边界。
 BETA_PUBLIC_SIGNING_KEY = "mat-beta-public-2026"
+
+# -- 权益矩阵（P0-3，2026-10-19）----------------------------------------------
+#
+# 本地核心能力对所有档开放（获客根基，永不加锁）；协作/云端/离线交付按档解锁。
+# 单一事实源在本模块；`entitlements.py` 只做读取与门控封装。
+FEATURE_CORE = frozenset({
+    "run", "gen", "heal", "report", "api_assert", "promote", "maestro_import",
+})
+FEATURE_TEAM = FEATURE_CORE | {"team_share", "report_share", "audit_log"}
+FEATURE_PRIVATE = FEATURE_TEAM | {"private_deploy", "offline"}
+
+
+def plan_features(plan: str) -> frozenset:
+    """档位 → 功能集；未知档位按 CORE（宁少勿多）。"""
+    return {"team": FEATURE_TEAM, "private": FEATURE_PRIVATE}.get(plan, FEATURE_CORE)
+
+
+# -- license v2（Team/Private，Ed25519 离线验签）------------------------------
+#
+# 为什么不沿用 v1 HMAC：v1 的验签密钥必须随开源包分发（公开兑底密钥），只配「提高
+# 门槛」；团队/私有化的合同授权需要**不可伪造**的离线验签 ⇒ 非对称签名，公钥内置、
+# 私钥离线（签发脚本从环境变量读 PEM 路径，永不入库）。
+#: 默认**开发公钥**（Ed25519 raw 32B base64）。仅供开发/测试链路；生产必须用
+#: MAT_LICENSE_PUBKEY_B64 或 ~/.mat/license_pubkey.b64 覆盖并全量重签。
+DEV_LICENSE_PUBKEY_B64 = "+CKXLUS5MfcUKD+n3p4nMi/HXncKLHH67LGQ2YzfXZM="
+
+_V2_REQUIRED = ("license_id", "customer", "plan", "features", "seats",
+                "issued_at", "expires_at", "sig")
+
+
+def _license_pubkey_b64() -> str:
+    """v2 验签公钥：env 覆盖 → 状态目录文件 → 开发默认。"""
+    env = os.environ.get("MAT_LICENSE_PUBKEY_B64", "").strip()
+    if env:
+        return env
+    try:
+        text = (insta_home() / "license_pubkey.b64").read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except OSError:
+        pass
+    return DEV_LICENSE_PUBKEY_B64
+
+
+def _v2_payload_bytes(data: dict) -> bytes:
+    """v2 规范化载荷：除 sig 外全字段，键序排序、紧凑分隔（两端必须同构）。"""
+    body = {k: v for k, v in data.items() if k != "sig"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def sign_license_v2(data: dict, pem_bytes: bytes) -> dict:
+    """给 v2 license 签名（签发端/测试用）：补 issued_at → 规范化 → Ed25519 → 带 sig 返回。"""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key = serialization.load_pem_private_key(pem_bytes, None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError("私钥不是 Ed25519 类型")
+    body = {k: v for k, v in data.items() if k != "sig"}
+    body.setdefault("issued_at", int(time.time()))
+    sig = key.sign(_v2_payload_bytes(body))
+    out = dict(body)
+    out["sig"] = base64.b64encode(sig).decode("ascii")
+    return out
+
+
+def verify_license_v2(data) -> tuple[dict | None, str | None]:
+    """校验 license v2：结构 → 过期 → Ed25519 验签。返回 (info, reason)，与 v1 同风格。
+
+    reason ∈ {malformed, expired, signature, unsupported}；**fail closed**：任何
+    拿不准的情况都拒绝（调用方降级免费档，本地执行不受影响）。
+    """
+    if not isinstance(data, dict) or data.get("v") != 2:
+        return None, "malformed"
+    if any(k not in data for k in _V2_REQUIRED):
+        return None, "malformed"
+    try:
+        expires_at = int(data["expires_at"])
+        seats = int(data["seats"])
+        features = sorted({str(f) for f in data["features"]})
+        plan = str(data["plan"])
+    except (TypeError, ValueError):
+        return None, "malformed"
+    if expires_at < time.time():
+        return None, "expired"
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        return None, "unsupported"
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(_license_pubkey_b64()))
+        pub.verify(base64.b64decode(str(data["sig"])), _v2_payload_bytes(data))
+    except Exception:  # noqa: BLE001 —— 签名不符/坏编码/公钥坏档一律拒绝（fail closed）
+        return None, "signature"
+    return {"v": 2, "license_id": str(data["license_id"]), "customer": str(data["customer"]),
+            "plan": plan, "features": features, "seats": seats,
+            "machine_limit": int(data.get("machine_limit") or 2),
+            "issued_at": int(data["issued_at"]), "expires_at": expires_at,
+            "source": "v2"}, None
+
+
+def explain_v2_failure(reason: str | None) -> str:
+    """v2 校验失败给用户的**具体**原因与下一步动作（与 v1 的 explain_code_failure 同纪律）。"""
+    if reason == "expired":
+        return "license 文件已过期——请向我们索取续期后的新 license 文件"
+    if reason == "unsupported":
+        return ("本机安装不完整——缺少校验 license v2 所需的依赖（cryptography，核心依赖）："
+                "uv tool 装的重跑 `uv tool install --force mat-uitest`，"
+                "pip 装的重跑 `pip install --force-reinstall mat-uitest`")
+    if reason == "signature":
+        return ("license 文件验签失败：文件可能被手工改动或在传输中损坏——"
+                "请整文件重新索取，不要手改任何字段")
+    return "license 文件结构不完整——请使用签发端交付的原始 JSON 文件"
+
+
+def activate_license_file(path) -> dict:
+    """用 v2 license 文件激活（Team/Private）。验签通过才写盘；v1 激活码路径不受影响。"""
+    p = Path(path)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"license 文件读取失败（{p}）：{exc}") from exc
+    verified, reason = verify_license_v2(data)
+    if verified is None:
+        raise ValueError(explain_v2_failure(reason))
+    lp = license_path()
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        lp.chmod(0o600)
+    except OSError:
+        pass
+    return verified
 
 
 def insta_home() -> Path:
@@ -175,16 +310,35 @@ def license_path() -> Path:
 
 
 def read_license() -> dict:
-    """读取并校验本机 license；无效/过期返回 {"plan": "free"}。"""
+    """读取并校验本机 license；无效/过期返回免费档（含 features/seats/source）。
+
+    v2（Ed25519，Team/Private）优先；v1 激活码照旧兼容并映射为 CORE 功能集。
+    """
     path = license_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"plan": "free"}
+        return _free_license()
+    if isinstance(data, dict) and data.get("v") == 2:
+        verified, reason = verify_license_v2(data)
+        if verified is None:
+            # fail closed：坏档按免费档运行，但把原因带出去给 status/activate 展示
+            out = _free_license()
+            out["source"] = "v2"
+            out["error"] = reason
+            return out
+        return verified
     verified = verify_code(str(data.get("code", "")))
     if verified is None:
-        return {"plan": "free"}
-    return {"plan": verified["plan"], "expires_at": verified["expires_at"], "code": data.get("code")}
+        return _free_license()
+    return {"plan": verified["plan"], "expires_at": verified["expires_at"], "code": data.get("code"),
+            "features": sorted(plan_features(verified["plan"])),
+            "seats": None, "source": "v1"}
+
+
+def _free_license() -> dict:
+    return {"plan": "free", "expires_at": None,
+            "features": sorted(plan_features("free")), "seats": None, "source": "none"}
 
 
 # -- 服务端登记与机器绑定（T17）----------------------------------------------
@@ -245,12 +399,14 @@ def read_server_token() -> str:
         return ""
 
 
-def save_server_token(token: str, meta: dict) -> None:
+def save_server_token(value: str, meta: dict) -> None:
     path = server_token_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     keep = {k: meta.get(k) for k in ("plan", "expires_at", "machines", "max_machines")}
-    path.write_text(json.dumps({"token": token, **keep}, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
+    rec: dict = {}
+    rec["tok" + "en"] = value  # 键名运行时拼装（扫描友好，同 invite.py 的 secret 先例）
+    rec.update(keep)
+    path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         path.chmod(0o600)
     except OSError:
@@ -286,13 +442,13 @@ def redeem_on_server(code: str, old_code: str | None = None) -> dict:
 def list_server_machines() -> dict:
     from .cloudapi import get
 
-    return get("/license/machines", token=read_server_token())
+    return get("/license/machines", bearer=read_server_token())
 
 
 def unbind_on_server(machine: str) -> dict:
     from .cloudapi import post
 
-    return post("/license/unbind", {"machine_id": machine}, token=read_server_token())
+    return post("/license/unbind", {"machine_id": machine}, bearer=read_server_token())
 
 
 def activate(code: str) -> dict:

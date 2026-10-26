@@ -64,13 +64,15 @@ RULES_DIR = Path("calibration")
 RULES_FILE = "rules.json"
 RULES_VERSION = 1
 
-#: 五分类（规则口径）—— 人工改判的目标必须落在这里，报告与 `run.json` 才认得
-CATEGORIES = ("app-crash", "env-failure", "assert-fail", "locate-fail", "unknown")
+#: 六分类（规则口径）—— 人工改判的目标必须落在这里，报告与 `run.json` 才认得；
+#: `api` 为 P1-1 新增（接口断言失败，与 runner.CATEGORIES 同源）
+CATEGORIES = ("app-crash", "env-failure", "assert-fail", "locate-fail", "api", "unknown")
 CATEGORY_LABELS = {
     "app-crash": "产品 bug（崩溃）",
     "env-failure": "环境问题",
     "assert-fail": "断言失败",
     "locate-fail": "定位失败",
+    "api": "接口断言失败",
     "unknown": "待归因",
 }
 #: 四分类（`mat diagnose` 的责任归属口径）—— 只作展示，供人判断时参考

@@ -1,8 +1,10 @@
 """run.json → 运行摘要（≤40 行文本，供 AI agent 与 CI 快速判读）。
 
-用法（pip install mat-uitest 后，任意目录）：
+用法（推荐 CLI 形态；uv tool / pipx 隔离装法下 `python -m` 看不到本包）：
+    mat summary artifacts/<run_dir>
+    mat summary --self-test
+等价（仅当当前解释器装着 insta_engine，如 pip --user 装法）：
     python -m insta_engine.run_summary artifacts/<run_dir>
-    python -m insta_engine.run_summary --self-test
 
 为什么存在：报告 report.html 是自包含 HTML（截图 base64 内联，实测单跑可达 15MB），
 agent 整读会撑爆上下文；run.json 才是结构化事实（≈6KB）。本模块把「读大产物」
@@ -13,6 +15,7 @@ agent 整读会撑爆上下文；run.json 才是结构化事实（≈6KB）。�
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from .report import _CATEGORY_LABELS
@@ -25,7 +28,17 @@ def _load(run_dir: str | Path) -> dict:
     path = Path(run_dir) / "run.json"
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在——run_dir 应是含 run.json 的执行产物目录（如 artifacts/case_xxx）")
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        # 带路径重包（2026-10-25 评审 P2-1）：裸 JSONDecodeError 没说哪个文件坏了，
+        # 调用方（agent/CI）无从行动。收口在这里，`python -m` 直跑同样受益。
+        raise ValueError(f"{path} 不是合法 JSON（{exc}）——若被手工改过，重跑该用例生成新产物"
+                         ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} 应是对象，实际是 {type(data).__name__}——该文件由 mat run 生成，"
+                         "若被手工改过，重跑该用例生成新产物")
+    return data
 
 
 def summarize_run(run_dir: str | Path) -> dict:
@@ -147,9 +160,15 @@ def main() -> int:
         return self_test()
     if not args.run_dir:
         ap.error("需要 run_dir（或 --self-test）")
-    summary = summarize_run(args.run_dir)
+    try:
+        summary = summarize_run(args.run_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     print(digest(summary))
-    return 0 if summary["status"] == "passed" else 1
+    if summary["status"] == "passed":
+        return 0
+    return 1 if summary["status"] in ("failed", "skipped", "cancelled") else 2
 
 
 if __name__ == "__main__":

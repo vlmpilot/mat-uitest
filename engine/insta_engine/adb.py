@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 
 
@@ -18,6 +19,37 @@ def adb(serial: str | None, *args: str, timeout: float = 15) -> str | None:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               encoding="utf-8", errors="replace")  # Windows 默认 GBK 会炸中文日志
         return proc.stdout if proc.returncode == 0 else None
+    except FileNotFoundError:
+        # 本机没有 CLI `adb`（2026-10-25 真机评测）：回退 adbutils——驱动能连设备，
+        # 说明只是**采集通道**缺失；不兜底会让失败步日志静默变空、崩溃归因失效。
+        return _adb_py(serial, args, timeout)
+    except Exception:
+        return None
+
+
+def _shell_command(args: tuple[str, ...]) -> str:
+    """把 adb 参数列表转成**设备端** shell 命令行（CLI 缺失时的回退通道用）。
+
+    ⚠️ **必须先剥掉开头的 `shell`**（2026-10-25 真机实测）：adbutils 的
+    `device.shell(cmd)` 本身就在设备 shell 里执行，再传一个 `shell` 就变成
+    `sh -c "shell dumpsys meminfo …"` ⇒ 报
+    `/system/bin/sh: shell: inaccessible or not found`。而 `adb()` 只在
+    returncode==0 时返回 stdout ⇒ **静默变空**。
+    受影响的是带 `shell` 前缀的调用方（perf 的启动耗时 / meminfo、
+    recording 的 screenrecord 控制等）——在没装 adb CLI 的机器上（本机就是）
+    这些采集会全部静默丢数据，而**驱动本身照常能连设备**，所以看起来一切正常。
+    """
+    rest = args[1:] if args and args[0] == "shell" else args
+    return " ".join(shlex.quote(a) for a in rest)
+
+
+def _adb_py(serial: str | None, args: tuple[str, ...], timeout: float) -> str | None:
+    """CLI `adb` 不可用时的纯 Python 通道（adbutils，与驱动同一传输）。"""
+    try:
+        import adbutils
+
+        device = adbutils.adb.device(serial) if serial else adbutils.adb.device()
+        return device.shell(_shell_command(args), timeout=timeout)
     except Exception:
         return None
 

@@ -17,6 +17,15 @@ def api_index(root: Path, body: dict) -> tuple[int, dict]:
     package = str(body.get("package", "")).strip()
     if not package:
         return 400, {"error": "需要 package"}
+    # 与 api_explore 同闸口（A3）：包名既拼进 artifacts/page_index/<package>.json
+    # 路径，又进 `monkey -p <package>` 设备 shell——形状非法在边界拒绝，
+    # 不给设备注入与越界写原语（2026-10-20 评审 P1-1：本端点曾漏校验）。
+    from ..pkgname import safe_package_name
+
+    try:
+        safe_package_name(package)
+    except ValueError as exc:
+        return 400, {"error": f"包名不合法: {exc}"}
     refresh = bool(body.get("refresh"))
     steps = min(max(int(body.get("steps", 30)), 5), 120)
     pages_limit = min(max(int(body.get("pages", 15)), 5), 60)

@@ -141,7 +141,8 @@ def test_make_recorder_ios_sim_only(tmp_path):
     rec, reason = make_recorder("ios", "simulator", tmp_path)
     assert isinstance(rec, Recorder) and reason is None
     rec, reason = make_recorder("ios", "00008101-XXXX", tmp_path)
-    assert rec is None and "P2" in (reason or ""), "iOS 真机录屏属 P2（诚实降级）"
+    assert rec is None and "公开的录制 API" in (reason or ""), (
+        "iOS 真机录屏明确不做（诚实降级），文案须说清原因")
 
 
 def test_make_recorder_unknown_platform():
@@ -250,3 +251,116 @@ def test_report_embeds_video_player(tmp_path):
     (tmp_path / "no-video").mkdir(exist_ok=True)
     html2 = render_html(run, tmp_path / "no-video").read_text(encoding="utf-8")
     assert "video/" not in html2
+
+
+# -- 段轮转竞态（P1-3，2026-10-24）--------------------------------------------
+
+def test_rotate_watch_rechecks_stopping_after_sleep(tmp_path, monkeypatch):
+    """P1-3 回归：段到点自退与 stop() 并发——sleep 窗口内停止位已置 ⇒ 不得起新段。
+
+    此前 11 条录屏测试全传 rotate_watch=False，轮转线程零覆盖；实际竞态是
+    watch 线程 sleep(0.5) 期间 stop() 完成了 kill+pull，醒来再 _start_segment()
+    ⇒ 新段不被 kill、不被 pull（设备端进程/文件泄漏至多 180s）。
+    """
+    from insta_engine import recording
+
+    rec = Recorder("android", "SER", tmp_path / "rec", rotate_watch=True)
+    rec._started = True
+    rec._seg = 1
+
+    class _DeadProc:  # 模拟 180s 到点自退：wait() 立即返回
+        def wait(self, *a, **k):
+            return 0
+
+    rec._proc = _DeadProc()
+
+    def _sleep_raced(_s):
+        rec._stopping = True  # 竞态时序：stop() 恰落在 watch 线程的 sleep 窗口内
+
+    monkeypatch.setattr(recording.time, "sleep", _sleep_raced)
+    started: list[int] = []
+    monkeypatch.setattr(rec, "_start_segment", lambda: started.append(1))
+
+    rec._rotate_watch()  # 主线程直跑（确定性），不再依赖守护线程时序
+
+    assert started == [], "stop() 置位后轮转线程不得再起新段"
+    assert rec._stopping is True
+
+
+def test_start_segment_entry_refuses_after_stop(tmp_path, monkeypatch):
+    """P1-3 入口兜底：_stopping 已置位时 _start_segment 必须是空操作（不 Popen）。"""
+    from insta_engine import recording
+
+    rec = Recorder("android", "SER", tmp_path / "rec", mode="screenrecord")
+    rec._stopping = True
+
+    def _no_pop(*_a, **_k):
+        raise AssertionError("stop() 后不得再启动录制子进程")
+
+    monkeypatch.setattr(recording.subprocess, "Popen", _no_pop)
+    rec._start_segment()
+    assert rec._seg == 0, "入口检查必须发生在计数自增之前"
+
+
+# -- 数据驱动逐组录屏（P1-5，2026-10-24）--------------------------------------------
+
+def test_run_datasets_recorder_factory_per_group(tmp_path):
+    """P1-5 回归：--record 不再在数据驱动路径被静默丢弃——recorder_factory
+    每组各建一个 Recorder（一次性对象），各组拿到**自己的**产物目录，
+    start/stop 逐组配对；run_datasets 结束后还原 runner 原始 recorder。"""
+    from insta_engine.dsl import TestCase
+
+    class _GroupRecorder:
+        def __init__(self, art_dir):
+            self.dir = art_dir
+            self.calls: list[str] = []
+
+        def start(self):
+            self.calls.append("start")
+
+        def stop(self):
+            self.calls.append("stop")
+            return []
+
+        def keep(self, files, artifacts_dir):
+            self.calls.append("keep")
+
+        def discard(self, files):
+            self.calls.append("discard")
+
+    made: list[_GroupRecorder] = []
+
+    def _factory(art_dir):
+        rec = _GroupRecorder(Path(art_dir))
+        made.append(rec)
+        return rec
+
+    case = TestCase.model_validate({
+        "caseId": "case_ds", "name": "数据驱动录屏", "target": {"package": "com.x"},
+        "steps": [{"id": "s1", "action": "wait", "params": {"ms": 5}}],
+        "datasets": [{"name": "组A", "vars": {}}, {"name": "组B", "vars": {}}],
+    })
+    runner = Runner(_FakeDrv(), tmp_path)
+    sentinel = object()
+    runner.recorder = sentinel
+    results = runner.run_datasets(case, tmp_path, recorder_factory=_factory)
+
+    assert len(results) == 2 and len(made) == 2, "每组必须各建一个 recorder"
+    assert [r.calls[:2] for r in made] == [["start", "stop"], ["start", "stop"]], \
+        "各组录屏 start/stop 必须逐组配对"
+    assert {r.dir.name for r in made} == {"组A", "组B"}, "工厂收到的必须是本组产物目录"
+    assert runner.recorder is sentinel, "run_datasets 结束后必须还原原始 recorder"
+
+
+def test_run_datasets_without_factory_keeps_recorder_none(tmp_path):
+    """不传工厂时行为与从前一致（recorder=None，不录屏）——向后兼容。"""
+    from insta_engine.dsl import TestCase
+
+    case = TestCase.model_validate({
+        "caseId": "case_ds2", "name": "无录屏", "target": {"package": "com.x"},
+        "steps": [{"id": "s1", "action": "wait", "params": {"ms": 5}}],
+        "datasets": [{"name": "组A", "vars": {}}],
+    })
+    runner = Runner(_FakeDrv(), tmp_path)
+    results = runner.run_datasets(case, tmp_path)
+    assert len(results) == 1 and runner.recorder is None

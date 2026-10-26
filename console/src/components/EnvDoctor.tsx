@@ -17,16 +17,17 @@ const isAi = (c: DoctorCheck) => AI_IDS.has(c.id);
 
 // gen 未配置时的两种方式(截图文案):直接铺在行下,不藏 tooltip——配置内容是
 // 用户要照抄的,不是补充说明。与 doctor.py gen_hint、ENV_TEMPLATE 同源同文案。
+// 2026-10-21：推荐 BYOK（数据不经我们），代理降为零配置试用。
 const GEN_WAYS: { title: string; lines: string[] }[] = [
-  { title: "方式一：官方代理", lines: [
-    "GEN_BASE_URL=https://mobileaitest.com",
-    "GEN_API_KEY=<你的 token>",
-    "GEN_PROMPT_MODE=server"] },
-  { title: "方式二：自带 Key（OpenAI 兼容端点）", lines: [
+  { title: "方式一（推荐）：自带 API Key（OpenAI 兼容端点，数据不经我们）", lines: [
     "GEN_BASE_URL=<你的 OpenAI 兼容端点>",
     "GEN_API_KEY=<你的 Key>",
     "GEN_MODEL=<语言模型名>",
-    "GEN_VL_MODEL=<视觉模型名>"] },
+    "GEN_VL_MODEL=<视觉模型名>  # 可选：视觉兜底"] },
+  { title: "方式二：官方代理（零配置试用，关注公众号「Mobile AI Test」获取 token）", lines: [
+    "GEN_BASE_URL=https://mobileaitest.com",
+    "GEN_API_KEY=<平台代理token>",
+    "GEN_PROMPT_MODE=server"] },
 ];
 
 function GenConfigWays() {
@@ -56,6 +57,15 @@ function FixButton({ fix, onDone }: { fix: NonNullable<DoctorCheck["fix"]>; onDo
     setLoading(true);
     if (fix.action === "start-wda") {
       message.info("正在启动 WDA…若本机从未构建过 WDA，将自动下载源码并构建（约 2~5 分钟），请稍候");
+    } else if (fix.action === "start-wda-device") {
+      // 真机走 usbmux + xcodebuild：有已签名产物时 1 秒级，否则要构建（分钟级）
+      message.info("正在启动真机 WDA…复用已签名产物时很快；需要构建时约 2~5 分钟，请保持设备解锁");
+    } else if (fix.action === "renew-cert") {
+      // 前置条件显式化（2026-10-22）：续期=重新签名，必须有 USB 真机作构建目标；
+      // 证书未临近到期时 Apple 不签发新 profile，续期成功后需重启 WDA 才生效。
+      message.info("正在尝试续期证书（= 重新签名）…需要 USB 连接 iPhone 并解锁；"
+        + "证书未临近到期时 Apple 不会签发新 profile（可能提示「没有变化」）；"
+        + "续期成功后请重启 WDA 才生效。xcodebuild 用不了账号时需去 Xcode 按 ⌘U");
     }
     try {
       const r = await doctorFix(fix.action);
@@ -102,6 +112,12 @@ function CheckRow({ c, onRerun, onGoSettings, onManage }: { c: DoctorCheck; onRe
         </div>
       </Tooltip>
       {c.id === "gen" && !c.ok && <GenConfigWays />}
+      {/* 需要人操作的项（插线/解锁/信任证书/登录账号）**没有按钮可点**，
+          引导不能只放 tooltip——不悬停就看不到。这里直接铺在行下方。 */}
+      {c.status !== "ok" && tip && (
+        <div style={{ margin: "2px 0 4px 16px", fontSize: 12, color: "#8a919f",
+          whiteSpace: "pre-line", lineHeight: 1.5 }}>{tip}</div>
+      )}
     </div>
   );
 }
@@ -112,12 +128,16 @@ function androidConclusion(checks: DoctorCheck[]): { color: string; text: string
   return blocking ? { color: "red", text: "有阻塞项" } : { color: "green", text: "就绪,可以开测" };
 }
 
-// iOS:整组可选——库没装=灰(用户没进这条赛道);装了库服务没起=红;模拟器没开=橙。
+// iOS:整组可选——库没装=灰(用户没进这条赛道);装了库服务没起=红;
+// 真机与模拟器**任一可用即可**（2026-10-22：此前只看 simulators，
+// 真机已连好且 WDA 就绪也报「模拟器未启动」）。
 function iosConclusion(checks: DoctorCheck[]): { color: string; text: string } {
   const byId = Object.fromEntries(checks.map((c) => [c.id, c]));
   if (!byId["wda-lib"]?.ok) return { color: "default", text: "未安装(可选)" };
   if (byId["wda-server"]?.status === "fail") return { color: "red", text: "WDA 服务未起" };
-  if (!byId["simulators"]?.ok) return { color: "orange", text: "模拟器未启动" };
+  if (!byId["simulators"]?.ok && !byId["ios-device"]?.ok) {
+    return { color: "orange", text: "无可用设备" };
+  }
   return { color: "green", text: "就绪" };
 }
 
@@ -145,6 +165,7 @@ function DoctorCard({ title, loading, checks, resp, conclusion, onRerun, busy, o
 
 export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
   onGoSettings?: () => void }) {
+  const iosSupported = state.ios_supported !== false;
   const [android, setAndroid] = useState<DoctorResp | null>(null);
   const [ios, setIos] = useState<DoctorResp | null>(null);
   // 单卡独立重跑（发起人 2026-10-12：点一个「重新检测」另外两个也响应）——
@@ -159,7 +180,11 @@ export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
       .catch((e) => setErr(String(e)))
       .finally(() => setBusyKey(null));
   }, []);
-  useEffect(() => { runOne("android"); runOne("ios"); }, [runOne]);
+  useEffect(() => {
+    runOne("android");
+    // 非 macOS 没有 iOS 工具链：不发起这次检测，也不渲染 iOS 卡
+    if (iosSupported) runOne("ios");
+  }, [runOne, iosSupported]);
 
   const androidChecks = android?.checks ?? [];
   const envChecks = androidChecks.filter((c) => !isAi(c));
@@ -169,20 +194,22 @@ export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
 
   return (
     <Row gutter={16} style={{ marginTop: 16 }}>
-      <Col span={8}>
+      <Col span={iosSupported ? 8 : 12}>
         <DoctorCard title="Android 环境" loading={!android && !err} checks={envChecks} resp={android}
           conclusion={androidConclusion(envChecks)} onRerun={() => runOne("android")}
           busy={busyKey === "android"} />
       </Col>
-      <Col span={8}>
-        <DoctorCard title="iOS 环境" loading={!ios && !err} checks={iosChecks} resp={ios}
-          conclusion={iosConclusion(iosChecks)} onRerun={() => runOne("ios")}
-          busy={busyKey === "ios"} />
-      </Col>
-      <Col span={8}>
+      {iosSupported && (
+        <Col span={8}>
+          <DoctorCard title="iOS 环境" loading={!ios && !err} checks={iosChecks} resp={ios}
+            conclusion={iosConclusion(iosChecks)} onRerun={() => runOne("ios")}
+            busy={busyKey === "ios"} />
+        </Col>
+      )}
+      <Col span={iosSupported ? 8 : 12}>
         <DoctorCard title="AI 生成" loading={!android && !err} checks={aiChecks} resp={android}
           conclusion={genOk
-            ? { color: "green", text: `已配置 · ${state.prompt_mode === "server" ? "server模式" : "自部署"}` }
+            ? { color: "green", text: `已配置 · ${state.prompt_mode === "server" ? "server" : "自部署"}` }
             : { color: "orange", text: "未配置" }}
           onRerun={() => runOne("android")} busy={busyKey === "android"}
           onGoSettings={onGoSettings}

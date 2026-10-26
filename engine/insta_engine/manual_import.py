@@ -75,6 +75,17 @@ _KEYWORDS: dict[str, list[str]] = {
 _REQUIRED = ("title", "steps_action")
 
 
+def slugify_filename(title: str, *, fallback: str) -> str:
+    """用例标题 → 文件安全名（2026-10-25：产物文件名直接用用例名，不再 stamp+uuid）。
+
+    非法字符与空白归一成 `_`，中文保留（工作区/套件已验证中文文件名无碍），
+    截 40 字防超长；清洗后为空回退 `fallback`（如 gen-123456-1）。撞名由**落盘方**
+    处理（加 -2/-3）——这里只负责无状态地起名。
+    """
+    s = re.sub(r'[\\/:*?"<>|\s]+', "_", str(title or "").strip()).strip("._")
+    return (s[:40] or fallback)
+
+
 def _norm(text: str) -> str:
     return re.sub(r"[\s\u3000·_\-—()（）\[\]【】]", "", str(text)).lower()
 
@@ -233,7 +244,11 @@ def _read_xlsx(path: Path) -> list[list[str]]:
     try:
         import openpyxl
     except ImportError as exc:
-        raise TemplateError("读取 Excel 需要：pip install 'mat-uitest[import]'") from exc
+        # openpyxl 是核心依赖（2026-10-21 起）：走到这里说明安装不完整，不是"缺个 extra"
+        raise TemplateError(
+            "读取 Excel 失败：本机安装缺少 openpyxl（核心依赖，正常安装应自带）——"
+            "请重装：uv tool 装的重跑 `uv tool install --force mat-uitest`，"
+            "pip 装的重跑 `pip install --force-reinstall mat-uitest`") from exc
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
     sheet = workbook.active
     return [[("" if cell is None else str(cell)) for cell in row] for row in sheet.iter_rows(values_only=True)]
@@ -550,7 +565,16 @@ def convert_case(client, case: ManualCase, package: str, controls: str = "",
             def hook(raw_case, _items=tuple(page_states)):  # noqa: B023 - 默认参数绑定，非晚绑定
                 return _expand_preconditions(client, raw_case, _items, package,
                                              controls, graph, record)
-        issues = review(data["case"], case.preconditions, expand=hook)
+        # 要图谱的确定性改写（R21 共用 rid → 文案、R25 导航耦合 → 状态断言）。
+        # 与生成路径**同一个入口**（`case_audit.index_rewrites`）—— 导入是 A2 的主要来源，
+        # 不在这里改，历史缺陷就永远只在跑测后才被发现。
+        rewrite_hook = None
+        if index_dir is not None:
+            from .case_audit import index_rewrites
+
+            def rewrite_hook(raw_case, _dir=index_dir):  # noqa: B023 - 默认参数绑定，非晚绑定
+                return index_rewrites(raw_case, _dir)
+        issues = review(data["case"], case.preconditions, expand=hook, rewrite=rewrite_hook)
         # 模型自己报的问题：挂 `[LLM]`（**没有对应规则编号**这件事本身要可见 ——
         # R16 要求每条 issue 都能指回一个编号，模型的自述是唯一的例外）
         issues += [fmt_issue("LLM", str(i)) for i in data.get("issues", [])]
@@ -593,9 +617,10 @@ def convert_case(client, case: ManualCase, package: str, controls: str = "",
         #    因为一条断言有问题就不给草稿，等于把已经花掉的转换额度扔掉，
         #    还把"改哪一条"的活推回给手工用例 —— 方向反了。
         #    C 级仍然响亮标出（它是"必失败，必须改"），但**不再等于"什么都不给"**。
-        import uuid
         slug = re.sub(r"[^\w\u4e00-\u9fff]+", "-", case.title).strip("-")[:24] or "case"
-        record["case_file"] = f"import-{datetime.now().strftime('%H%M%S')}-{uuid.uuid4().hex[:4]}-{slug}.json"
+        # 2026-10-25：文件名直接用标题（slugify_filename 与 gen 产物同一清洗口径），
+        # 不再 import-<stamp>-<uuid> 前缀——那是"还要再改名"痛点的另一面
+        record["case_file"] = f"{slugify_filename(case.title, fallback=f'import-{slug}')}.json"
         record["dsl"] = json.loads(dump_dsl(draft))
         return record
     except Exception as exc:
@@ -647,9 +672,8 @@ def convert_batch(client, cases: list[ManualCase], package: str, usage: UsageSto
     **已完成**条数，中止时小于 `cases` 数（UI 文案由调用方区分）。
     """
     expanding = expand_enabled()
-    extra = sum(1 for c in cases if expanding and provisionable(c.preconditions))
-    amount = round((len(cases) + extra) * 0.5, 2)
-    usage.ensure_capacity(amount)  # 不足直接 QuotaExceeded，不产生半批结果
+    _ = expanding  # 保留开关读取（摘要/UI 侧仍引用 expand 语义；额度按实际调用 consume）
+    # P0-2：本地不再拦截生成（官方代理 429 权威/BYOK 不限）；逐条成功后 consume 仅统计
     results = []
     for idx, case in enumerate(cases, 1):
         if cancel_event is not None and cancel_event.is_set():
@@ -683,9 +707,17 @@ def save_import_bundle(root: Path, source_path: Path, package: str, batch: dict,
         if record.get("dsl"):
             data = dict(record["dsl"])  # 不修改调用方数据
             data["caseId"] = unique_case_id(str(data.get("caseId", "case_import")), cases_dir)
+            # 撞名加序号（磁盘已有或批内同标题）：标题同名是合法输入,别互相覆盖
             case_path = cases_dir / record["case_file"]
+            stem = case_path.stem
+            n = 2
+            while case_path.exists() or case_path.name in used_ids:
+                case_path = cases_dir / f"{stem}-{n}.json"
+                n += 1
             case_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            used_ids.add(record["case_file"])
+            # 回写最终文件名（撞名加了序号）——import.json 报告的对账字段必须真实
+            record["case_file"] = case_path.name
+            used_ids.add(case_path.name)
     payload = {
         "import_id": import_id, "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source_file": source_path.name, "package": package, "template": used_template, **batch,

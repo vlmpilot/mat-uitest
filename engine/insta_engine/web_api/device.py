@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 
 from .. import ios_wda
@@ -17,12 +18,43 @@ from .runtime import get_driver, invalidate_driver
 #: 设备级操控动作白名单（F3）：拒绝一切自由文本，其余一律 400。
 _KEY_ACTIONS = ("home", "back", "recents", "settings")
 
+#: iOS 真机枚举的 TTL 缓存（2026-10-19）：/api/state 每 5s 被前端轮询一次，
+#: 而 `devicectl list` 要 0.5~2s——不缓存的话每次轮询都白烧一次子进程。
+_IOS_CACHE_TTL = 8.0
+_ios_cache: list = [0.0, []]  # [过期时间戳, 设备列表]
+
+
+def ios_state_devices() -> list[dict]:
+    """iOS **USB** 真机并入设备清单（2026-10-19，控制台真机入口）。
+
+    字段与 adb 设备同构（`serial`=udid、`state`="device"），另带 `platform`/`os`——
+    前端按 platform 分流，serial 原样透传给驱动层（WdaDriver 认得真机 udid，走 usbmux）。
+    **只列 wired**：V1 仅支持 USB，Wi-Fi 设备列出来用户一点投屏就是必失败；
+    有 Wi-Fi 设备时以 `wifi_count` 旁路告知（前端可提示插线）。
+    """
+    now = time.monotonic()
+    if now < _ios_cache[0]:
+        return _ios_cache[1]
+    from .. import ios_device
+
+    out: list[dict] = []
+    for dev in ios_device.list_devices():
+        if dev.get("transport") != "wired":
+            continue
+        out.append({"serial": dev["udid"], "state": "device",
+                    "model": dev.get("model") or dev.get("name") or dev["udid"],
+                    "os": dev.get("os_version") or "", "platform": "ios"})
+    _ios_cache[:] = [now + _IOS_CACHE_TTL, out]
+    return out
+
 
 def api_devices() -> tuple[int, dict]:
-    """GET /api/devices：adb 枚举天然只有 Android；逐项标注 platform 供上层按平台
-    路由（评审 I4）。iOS 设备不可枚举（WDA 常驻 localhost:8100），可达性在首次连接时校验。
+    """GET /api/devices：adb 枚举 + iOS USB 真机（2026-10-19 起真机也在此列），
+    逐项标注 platform 供上层按平台路由（评审 I4）。iOS 模拟器不可枚举
+    （WDA 常驻 localhost:8100），可达性在首次连接时校验。
     """
     devices = [{**d, "platform": "android"} for d in list_adb_devices()]
+    devices.extend(ios_state_devices())
     return 200, {"devices": devices}
 
 
@@ -99,7 +131,9 @@ def api_ios_sim_boot(body: dict) -> tuple[int, dict]:
             subprocess.run(["xcrun", "simctl", "shutdown", d["udid"]],
                            capture_output=True, text=True, timeout=60)
             shut.append(d.get("name", ""))
-    subprocess.run(["open", "-a", "Simulator"], capture_output=True, timeout=15)  # best-effort 显示窗口
+    from ..ios_setup import open_simulator_app
+
+    open_simulator_app(boot_first=False)  # best-effort 开窗口;别再 boot 另一台(udid 已 boot)
     # boot 完顺手拉 WDA（发起人 2026-10-12：启动完成即正常投屏——此前 WDA 要去终端
     # 手动跑，模拟器开了也投不了屏）。allow_build=True：全新模拟器 WDA 未安装，
     # simctl launch 必然失败——首次启动必须走构建兜底（分钟级，前端「启动中」占位
@@ -130,7 +164,7 @@ def api_screenshot_capture(root, host: str, body: dict) -> tuple[int, dict]:
     """人工截屏（迭代，发起人需求）：截当前设备画面，存工作区固定目录。
 
     目录：<工作区>/screenshots/（与测试产物 artifacts/ 分离——这是人拍的，不是用例证据）。
-    文件名带时间戳与设备号，绝不覆盖；返回相对路径与可点 URL（screenshots 路由直出）。
+    文件名带时间戳与设备号，绝不覆盖；返回相对路径与可点 URL（/screenshots 路由直出）。
     """
     serial = body.get("serial") or None
     platform = str(body.get("platform") or "android")

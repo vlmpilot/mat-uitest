@@ -5,12 +5,12 @@ import type { MenuProps } from "antd";
 type MenuPropsItems = NonNullable<MenuProps["items"]>[number];
 import {
   BarChartOutlined, CheckCircleOutlined, FileTextOutlined, FolderOpenOutlined, MobileOutlined,
-  PlayCircleOutlined, RobotOutlined, SearchOutlined, SolutionOutlined, SwapOutlined,
-  ThunderboltOutlined, UserOutlined,
+  PlayCircleOutlined, QuestionCircleOutlined, RobotOutlined, SearchOutlined, SolutionOutlined,
+  SwapOutlined, ThunderboltOutlined, UserOutlined,
 } from "@ant-design/icons";
 import { ReactNode, useEffect, useRef, useState } from "react";
 import {
-  getJobs, getState, getOperator, getVersionCheck, JobInfo, openWorkspace, seatCheck, setOperator,
+  getJobs, getSeats, getState, getOperator, getVersionCheck, cancelJob, JobInfo, openWorkspace, seatCheck, setOperator,
   StateResp, submitAuthKey, VersionCheck,
 } from "./api";
 import Audit from "./views/Audit";
@@ -65,7 +65,10 @@ function NextStepCard({ state, onNav }: { state: StateResp; onNav: (nav: Nav) =>
   const step: { icon: ReactNode; title: string; desc: string; action: string; view: string }
     | null = !online.length
     ? { icon: <MobileOutlined />, title: "第一步:连接设备",
-        desc: "Android 手机开启 USB 调试插上电脑,或启动 iOS 模拟器;「设备/执行日志」页出现实时画面即就绪。",
+        // iOS 仅 macOS 可用（Xcode 工具链）：其他平台不引导启动模拟器
+        desc: state.ios_supported === false
+          ? "Android 手机开启 USB 调试插上电脑;「设备/执行日志」页出现实时画面即就绪。"
+          : "Android 手机开启 USB 调试插上电脑,或启动 iOS 模拟器;「设备/执行日志」页出现实时画面即就绪。",
         action: "去连接设备", view: "screens" }
     : !state.gen_ready
     ? { icon: <RobotOutlined />, title: "第二步:配置 AI",
@@ -110,8 +113,27 @@ function NextStepCard({ state, onNav }: { state: StateResp; onNav: (nav: Nav) =>
 
 function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => void }) {
   const quota = state.usage;
-  // 标准版(gen_limit=null)只显示「无限」，不再带计数前缀（发起人 2026-10-13）
-  const genValue = quota.gen_limit == null ? "无限" : `${quota.gen_count}/${quota.gen_limit}`;
+  // 额度展示按**AI 接入**分（2026-10-24）：自带 API Key 不设上限，就别摆分母；
+  // 官方代理如实显示 已用/上限。`ai_mode` 缺省（旧后端）时退回旧逻辑。
+  const byok = state.ai_mode === "local";
+  const genValue = byok ? "不限"
+    : quota.gen_limit == null ? "无限" : `${quota.gen_count}/${quota.gen_limit}`;
+  // 额度消耗口径的**单一来源**（2026-10-26 用户要求：各业务页的额度说明收敛到这里，
+  // 数字后问号 tooltip 展示「哪里消耗多少」——与轻云 TASK_COST/TASK_BUCKET 同口径）
+  const genTip = byok
+    ? <>local(自带 API Key)不消耗官方 AI 额度。以下口径仅官方代理模式:
+        <br/>· 用例生成 <b>1 次/任务</b>(同页多入口拆分不另计)
+        <br/>· 导入转换 <b>0.5 次/用例</b>
+        <br/>· AI 归因 <b>1 次/次</b>
+        <br/>· 页面起名 <b>1 次/批</b>(一次调用描述一批,≤50 页)
+        <br/>· 视觉兜底<b>单独额度</b>(与生成额度分池)</>
+    : <>额度消耗口径:
+        <br/>· 用例生成 <b>1 次/任务</b>(同页多入口拆分不另计)
+        <br/>· 导入转换 <b>0.5 次/用例</b>
+        <br/>· AI 归因 <b>1 次/次</b>
+        <br/>· 页面起名 <b>1 次/批</b>(一次调用描述一批,≤50 页)
+        <br/>· 视觉兜底<b>单独额度</b>:本月 {quota.vision_count}/{quota.vision_limit ?? "∞"}
+        <br/>· 换自带 API Key(local)则不消耗官方额度</>;
   const online = state.devices.filter((d) => d.state === "device");
   const apps = new Set(Object.values(state.caseMeta).map((m) => m.app).filter(Boolean));
   const passed = state.runs.filter((r) => r.status === "passed").length;
@@ -182,9 +204,16 @@ function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => voi
           title="用例" value={state.cases.length}
           sub={apps.size ? `覆盖 ${apps.size} 个应用` : "暂无用例"} /></Col>
         <Col span={6}><StatCard icon={<RobotOutlined />} tint="#f9f0ff" color="#9254de"
-          title="AI 生成(本月)" value={genValue}
+          title="AI 生成(本月)"
+          value={<>{genValue}
+            <Tooltip title={genTip} overlayStyle={{ maxWidth: 420 }}>
+              <QuestionCircleOutlined style={{ fontSize: 14, color: "#8a919f",
+                marginLeft: 6, cursor: "help" }} />
+            </Tooltip></>}
           sub={<Tag style={{ marginLeft: 0 }} color={state.gen_ready ? "green" : "orange"}
-            bordered={false}>{state.gen_ready ? "已配置" : "未配置"}</Tag>} /></Col>
+            bordered={false}>{state.gen_ready
+            ? `${byok ? "local" : "server"} · ${byok ? "不限额度" : "官方代理额度"}`
+            : "未配置"}</Tag>} /></Col>
         <Col span={6}><StatCard icon={<PlayCircleOutlined />} tint="#fff7e6" color="#fa8c16"
           title="最近执行" value={state.runs.length}
           sub={state.runs.length ? `通过 ${passed} · 失败 ${state.runs.length - passed}` : "暂无执行"} /></Col>
@@ -196,7 +225,7 @@ function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => voi
 }
 
 function parseHash(): { view: ViewKey; caseName?: string; stepId?: string; jobId?: string } {
-  const seg = location.hash.replace(^#\/?/, "").split("/");
+  const seg = location.hash.replace(/^#\/?/, "").split("/");
   // 用例深链支持 ?step= 定位失败步骤（报告「编辑此步」→ 编辑器滚动高亮，发起人 2026-10-12 P1）
   let caseName: string | undefined; let stepId: string | undefined;
   if (seg[0] === "cases") {
@@ -252,34 +281,43 @@ function AuthGate() {
 // localStorage；Header 常驻显示可改（改名=占新名额，同样过登记）。
 // ⚠️ open 由 App 持有（Header 按钮 / 首次进入都会置位）——此前 open 是组件内部 state
 // 且从未置 true，点右上角「设置名字」毫无反应（发起人 2026-10-12 反馈）。
-// ⚠️ 未命名时不给任何逃生口（无取消/关闭/ESC/点遮罩）——后端写接口已全部过人数闸，
-// 匿名做任何写操作都会 400，前端也就不该放行匿名状态（发起人 2026-10-12：匿名可绕名额）。
-function OperatorPrompt({ operator, open, onClose, onSaved }: {
-  operator: string; open: boolean; onClose: () => void; onSaved: (n: string) => void }) {
+// ⚠️ 逃生口按模式（2026-10-25 方案 B）：**共享模式（--share）**未命名时不给逃生口（无取消/关闭/
+// ESC/点遮罩）——后端写接口全过人数闸，匿名做任何写操作都会 400，前端不该放行匿名状态
+// （发起人 2026-10-12：匿名可绕名额）；**本机单人模式**名字已是可选（operator 兜底「本机」），
+// 不可关闭的弹窗只剩陷阱意义——给全量逃生口。
+function OperatorPrompt({ operator, open, onClose, onSaved, shared }: {
+  operator: string; open: boolean; shared: boolean;
+  onClose: () => void; onSaved: (n: string) => void }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {  // 打开时预填当前名字——改名字不必重敲
     if (open) setName(operator || "");
   }, [open, operator]);
+  // 被名额拒过（403）后必须可关：提示文案的出路（设置页移除旧名字）在弹窗后面——
+  // 关不掉就等于锁死（2026-10-25 评审：未授权 --share 的 1 席被旧名占住、换浏览器
+  // 清了 localStorage 的场景，方案 B 的 canEscape 只豁免了非 shared）
+  const [rejected, setRejected] = useState(false);
   const save = () => {
     const n = name.trim().slice(0, 40);
     if (!n || busy) return;
     setBusy(true); setErr(null);
     seatCheck(n).then(() => { setOperator(n); onSaved(n); onClose(); })
-      .catch((e) => setErr(String(e).replace("Error: ", "")))
+      .catch((e) => { setErr(String(e).replace("Error: ", "")); setRejected(true); })
       .finally(() => setBusy(false));
   };
+  const canEscape = !!operator || !shared || rejected;  // 已命名可关；单人随时可关；被拒后给出路
   return (
     <Modal title={operator ? "修改名字" : "先打个招呼——你是谁？"} open={open}
       okText="进入" cancelText="取消" width={380}
-      closable={!!operator} keyboard={!!operator} maskClosable={!!operator}
-      cancelButtonProps={{ style: operator ? undefined : { display: "none" } }}
+      closable={canEscape} keyboard={canEscape} maskClosable={canEscape}
+      cancelButtonProps={{ style: canEscape ? undefined : { display: "none" } }}
       onCancel={onClose} onOk={save}
       okButtonProps={{ disabled: !name.trim(), loading: busy }}>
       <Typography.Paragraph type="secondary" style={{ fontSize: 13, marginBottom: 12 }}>
-        团队协作时任务会记录触发者，同事能看到「谁在跑什么」、报告按人区分。
-        成员数默认最多5人，可在设置页管理。
+        {shared
+          ? "团队协作时任务会记录触发者，同事能看到「谁在跑什么」、报告按人区分。成员数默认最多5人，可在设置页管理。"
+          : "单人模式可不设置名字——任务会记为「本机」。要和同事共用并按人区分，请用 mat console --share 启动。"}
       </Typography.Paragraph>
       <Input value={name} autoFocus maxLength={40} placeholder="如：张三 / Wei"
         onChange={(e) => { setName(e.target.value); setErr(null); }} onPressEnter={save} />
@@ -290,10 +328,25 @@ function OperatorPrompt({ operator, open, onClose, onSaved }: {
 
 // TaskBar：全局任务横幅（所有页面可见）——「谁 · 在哪台设备 · 跑什么 · 运行/排队第几位」。
 // 单机单人时多数时间无活动任务、横幅自动隐藏；团队场景下它就是共享主机的状态灯。
-function TaskBar() {
+// 2026-10-25 升级为**可操作**（发起人场景：任务在跑，人应该能去别的页干别的）：
+// 每条任务带「日志」（跳投屏页定位）/「实时投屏」（/live 新标签）/「取消」（优雅停）；
+// 任务从运行转为终态时全局 toast 携摘要——不用守在哪个页面等。
+function TaskBar({ onOpenJob }: { onOpenJob: (id: string) => void }) {
   const [jobs, setJobs] = useState<JobInfo[]>([]);
+  const [cancelling, setCancelling] = useState<string | null>(null);
+  const seen = useRef<Map<string, string>>(new Map());  // id → 上次 status（完成检测）
   useEffect(() => {
-    const tick = () => getJobs().then((d) => setJobs(d.jobs)).catch(() => {});
+    const tick = () => getJobs().then((d) => {
+      setJobs(d.jobs);
+      for (const j of d.jobs) {
+        const prev = seen.current.get(j.id);
+        if (prev === "running" || prev === "queued") {
+          if (j.status === "done") message.success(`「${KIND_LABEL[j.kind] || j.kind}」完成：${(j.summary || "").slice(0, 60)}`);
+          if (j.status === "error") message.error(`「${KIND_LABEL[j.kind] || j.kind}」失败：${((j.error || j.summary) || "详见日志").slice(0, 60)}`);
+        }
+        seen.current.set(j.id, j.status);
+      }
+    }).catch(() => {});
     tick();
     const t = setInterval(tick, 3000);
     return () => clearInterval(t);
@@ -305,15 +358,26 @@ function TaskBar() {
       && (x.serial ?? "") === (j.serial ?? "") && (x.platform ?? "") === (j.platform ?? ""))
       .findIndex((x) => x.id === j.id) + 1;
   const dev = (j: JobInfo) => j.serial || (j.platform === "ios" ? "iOS 模拟器" : "安卓");
+  const cancel = (id: string) => {
+    setCancelling(id);
+    cancelJob(id).catch(() => {}).finally(() => setCancelling(null));
+  };
   return (
     <Alert type="info" showIcon style={{ marginBottom: 16 }} message={
-      <Space size={16} wrap>
+      <Space size={16} wrap direction="vertical" style={{ width: "100%" }}>
         {active.map((j) => (
-          <span key={j.id}>
+          <Space key={j.id} size={8} wrap>
             <Typography.Text strong>{j.operator || "匿名"}</Typography.Text>
             {" · "}{KIND_LABEL[j.kind] || j.kind}{" · "}{dev(j)}
             {" · "}{j.status === "running" ? "运行中" : `排队第 ${queuePos(j)} 位`}
-          </span>
+            <Button type="link" size="small" style={{ padding: 0 }}
+              onClick={() => onOpenJob(j.id)}>日志</Button>
+            <a href={`/live/${j.id}`} target="_blank" rel="noreferrer"
+              style={{ fontSize: 12 }}>实时投屏</a>
+            <Button type="link" size="small" danger style={{ padding: 0 }}
+              loading={cancelling === j.id}
+              onClick={() => cancel(j.id)}>取消</Button>
+          </Space>
         ))}
       </Space>} />
   );
@@ -360,9 +424,15 @@ export default function App() {
   // 团队协作 P1：触发者身份（首次进入弹窗填写；Header 常驻显示可改）
   const [operator, setOperatorState] = useState(getOperator());
   const [opModalOpen, setOpModalOpen] = useState(false);
-  useEffect(() => {  // 无名字才弹——改名字走 Header 按钮
-    if (!getOperator()) setOpModalOpen(true);
+  // 2026-10-25 方案 B：本机单人模式（未 --share）免名——服务端自动记 operator=本机，
+  // 不再弹窗；仅共享模式（--share）要求实名。shared 一次拉取，弹窗逃生口与首次弹窗共用。
+  const [shared, setShared] = useState(false);
+  useEffect(() => {
+    getSeats().then((s: { shared?: boolean }) => setShared(!!s.shared)).catch(() => { /* 查不到按单人处理 */ });
   }, []);
+  useEffect(() => {  // 无名字才弹——改名字走 Header 按钮
+    if (!getOperator() && shared) setOpModalOpen(true);
+  }, [shared]);
 
   // 新版本检查（发起人 2026-10-14）：后端服务启动时查过一次 PyPI（失败 latest=null），
   // 前端只读结果；has_update ⇒ 左上角版本旁亮「新」badge，点击弹窗给对应渠道升级命令
@@ -434,20 +504,29 @@ export default function App() {
               {/* nowrap（发起人 2026-10-12）：加了套餐标签后侧栏宽度吃紧，标题不许换行 */}
               <span style={{ fontWeight: 700, fontSize: 15, lineHeight: "20px",
                 whiteSpace: "nowrap" }}>MAT 控制台</span>
-              {/* 套餐标签（发起人 2026-10-12：free/pro 改叫 体验版/标准版，logo 后常驻）——
-                  口径与设置页一致：gen_limit != null ⇒ 体验版（额度受限），
-                  null ⇒ 标准版（AI 生成不限额度；视觉兜底两档均有月上限） */}
-              {state && (
-                <Tooltip title={state.usage.gen_limit != null
-                  ? "体验版：AI 生成/视觉兜底有额度上限，功能与标准版完全一致"
-                  : "标准版：AI 生成不限额度，视觉兜底 300 次/月"}>
-                  <Tag color={state.usage.gen_limit != null ? "default" : "gold"}
-                    style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: "16px",
-                      paddingInline: 5, paddingBlock: 0, borderRadius: 4, flexShrink: 0 }}>
-                    {state.usage.gen_limit != null ? "体验版" : "标准版"}
-                  </Tag>
-                </Tooltip>
-              )}
+              {/* AI 接入标签（2026-10-24：此前把「模式」和「AI 接入」混成一维，
+                  误导出「标准模式只能自带 API Key」的观感）——
+                  使用方式（体验/标准/团队）由授权与 --share 决定，AI 接入选代理还是自带 API Key
+                  是另一维：标准模式走代理、也没问题。 */}
+              {state && (() => {
+                // 左上角徽标 = **当前的模式名称**（2026-10-25 用户要求）：使用方式档位
+                // （体验/标准/团队，只由授权决定，与 __main__._usage_mode_label 同映射）；
+                // AI 接入（官方代理/自带 Key）是另一维，挪进 Tooltip 保留——额度行为不同。
+                const plan = (state.license?.plan || "free").toLowerCase();
+                const mode = plan === "free" ? "体验模式"
+                  : (plan === "team" || plan === "private") ? "团队模式" : "标准模式";
+                return (
+                  <Tooltip title={`${mode} · AI 接入：${state.ai_mode === "server"
+                    ? "官方代理（有月度上限）"
+                    : "自带 API Key（本站不设上限，请求直连你选的服务商）"}`}>
+                    <Tag color={state.ai_mode === "server" ? "default" : "gold"}
+                      style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: "16px",
+                        paddingInline: 5, paddingBlock: 0, borderRadius: 4, flexShrink: 0 }}>
+                      {mode}
+                    </Tag>
+                  </Tooltip>
+                );
+              })()}
             </div>
             {/* 版本号（发起人 2026-10-14：左上角常驻）——副标题行宽度只有 ~130px，
                 「移动 AI 测试」与品牌语义重复让位给版本号；有新版时亮「新」badge 点击弹窗 */}
@@ -528,7 +607,7 @@ export default function App() {
           // 页面底部出现整块白区（发起人 2026-10-12）；contain 禁掉本容器的边界回弹，
           // 表格等内部滚动容器到边界后仍正常链到本容器，页面滚动不受影响
           overscrollBehavior: "contain" }}>
-          <TaskBar />
+          <TaskBar onOpenJob={onLaunched} />
           {err && !state && <Alert type="error" message={`后端连接失败:${err}`} style={{ marginBottom: 16 }} />}
           {!state && !err && <Card loading style={{ minHeight: 300 }} />}
           {view === "overview" && state && <Overview state={state} onNav={navigate} />}
@@ -538,7 +617,7 @@ export default function App() {
           {view === "generate" && state && <Generate state={state} onCasesChanged={() => getState().then(setState)} />}
           {view === "runs" && state && <Runs state={state} onLaunched={onLaunched} />}
           {view === "screens" && state && <Screens state={state} focusJob={focusJob} />}
-          {view === "reports" && state && <Reports state={state} />}
+          {view === "reports" && state && <Reports state={state} onLaunched={onLaunched} />}
           {view === "heals" && state && <Heals state={state} />}
           {view === "review" && state && <Review state={state} />}
           {view === "settings" && state && <Settings state={state}
@@ -547,7 +626,7 @@ export default function App() {
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)}
             state={state} onNav={navigate} />
           <AuthGate />
-          <OperatorPrompt operator={operator} open={opModalOpen}
+          <OperatorPrompt operator={operator} open={opModalOpen} shared={shared}
             onClose={() => setOpModalOpen(false)} onSaved={(n) => setOperatorState(n)} />
           {/* 升级引导弹窗：运行中的进程无法可靠替换自己（pipx/uv/pip 各有安装位置），
               给对应渠道的升级命令由用户执行，升级后重启控制台生效（发起人 2026-10-14） */}

@@ -8,26 +8,27 @@
 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
-AI 驱动的移动端 UI 自动化测试工具（Android 真机为主支持，iOS 模拟器预览）：自然语言生成用例，混合定位 + 失败自愈，每一步留下可追溯证据（截图 / 控件树 / logcat / 失败分类）。执行全程在本机，离线可用；用例是结构化 DSL——回归回放零 token，AI 只在生成与自愈时调用。
+AI 驱动的移动端 UI 自动化测试工具（Android 真机为主支持，iOS 模拟器 + 真机 beta）：自然语言生成用例，混合定位 + 失败自愈，每一步留下可追溯证据（截图 / 控件树 / logcat / 失败分类）。执行全程在本机，离线可用；用例是结构化 DSL——回归回放零 token，AI 只在生成与自愈时调用。
 
 官网 [mobileaitest.com](https://mobileaitest.com)
 
 ## 安装与上手
 
-按平台选一条（**Windows：pip 直装；macOS / Linux：pipx 隔离安装**）：
+按平台选一条（**macOS / Linux：uv 安装，推荐；Windows：pip 直装**）：
 
 ```bash
-# Windows
-py -m pip install --user mat-uitest
-
-# macOS / Linux（没有 pipx 的话先 brew install pipx / sudo apt install pipx）
-pipx install mat-uitest && pipx ensurepath
-# 不想装 brew？用 uv（Linux 上尤其推荐：不需要 root，也不需要先装 Homebrew）
+# macOS / Linux（推荐：uv 自动解决 Python 3.11+，不需要预装）
 curl -LsSf https://astral.sh/uv/install.sh | sh   # 已有 uv 就跳过这行
 uv tool install mat-uitest
 uv tool update-shell                              # 把 ~/.local/bin 加进 PATH，重开终端后 mat 才能直接用
 
-# 任何平台、不想装 pipx —— venv + pip
+# Windows（推荐：py 启动器随 Python 安装包附带）
+py -m pip install --user mat-uitest
+
+# 已装 pipx（等价备选；内网下载 uv 托管 Python 受限时用这条）
+pipx install mat-uitest && pipx ensurepath        # 没有 pipx：brew install pipx（macOS）/ sudo apt install pipx（Ubuntu·Debian）
+
+# 任何平台、不想装 uv / pipx —— venv + pip
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install mat-uitest
 ```
@@ -38,15 +39,30 @@ mat doctor                            # 环境自检：Python / adb / 设备 / A
 mat run cases/example-settings.json   # 跑通第一条用例
 ```
 
-要求：Python 3.11+、`adb`、一台开启 USB 调试的 Android 真机或模拟器（Android 真机与模拟器为主支持；iOS 见下）。命令找不到时：**macOS / Linux**（pipx 装）跑一次 `pipx ensurepath` 并重开终端；**Windows**（pip 直装）脚本目录 `%APPDATA%\Python\Python3x\Scripts` 可能不在 PATH，加入后重开终端。任何装法都可用等价写法 `python -m insta_engine`（Windows `py -m insta_engine`）。
+要求：Python 3.11+（uv 安装会自动带上）、`adb`、一台开启 USB 调试的 Android 真机或模拟器（Android 真机与模拟器为主支持；iOS 见下）。命令找不到时：uv 装的跑一次 `uv tool update-shell`、pipx 装的跑一次 `pipx ensurepath`，然后重开终端；**Windows**（pip 直装）脚本目录 `%APPDATA%\Python\Python3x\Scripts` 可能不在 PATH，加入后重开终端。任何装法都可用等价写法 `python -m insta_engine`（Windows `py -m insta_engine`）。
 
-> **iOS（模拟器预览）**：`mat run --platform ios`——需装 `mat-uitest[ios]` extra 且 WDA 跑在 `localhost:8100`。**真机未支持**，`index` / `explore` / `arrival` 在 iOS 上会明确拦截。
+> **iOS**：装 `mat-uitest[ios]` extra。模拟器：`mat run --platform ios`（WDA 跑在 `localhost:8100`）。
+> 真机（beta）：USB 连接后先 `mat ios-setup` 逐项体检（首次需一次性准备：Xcode 登录账号、
+> 设备信任证书、在 Xcode 里 ⌘U 一次），然后 `mat run --platform ios --serial <udid>`。
+> 真机限制：仅 USB、须保持解锁且自动锁定设为「永不」、免费证书 7 天过期、不支持录屏；
+> `index` / `explore` / `arrival` 在 iOS 上明确拦截。
 
 ### 接入 AI
 
 本地执行、控件层自愈与探索无需任何配置；`gen` / `describe` / `diagnose` 等生成类命令需在工作区 `.env` 配置二者其一。
 
-**方式一：官方代理**
+**方式一：自带 API Key（推荐——数据不经我们）**
+
+```bash
+GEN_BASE_URL=<你的 OpenAI 兼容端点>
+GEN_API_KEY=<你的 Key>
+GEN_MODEL=<语言模型名>
+GEN_VL_MODEL=<视觉模型名>   # 可选：视觉兜底，不配则关闭
+```
+
+prompt 在你本机拼装（`GEN_PROMPT_MODE` 默认 `local`），请求直连你的端点：控件文本与截图**不经过 MAT 服务器**。模型可自选（DashScope / 智谱 / DeepSeek / OpenAI / 企业内网网关）。
+
+**方式二：官方代理（零配置试用）**
 
 ```bash
 GEN_BASE_URL=https://mobileaitest.com
@@ -54,16 +70,25 @@ GEN_API_KEY=<你的 token>
 GEN_PROMPT_MODE=server
 ```
 
-**方式二：自带 Key（OpenAI 兼容端点）**
+装完不配 API Key 也能先看效果（体验模式 60 次/月）。此模式下由服务端组装 prompt 并转发给模型厂商：**控件文本会经我们转出，开启视觉兜底时截图也会转出**；我们不做内容留存、不用于训练。
 
-```bash
-GEN_BASE_URL=<你的 OpenAI 兼容端点>
-GEN_API_KEY=<你的 Key>
-GEN_MODEL=<语言模型名>
-GEN_VL_MODEL=<视觉模型名>
-```
+> 数据流向是两条路最大的区别：要「内容不出本机」，用方式一；只有方式二会把请求交给我们中转。代理的 prompt 档与本地档同源（gen v1.2），差异只在是否需要自己配 API Key。
 
-AI 命令只发送页面控件文本，不含截图。`GEN_MODEL` 是生成类命令（gen / describe / diagnose 等）的**主模型，必需**；`GEN_VL_MODEL` 仅用于视觉兜底（发送截图，默认关闭、需显式开启）——只配 VL 不能替代主模型。`mat export` 可一键导出全部本地数据。
+`GEN_MODEL` 是生成类命令（gen / describe / diagnose 等）的**主模型，必需**；`GEN_VL_MODEL` 仅用于视觉兜底（发送截图，默认关闭、需显式开启）——只配 VL 不能替代主模型。`mat export` 可一键导出全部本地数据。
+
+## 使用方式与获取
+
+本地执行、回放、自愈、证据报告、多人协作**全程免费、不限量**；只有官方 AI 代理这条通道计数。
+
+⚠️ **使用方式**（体验 / 标准 / 团队）与 **AI 接入**（官方代理 / 自带 API Key）是两个独立维度：三种方式都可以自带 API Key，自带 API Key 时本站不设上限；差别只在官方代理的月度额度。
+
+| 方式 | 官方代理额度 | 自带 API Key | 适合 |
+| --- | --- | --- | --- |
+| **体验模式**（装完即用） | 生成 60 / 视觉 20 次每月 | 不设上限 | 第一次装、先看效果 |
+| **标准模式**（激活后） | 生成 2,000 / 视觉 300 次每月 · 公众号 / 邮件人工回复（工作日 48 小时内） | 不设上限 | 每天都在跑、要更高额度 |
+| **团队模式**（`mat console --share`） | 同标准模式 | 不设上限 | 2–5 人共用一套控制台；成员名额只在这种模式下出现 |
+
+标准模式的激活码：关注公众号「Mobile AI Test」参加用户调研获赠，或留言申请。完整对照见 [使用方式](https://mobileaitest.com/plans.html)。
 
 ## 常用命令
 
@@ -89,10 +114,10 @@ AI 命令只发送页面控件文本，不含截图。`GEN_MODEL` 是生成类�
 
 ## AI 编程助手接入
 
-- **skill**（教助手何时跑用例、何时探索、怎么读结果）：`mat skill install` —— 把随包的 `mobileapp-testing` 装进 AI 助手的 skill 目录（默认 `~/.claude/skills/`；WorkBuddy 用 `--target workbuddy`，其他助手用 `--dir <目录>`）；`mat skill path` 打印包内位置供手动复制。装完开新会话才会加载
+- **skill**（教助手何时跑用例、何时探索、怎么读结果）：`mat skill install` —— 把随包的 `mobileapp-testing` 装进 AI 助手的 skill 目录（默认 `~/.claude/skills/`；WorkBuddy 用 `--target workbuddy`，其他助手用 `--dir <目录>`）；`mat skill path` 打印包内位置供手动复制。装完开新会话才会加载。助手不能执行终端命令时，从 [mat-skill](https://github.com/vlmpilot/mat-skill) 取 `mobileapp-testing/` 目录直接导入（手动拷贝的副本不会自动更新）
 - **MCP**（让 Cursor / Codex / WorkBuddy 等直接驱动 `mat`）：装带 `[mcp]` extra 的包，再把 `mat mcp` 配进助手的 MCP 配置
   - Windows：`py -m pip install --user "mat-uitest[mcp]"`
-  - macOS / Linux：`pipx install 'mat-uitest[mcp]'`
+  - macOS / Linux：`uv tool install 'mat-uitest[mcp]'`（已装过普通版再跑这条即可带上 MCP 依赖；pipx 用户等价写法 `pipx install 'mat-uitest[mcp]'`）
   - 配置片段（Cursor / CodeBuddy / Trae 通用）：`{"mcpServers": {"mat": {"type": "stdio", "command": "mat", "args": ["mcp"]}}}`；先手动跑一次 `mat mcp`，看到 `MAT MCP 就绪` 再填进 IDE
 
 ## 开发

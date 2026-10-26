@@ -4,9 +4,9 @@ import {
 import {
   DeleteOutlined, DownOutlined, PlusOutlined, ThunderboltOutlined, UpOutlined,
 } from "@ant-design/icons";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  deleteCase, deleteSuite, getAppLabels, getCase, getSuite, getSuites, runCase, saveSuite,
+  deleteCase, deleteSuite, getAppLabels, getCase, getSuite, getSuites, renameCase, runCase, saveSuite,
   StateResp, SuiteInfo,
 } from "../api";
 import { Nav } from "../components/CommandPalette";
@@ -42,22 +42,28 @@ function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial
   // 行为完全确定——所有元素垂直中心线一致。
   // ⚠️ 不能带 marginBottom：作为外层筛选栏 flex 的子项，margin 会参与居中计算，
   // 整条运行参数比同行其他元素中心偏移 6px（实测 top 243 vs 249，2026-10-12）
+  // iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 不提供 iOS 运行平台选项
+  const iosSupported = state.ios_supported !== false;
   return (
     <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-      <Tooltip title="iOS 模拟器由 WDA 自动连接（localhost:8100）——平台选择即设备选择">
+      <Tooltip title={iosSupported
+        ? "iOS：真机需在右侧选设备（USB 连接，serial=udid）；留空走模拟器（WDA 常驻 localhost:8100）"
+        : "运行平台：仅 Android（iOS 需要 macOS + Xcode）"}>
         <Select style={{ width: 120 }} value={runPlatform}
-          onChange={(v) => setRunPlatform(v)}
-          options={[{ value: "android", label: "Android" }, { value: "ios", label: "iOS" }]} />
+          onChange={(v) => { setRunPlatform(v); setRunSerial(null); }}
+          options={[{ value: "android", label: "Android" },
+                    ...(iosSupported ? [{ value: "ios", label: "iOS" }] : [])]} />
       </Tooltip>
       <Tooltip title={runPlatform === "ios"
-        ? "iOS 模拟器由 WDA 自动连接（localhost:8100），无需选择设备"
+        ? "选 USB 真机；留空 = 模拟器（WDA 常驻 localhost:8100）"
         : "留空 = 自动使用首台在线设备"}>
-        <Select placeholder={runPlatform === "ios" ? "iOS 模拟器（WDA 自动）" : "运行设备(自动)"}
+        <Select placeholder={runPlatform === "ios" ? "iOS 模拟器（留空）" : "运行设备(自动)"}
           style={{ width: 240 }} allowClear
-          value={runPlatform === "ios" ? undefined : runSerial}
-          disabled={runPlatform === "ios"}
+          value={runSerial ?? undefined}
           onChange={setRunSerial}
-          options={state.devices.filter((d) => d.state === "device")
+          options={state.devices
+            .filter((d) => d.state === "device" && (runPlatform === "ios"
+              ? d.platform === "ios" : (d.platform || "android") === "android"))
             .map((d) => ({ value: d.serial, label: `${d.model || d.serial} · ${d.serial}` }))} />
       </Tooltip>
       <Tooltip title="全程录屏；通过的自动删除、失败的保留进 artifacts/video/ 并内嵌报告（iOS 真机暂不支持）">
@@ -69,9 +75,12 @@ function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial
 
 function useRunTarget(state: StateResp, runPlatform: "android" | "ios", runSerial: string | null) {
   const online = state.devices.filter((d) => d.state === "device");
-  const runDisabled = runPlatform === "android" && online.length === 0;
-  const runTarget = runPlatform === "ios" ? "iOS 模拟器"
-    : (runSerial || (online.length ? online[0].serial : "默认设备"));
+  const androidOnline = online.filter((d) => (d.platform || "android") === "android");
+  const runDisabled = runPlatform === "android" && androidOnline.length === 0;
+  const runTarget = runSerial
+    ? (online.find((d) => d.serial === runSerial)?.model || runSerial)
+    : runPlatform === "ios" ? "iOS 模拟器"
+    : (androidOnline.length ? androidOnline[0].serial : "默认设备");
   return { runDisabled, runTarget };
 }
 
@@ -79,30 +88,23 @@ function useRunTarget(state: StateResp, runPlatform: "android" | "ios", runSeria
 
 function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesChanged,
                     runPlatform, setRunPlatform, runSerial, setRunSerial,
-                    record, setRecord, reset, setReset, focusStep }: {
+                    record, setRecord, reset, setReset, focusStep, appLabels }: {
   state: StateResp; onLaunched: (id: string) => void; openCaseName?: string;
   onOpenCase?: (name: string) => void; onNav?: (nav: Nav) => void; onCasesChanged: () => void;
   runPlatform: "android" | "ios"; setRunPlatform: (v: "android" | "ios") => void;
   runSerial: string | null; setRunSerial: (v: string | null) => void;
   record: boolean; setRecord: (v: boolean) => void;
   reset: "off" | "cold"; setReset: (v: "off" | "cold") => void;
-  focusStep?: string | null }) {
+  focusStep?: string | null; appLabels: Record<string, string> }) {
   const [filter, setFilter] = useState<string | null>(null);
   const [nameQ, setNameQ] = useState("");                 // 名称筛选（标题/文件名）
   const [selKeys, setSelKeys] = useState<string[]>([]);   // 勾选用例 → 运行/批量操作
   const [editing, setEditing] = useState<Editing | null>(null);
   const [focusStepId, setFocusStepId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [rename, setRename] = useState<{ from: string; to: string } | null>(null);
 
   const apps = Array.from(new Set(Object.values(state.caseMeta).map((m) => m.app).filter(Boolean))) as string[];
-  // App 显示名（发起人 2026-10-12：包名可读性差，分组行包名后展示 displayName）——
-  // 后端 aapt 解析 APK + 缓存（无 aapt/无设备回空，前端回落包名，绝不阻塞列表）
-  const [appLabels, setAppLabels] = useState<Record<string, string>>({});
-  const appKey = apps.join(",");
-  useEffect(() => {
-    if (!appKey) return;
-    getAppLabels(appKey.split(",")).then((d) => setAppLabels(d.labels)).catch(() => {});
-  }, [appKey]);
   const rows = state.cases.map((name) => ({
     name, app: state.caseMeta[name]?.app || "",
     title: state.caseMeta[name]?.title || "",
@@ -135,7 +137,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
   // 工作区里没有该文件 → 剥掉前缀再试（编辑器深链发起人 2026-10-12 P1）
   const resolveCaseName = (raw: string): string | null => {
     if (state.cases.includes(raw)) return raw;
-    const stripped = raw.replace(^\d{2}_/, "");
+    const stripped = raw.replace(/^\d{2}_/, "");
     return state.cases.includes(stripped) ? stripped : null;
   };
 
@@ -163,7 +165,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
       const obj = { ...(content as Record<string, unknown>) };
       obj.caseId = `${String(obj.caseId || "case")}_copy`;
       obj.name = `${String(obj.name || "")}（副本）`;
-      setEditing({ name: name.replace(\.json$/, "") + "-copy.json",
+      setEditing({ name: name.replace(/\.json$/, "") + "-copy.json",
         content: JSON.stringify(obj, null, 2), isNew: true });
     } catch (e) { message.error(String(e)); }
   };
@@ -182,9 +184,10 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
   // 组成内存临时套件串行执行（与套件同链路，聚合报告按批次归组）
   const runSelected = async () => {
     if (!selNames.length) return;
-    // iOS 走 WDA 常驻服务（localhost:8100），serial 必须为空——平台选择即设备选择
-    const serial = runPlatform === "ios" ? null
-      : runSerial || state.devices.find((d) => d.state === "device")?.serial || null;
+    // iOS：选了 USB 真机就传 udid（WDA 走 usbmux）；留空 = 模拟器（localhost:8100）
+    const serial = runSerial || (runPlatform === "ios" ? null
+      : state.devices.find((d) => d.state === "device"
+          && (d.platform || "android") === "android")?.serial || null);
     setRunning(true);
     try {
       const { job_id } = await runCase({ cases: selNames, serial, platform: runPlatform, record, reset });
@@ -198,7 +201,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
     let ok = 0; const errs: string[] = [];
     for (const n of selNames) {
       try { await deleteCase({ name: n }); ok++; }
-      catch (e) { errs.push(`${n}：${String(e).replace(^Error:\s*/, "")}`); }
+      catch (e) { errs.push(`${n}：${String(e).replace(/^Error:\s*/, "")}`); }
     }
     if (ok) { message.success(`已删除 ${ok} 条用例`); setSelKeys([]); onCasesChanged(); }
     if (errs.length) {
@@ -258,7 +261,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
             <Button onClick={newCase}>手动新建</Button>
           </Space>
         </Empty></Card>
-      ) : (
+      ) : (<>
         <Table size="small" rowKey="key" dataSource={grouped} defaultExpandAllRows
           expandable={{ expandIcon: () => <span /> }}
           // 分组行只是组织维度，不应可选（发起人 2026-10-12）：禁用组行 checkbox，
@@ -294,7 +297,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
                         </a>
                       </Tooltip>
                     </Space> },
-            { title: "操作", width: 150, align: "right",
+            { title: "操作", width: 200, align: "right",
               render: (_: unknown, r: { isGroup?: boolean; name?: string }) =>
                 r.isGroup ? null : (
                   <Space>
@@ -302,9 +305,34 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
                     <Tooltip title="复制一份用例再改（克隆不改动原用例）">
                       <Button size="small" onClick={() => cloneCase(r.name!)}>复制</Button>
                     </Tooltip>
+                    {/* 重命名（2026-10-25，目录功能的轻量替代）：整理无语义的生成文件名；
+                        套件引用由后端同步替换，编号视为新用例（caseMeta 既有语义） */}
+                    <Button size="small" onClick={() => setRename({ from: r.name!, to: "" })}>改名</Button>
                   </Space>) },
           ]} />
-      )}
+      <Modal title={`重命名 ${rename?.from || ""}`} open={!!rename}
+        onCancel={() => setRename(null)} okText="重命名" cancelText="取消"
+        onOk={async () => {
+          if (!rename) return;
+          const to = rename.to.trim();
+          if (!to || to === rename.from) { setRename(null); return; }
+          const finalTo = to.endsWith(".json") ? to : `${to}.json`;
+          try {
+            const r2 = await renameCase({ from: rename.from, to: finalTo });
+            message.success(`已重命名为 ${r2.file}`
+              + (r2.suites_updated.length ? `（${r2.suites_updated.length} 个套件引用已同步）` : ""));
+            setRename(null);
+            onCasesChanged();
+          } catch (e) { message.error(String(e)); }
+        }}>
+        <Input addonBefore="新文件名" placeholder="如 search-bt.json（可省略 .json）"
+          value={rename?.to} autoFocus
+          onChange={(e) => rename && setRename({ ...rename, to: e.target.value })} />
+        <div style={{ color: "#8a919f", fontSize: 12, marginTop: 8 }}>
+          只改文件名,用例内容不动;套件里对它的引用会自动更新;历史报告不受影响。
+        </div>
+      </Modal>
+      </>)}
       <CaseEditor state={state} editing={editing} setEditing={setEditing}
         onSaved={onCasesChanged} focusStep={focusStepId || focusStep} />
     </>
@@ -316,12 +344,13 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
 type SuiteEditing = { file: string | null; title: string; cases: string[] };
 
 function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, setRunSerial,
-                     record, setRecord, reset, setReset }: {
+                     record, setRecord, reset, setReset, appLabels }: {
   state: StateResp; onLaunched: (id: string) => void;
   runPlatform: "android" | "ios"; setRunPlatform: (v: "android" | "ios") => void;
   runSerial: string | null; setRunSerial: (v: string | null) => void;
   record: boolean; setRecord: (v: boolean) => void;
-  reset: "off" | "cold"; setReset: (v: "off" | "cold") => void }) {
+  reset: "off" | "cold"; setReset: (v: "off" | "cold") => void;
+  appLabels: Record<string, string> }) {
   const [suites, setSuites] = useState<SuiteInfo[] | null>(null);
   const [editing, setEditing] = useState<SuiteEditing | null>(null);
   const [q, setQ] = useState("");                     // 名称筛选（标题/文件名）
@@ -343,9 +372,10 @@ function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, 
   // 运行选中套件：逐个起 job，同设备由设备锁自动串行排队；聚合报告按套件批次归组
   const runSelected = async () => {
     if (!selFiles.length) return;
-    // iOS 走 WDA 常驻服务，serial 必须为空；Android 用下拉所选设备，未选则回落首台在线设备
-    const serial = runPlatform === "ios" ? null
-      : runSerial || state.devices.find((d) => d.state === "device")?.serial || null;
+    // iOS：选了 USB 真机就传 udid；留空 = 模拟器。Android 未选则回落首台在线设备
+    const serial = runSerial || (runPlatform === "ios" ? null
+      : state.devices.find((d) => d.state === "device"
+          && (d.platform || "android") === "android")?.serial || null);
     setRunning(true);
     try {
       let first = "";
@@ -361,7 +391,7 @@ function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, 
     let ok = 0; const errs: string[] = [];
     for (const f of selFiles) {
       try { await deleteSuite({ file: f }); ok++; }
-      catch (e) { errs.push(`${f}：${String(e).replace(^Error:\s*/, "")}`); }
+      catch (e) { errs.push(`${f}：${String(e).replace(/^Error:\s*/, "")}`); }
     }
     if (ok) { message.success(`已删除 ${ok} 个套件（用例文件不受影响）`); setSelKeys([]); }
     if (errs.length) {
@@ -441,7 +471,7 @@ function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, 
                 }}>编辑</Button>) },
           ]} />
       )}
-      <SuiteEditorModal state={state} editing={editing} setEditing={setEditing}
+      <SuiteEditorModal state={state} appLabels={appLabels} editing={editing} setEditing={setEditing}
         onSaved={() => load()} />
     </>
   );
@@ -449,11 +479,36 @@ function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, 
 
 // ---------- 套件编辑器（两栏：可选用例 → 已选有序列表） ----------
 
-function SuiteEditorModal({ state, editing, setEditing, onSaved }: {
-  state: StateResp; editing: SuiteEditing | null;
+function SuiteEditorModal({ state, appLabels, editing, setEditing, onSaved }: {
+  state: StateResp; appLabels: Record<string, string>; editing: SuiteEditing | null;
   setEditing: (e: SuiteEditing | null) => void; onSaved: () => void }) {
   const [busy, setBusy] = useState(false);
+  // 可选用例筛选（2026-10-25）：用例多了之后凭文件名找不到目标——文字按标题/编号/文件名，
+  // 包名下拉按被测 App 过滤（多 App 工作区里先把范围收到一个包再挑用例）
+  const [q, setQ] = useState("");
+  const [appFilter, setAppFilter] = useState<string | null>(null);
   const available = state.cases.filter((c) => !(editing?.cases || []).includes(c));
+  const needle = q.trim().toLowerCase();
+  const matches = (c: string) => {
+    const m = state.caseMeta[c];
+    if (appFilter && (m?.app || "") !== appFilter) return false;
+    if (!needle) return true;
+    return c.toLowerCase().includes(needle)
+      || (m?.title || "").toLowerCase().includes(needle)
+      || (m?.no != null && String(m.no) === needle.replace("#", ""));
+  };
+  const shownAvailable = available.filter(matches);
+  const appOptions = useMemo(() => {
+    const apps = Array.from(new Set(state.cases
+      .map((c) => state.caseMeta[c]?.app).filter(Boolean))) as string[];
+    return apps.map((a) => ({ value: a, label: appLabels[a] ? `${appLabels[a]}（${a}）` : a }));
+  }, [state.cases, state.caseMeta, appLabels]);
+  // 显示口径与用例 Tab 对齐：#编号 + 用例标题（文件名降级进 Tooltip——
+  // 套件引用与报告目录以文件名为准，但用户认的是标题）
+  const caseLabel = (c: string) => {
+    const m = state.caseMeta[c];
+    return { no: m?.no ?? "—", title: m?.title || c, file: c };
+  };
 
   const move = (idx: number, delta: number) => {
     if (!editing) return;
@@ -486,33 +541,63 @@ function SuiteEditorModal({ state, editing, setEditing, onSaved }: {
           <Input addonBefore="套件标题" style={{ marginBottom: 12 }}
             value={editing.title} onChange={(e) => setEditing({ ...editing, title: e.target.value })} />
           <div style={{ display: "flex", gap: 12 }}>
-            <Card size="small" title="可选用例" style={{ flex: 1 }}>
-              <Space direction="vertical" size={4} style={{ width: "100%" }}>
-                {available.map((c) => (
-                  <Button key={c} block size="small" style={{ justifyContent: "flex-start", display: "flex" }}
-                    onClick={() => setEditing({ ...editing, cases: [...editing.cases, c] })}>
-                    + {c}
-                  </Button>))}
-                {available.length === 0 && <span style={{ color: "#999", fontSize: 12 }}>（全部已选）</span>}
+            {/* 筛选行独立于 Card extra（2026-10-25 用户反馈「可...」）：extra 与标题挤在
+                一行,小宽度下 antd 会把 Card 标题省略成「可...」——把控件挪到左栏自己的
+                行,视觉归属清晰（只作用于可选用例）且标题不再被挤 */}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <Space size={4} style={{ marginBottom: 6, width: "100%" }}>
+                <Select allowClear showSearch size="small" placeholder="按包筛选" style={{ minWidth: 120 }}
+                  value={appFilter} onChange={setAppFilter} options={appOptions}
+                  filterOption={(input, opt) => String(opt?.label ?? "").toLowerCase().includes(input.toLowerCase())} />
+                <Input allowClear size="small" placeholder="标题/编号/文件名" style={{ flex: 1 }}
+                  value={q} onChange={(e) => setQ(e.target.value)} />
               </Space>
-            </Card>
+              <Card size="small" title="可选用例" style={{ flex: 1 }}>
+              <Space direction="vertical" size={4} style={{ width: "100%", maxHeight: 420, overflow: "auto" }}>
+                {shownAvailable.map((c) => {
+                  const l = caseLabel(c);
+                  return (
+                    <Tooltip key={c} title={`文件：${l.file}`}>
+                      <Button block size="small" style={{ justifyContent: "flex-start", display: "flex" }}
+                        onClick={() => setEditing({ ...editing, cases: [...editing.cases, c] })}>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          <span style={{ color: "#8a919f", fontVariantNumeric: "tabular-nums" }}>#{l.no}</span>
+                          {" "}{l.title}
+                        </span>
+                      </Button>
+                    </Tooltip>
+                  );
+                })}
+                {available.length === 0 && <span style={{ color: "#999", fontSize: 12 }}>（全部已选）</span>}
+                {available.length > 0 && shownAvailable.length === 0
+                  && <span style={{ color: "#999", fontSize: 12 }}>（无匹配——换个关键词，或清空筛选）</span>}
+              </Space>
+              </Card>
+            </div>
             <Card size="small" title={`已选（${editing.cases.length}）`} style={{ flex: 1 }}>
               {editing.cases.length === 0 && <span style={{ color: "#999", fontSize: 12 }}>从左侧添加用例</span>}
-              {editing.cases.map((c, idx) => (
-                <div key={c} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
-                  <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {idx + 1}. {c}
-                  </span>
-                  <Button size="small" type="text" disabled={idx === 0}
-                    onClick={() => move(idx, -1)}><UpOutlined /></Button>
-                  <Button size="small" type="text" disabled={idx === editing.cases.length - 1}
-                    onClick={() => move(idx, 1)}><DownOutlined /></Button>
-                  <Button size="small" type="text" danger
-                    onClick={() => setEditing({ ...editing, cases: editing.cases.filter((x) => x !== c) })}>
-                    <DeleteOutlined />
-                  </Button>
-                </div>
-              ))}
+              <div style={{ maxHeight: 420, overflow: "auto" }}>
+                {editing.cases.map((c, idx) => {
+                  const l = caseLabel(c);
+                  return (
+                    <div key={c} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+                      <Tooltip title={`文件：${l.file}`}>
+                        <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {idx + 1}. <span style={{ color: "#8a919f" }}>#{l.no}</span> {l.title}
+                        </span>
+                      </Tooltip>
+                      <Button size="small" type="text" disabled={idx === 0}
+                        onClick={() => move(idx, -1)}><UpOutlined /></Button>
+                      <Button size="small" type="text" disabled={idx === editing.cases.length - 1}
+                        onClick={() => move(idx, 1)}><DownOutlined /></Button>
+                      <Button size="small" type="text" danger
+                        onClick={() => setEditing({ ...editing, cases: editing.cases.filter((x) => x !== c) })}>
+                        <DeleteOutlined />
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
             </Card>
           </div>
           <div style={{ marginTop: 12, color: "#8a919f", fontSize: 12 }}>
@@ -534,6 +619,16 @@ export default function Cases({ state, onLaunched, openCaseName, onOpenCase, onN
   const [runSerial, setRunSerial] = useState<string | null>(null);
   const [record, setRecord] = useState(true); // 全程录 + 只留失败（发起人拍板）
   const [reset, setReset] = useState<"off" | "cold">("cold"); // 批量默认冷启动重置（跨用例状态隔离）
+  // App 显示名（发起人 2026-10-12：包名可读性差）——提升到页级（2026-10-25：套件编辑器
+  // 的包名筛选也要用，此前只在用例 Tab 内部拉取，两个 Tab 各拉一遍既重复又传不下去）。
+  // 后端 aapt 解析 APK + 缓存（无 aapt/无设备回空，前端回落包名，绝不阻塞列表）。
+  const [appLabels, setAppLabels] = useState<Record<string, string>>({});
+  const appKey = useMemo(() => Array.from(new Set(Object.values(state.caseMeta)
+    .map((m) => m.app).filter(Boolean))).join(","), [state.caseMeta]);
+  useEffect(() => {
+    if (!appKey) return;
+    getAppLabels(appKey.split(",")).then((d) => setAppLabels(d.labels)).catch(() => {});
+  }, [appKey]);
 
   return (
     <>
@@ -545,7 +640,7 @@ export default function Cases({ state, onLaunched, openCaseName, onOpenCase, onN
               onOpenCase={onOpenCase} onNav={onNav} onCasesChanged={onCasesChanged}
               runPlatform={runPlatform} setRunPlatform={setRunPlatform}
               runSerial={runSerial} setRunSerial={setRunSerial}
-              record={record} setRecord={setRecord}
+              record={record} setRecord={setRecord} appLabels={appLabels}
               reset={reset} setReset={setReset}
               focusStep={focusStep} /> },
           { key: "suites", label: "套件",
@@ -553,7 +648,7 @@ export default function Cases({ state, onLaunched, openCaseName, onOpenCase, onN
               runPlatform={runPlatform} setRunPlatform={setRunPlatform}
               runSerial={runSerial} setRunSerial={setRunSerial}
               record={record} setRecord={setRecord}
-              reset={reset} setReset={setReset} /> },
+              reset={reset} setReset={setReset} appLabels={appLabels} /> },
         ]} />
       </Card>
     </>

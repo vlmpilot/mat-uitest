@@ -17,18 +17,28 @@ import hmac
 import json
 import os
 import threading
+import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .device import list_adb_devices  # noqa: F401 —— tests 经 web_server.list_adb_devices 引用
-from .web_api.apps import api_app_labels, api_app_probe, api_apps_install, api_apps_uninstall
+from .web_api.apps import (
+    api_app_labels,
+    api_app_note_get,
+    api_app_note_put,
+    api_app_probe,
+    api_apps_install,
+    api_apps_installed,
+    api_apps_uninstall,
+)
 from .web_api.audit import api_audit
 from .web_api.calibrate import api_calibrate_apply, api_calibrate_data, api_explore_calibrate
 from .web_api.cases import (
     api_case_delete,
     api_case_get,
+    api_case_rename,
     api_case_save,
     api_controls,
     api_import_convert,
@@ -56,13 +66,16 @@ from .web_api.heals import api_heal_apply, api_heal_list
 from .web_api.indexing import api_index
 from .web_api.invite import api_invite_action, api_invite_status
 from .web_api.jobs import api_job_cancel, api_job_events, api_job_view, api_jobs_list
+from .web_api.live import render_live
 from .web_api.polish import api_polish
 from .web_api.prompts import (
     api_prompts,
     api_prompts_content,
     api_prompts_save,
     api_prompts_select,
+    api_prompts_upgrade,
 )
+from .web_api.readiness import api_readiness
 from .web_api.review import api_review_list, api_review_save
 from .web_api.runs import api_explore, api_gen, api_run
 from .web_api.runtime import (  # noqa: F401
@@ -132,7 +145,16 @@ _DRAIN_LIMIT = 16_000_000
 
 
 class ConsoleHandler(BaseHTTPRequestHandler):
-    #: 工作区根：优先 server 实例的 ws_root（api/workspace/switch 在线切换），
+    # /api/auth 爆破防护（2026-10-20 评审 P1-4）：按来源 IP 滑动窗口计失败次数，
+    # 超限进入冷却；成功清零。口令是「跑用例/删改用例/烧额度」的全权钥匙，
+    # 此前无计数、无冷却、失败不落审计——内网纯脚本爆破零成本。
+    _AUTH_FAILS: dict[str, list[float]] = {}  # ip -> 窗口内失败时间戳（monotonic）
+    _AUTH_FAIL_LOCK = threading.Lock()
+    _AUTH_WINDOW_S = 300.0    # 滑动窗口
+    _AUTH_MAX_FAILS = 5       # 窗口内失败上限
+    _AUTH_COOLDOWN_S = 30.0   # 超限后冷却时长
+
+    #: 工作区根：优先 server 实例的 ws_root（/api/workspace/switch 在线切换），
     #: 回退 make_server 绑定的类属性。V2 之前是固定类属性——切换要重启进程。
     @property
     def root(self) -> Path:
@@ -168,11 +190,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 (self.query.get("platform") or ["android"])[0]),
             "/api/doctor": lambda: api_doctor((self.query.get("platform") or ["all"])[0], self.root),
             "/api/ios/simulators": lambda: api_ios_simulators(),
+            "/api/readiness": lambda: api_readiness(
+                self.root, (self.query.get("package") or [""])[0]),
             "/api/review": lambda: api_review_list(self.root, (self.query.get("package") or [""])[0]),
             "/api/controls": lambda: api_controls(self.root, (self.query.get("package") or [""])[0]),
             "/api/app/labels": lambda: api_app_labels(
                 self.root, (self.query.get("packages") or [""])[0]),
-            "/api/app/probe": lambda: api_app_probe((self.query.get("path") or [""])[0]),
+            # 按应用的测试说明（黑/白名单等，gen/polish 自动注入 prompt）
+            "/api/app/note": lambda: api_app_note_get(
+                self.root, (self.query.get("package") or [""])[0]),
+            "/api/app/probe": lambda: api_app_probe(
+                (self.query.get("path") or [""])[0], str(self.client_address[0])),
+            # 已安装第三方 App（遍历探索包名候选；2026-10-22）
+            "/api/apps/installed": lambda: api_apps_installed(
+                (self.query.get("serial") or [""])[0]),
             "/api/jobs": lambda: api_jobs_list(),
             # 邀请（main 的 `/api/invite` 迁入 `web_api/invite.py`；**只读本地不联网**）
             "/api/invite": lambda: api_invite_status(),
@@ -181,7 +212,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/device/elements": lambda: api_elements(
                 (self.query.get("serial") or [None])[0],
                 (self.query.get("platform") or ["android"])[0]),
-            "/api/seats": lambda: api_seats(self.root),
+            "/api/seats": lambda: api_seats(self.root, self._shared()),
             "/api/prompts": lambda: api_prompts(self.root),
             "/api/prompts/content": lambda: api_prompts_content(
                 self.root, (self.query.get("file") or [""])[0]),
@@ -193,27 +224,60 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/job": lambda: api_job_view((self.query.get("id") or [""])[0]),
         }
 
+    def _auth_cooldown_remaining(self, ip: str) -> float:
+        """该来源 IP 的剩余冷却秒数（0=未限流）。滑动窗口内失败 ≥5 次 ⇒ 冷却 30s。"""
+        now = time.monotonic()
+        with self._AUTH_FAIL_LOCK:
+            fails = [t for t in self._AUTH_FAILS.get(ip, [])
+                     if now - t < self._AUTH_WINDOW_S]
+            self._AUTH_FAILS[ip] = fails
+            if len(fails) < self._AUTH_MAX_FAILS:
+                return 0.0
+            return max(0.0, self._AUTH_COOLDOWN_S - (now - fails[-1]))
+
+    def _auth_record_fail(self, ip: str) -> None:
+        with self._AUTH_FAIL_LOCK:
+            self._AUTH_FAILS.setdefault(ip, []).append(time.monotonic())
+
+    def _auth_reset_fails(self, ip: str) -> None:
+        with self._AUTH_FAIL_LOCK:
+            self._AUTH_FAILS.pop(ip, None)
+
     def _auth_key(self) -> str | None:
         """本 server 实例的访问口令（None=未启用鉴权，一切放行）。"""
         return getattr(self.server, "auth_key", None)
 
+    def _shared(self) -> bool:
+        """当前是不是**共享模式**（`--share`，监听 0.0.0.0）。
+
+        成员名额只在共享模式下有意义：本机监听的默认控制台，物理上只有安装者能打开，
+        上限恒为 1（见 `web_api.seats`）；而共享之后给几个人，还要看**授权开不开放
+        共享**（2026-10-25：仅团队授权，见 `seat_quota.team_authorized`）。
+        这里按**实际监听地址**判断而不是看 `--share` 参数——测试与嵌入场景直接
+        `make_server(host=...)` 也一视同仁。
+        """
+        return self.server.server_address[0] not in ("127.0.0.1", "localhost", "::1")
+
     def _authed(self) -> bool:
         """`--share` 口令鉴权（团队协作 P1）：cookie（浏览器一次输入长期有效）
-        或 `X-MAT-Key` 头（curl/脚本）任一匹配即可。未配置口令恒 True。"""
+        或 `X-MAT-Key` 头（curl/脚本）任一匹配即可。未配置口令恒 True。
+        比对一律 compare_digest（2026-10-20 评审 P3：此前此处用 `==`）。"""
         key = self._auth_key()
         if key is None:
             return True
-        if self.headers.get("X-MAT-Key") == key:
+        if hmac.compare_digest(self.headers.get("X-MAT-Key") or "", key):
             return True
         for part in (self.headers.get("Cookie") or "").split(";"):
             k, _, v = part.strip().partition("=")
-            if k == AUTH_COOKIE and v == key:
+            if k == AUTH_COOKIE and hmac.compare_digest(v, key):
                 return True
         return False
 
     def _auth_gate_or_none(self, path: str):
         """GET 的鉴权关卡。需要挡下时返回响应动作（None=放行）：
         - /api/*：401 JSON（SPA 里 api.ts 收到后弹口令 Modal）；
+        - /live（实时视图页）：门槛页——页面 HTML 内嵌 serial/job 元数据
+          （2026-10-25 评审 P1 补：此前不在白名单 ⇒ --share 下未认证可读）；
         - /artifacts//screenshots/ 的 HTML 请求（报告直达链接）：门槛页；
         - 其余产物请求（图片/视频/zip）：401（浏览器已带 cookie 的正常场景不受影响）。
         SPA 壳（与 /assets/）不拦——里面没有敏感数据，鉴权收敛在 API 与产物。"""
@@ -221,6 +285,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return None
         if path.startswith("/api/"):
             return lambda: self._json(401, {"error": "需要访问口令", "auth": True})
+        if path == "/live" or path.startswith("/live/"):
+            return lambda: self._send(401, _GATE_HTML, "text/html; charset=utf-8")
         if (path.startswith("/artifacts/") or path.startswith("/screenshots/")) \
                 and "text/html" in (self.headers.get("Accept") or ""):
             return lambda: self._send(401, _GATE_HTML, "text/html; charset=utf-8")
@@ -262,10 +328,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             # index.html，静态文件必须在此之前显式接管。
             if path in ("/manual", "/manual.html") and (CONSOLE_DIST / "manual.html").exists():
                 return self._file(CONSOLE_DIST / "manual.html", "text/html; charset=utf-8")
-            # 客服微信二维码（发起人 2026-10-14）：设置页「联系客服」悬停弹出的素材。
-            # 同样必须在 SPA 兜底之前显式接管，否则被回落成 index.html。
-            if path == "/wx-qrcode.png" and (CONSOLE_DIST / "wx-qrcode.png").exists():
-                return self._file(CONSOLE_DIST / "wx-qrcode.png", "image/png")
             route = self._get_json_routes().get(path)
             if route is not None:
                 self.query = query
@@ -278,11 +340,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 code, data, ctype = api_screenshot(serial, width, platform)
                 return self._send(code, data, ctype)
             if path == "/api/cred":
-                host, _port = self.server.server_address[:2]
-                return self._json(*api_cred_list(str(host)))
+                # 本机能力门控按【客户端来源 IP】判定（client_address 是 TCP 层事实，
+                # 不可伪造）；此前误传 server_address（--share 下恒 0.0.0.0）导致
+                # 分享模式连本机也被 403（2026-10-15 修复）。
+                return self._json(*api_cred_list(str(self.client_address[0])))
             if path == "/api/fs":
-                host, _port = self.server.server_address[:2]
-                return self._json(*api_fs_browse(str(host), (query.get("path") or [""])[0],
+                return self._json(*api_fs_browse(str(self.client_address[0]),
+                                                 (query.get("path") or [""])[0],
                                                  (query.get("ext") or [None])[0]))
             if path == "/api/share":
                 host, port = self.server.server_address[:2]
@@ -332,6 +396,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     ".json": "application/json; charset=utf-8",
                 }.get(target.suffix, "text/plain; charset=utf-8")
                 return self._send(200, target.read_bytes(), ctype)
+            if path == "/live" or path.startswith("/live/"):
+                # 任务实时视图页（只读旁路：设备投屏 + 事件流；门控口径见 web_api/live.py
+                # ——必须在 SPA 兜底之前接管，否则 /live/* 会被 index.html 吞掉）
+                job_id = path[len("/live/"):] if path.startswith("/live/") else ""
+                code, html = render_live(job_id)
+                return self._send(code, html.encode("utf-8"), "text/html; charset=utf-8")
             if (CONSOLE_DIST / "index.html").exists() and not path.startswith(("/api/", "/artifacts/")):
                 return self._file(CONSOLE_DIST / "index.html", "text/html; charset=utf-8")
             return self._json(404, {"error": "not found"})
@@ -385,6 +455,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/review": lambda: api_review_save(self.root, self.body),
             "/api/case": lambda: api_case_save(self.root, self.body),
             "/api/case/delete": lambda: api_case_delete(self.root, self.body),
+            "/api/case/rename": lambda: api_case_rename(self.root, self.body),
             "/api/gen": lambda: api_gen(self.root, self.body),
             "/api/polish": lambda: api_polish(self.root, self.body),
             "/api/import/preview": lambda: api_import_preview(self.root, self.body),
@@ -402,30 +473,34 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/activate": lambda: api_activate(self.body),
             "/api/heals/apply": lambda: api_heal_apply(self.root, self.body),
             "/api/workspace/switch": lambda: api_workspace_switch(
-                self.server, self.root, str(self.server.server_address[:2][0]), self.body),
+                self.server, self.root, str(self.client_address[0]), self.body),
             "/api/fs/open": lambda: api_fs_open(
-                str(self.server.server_address[:2][0]), str(self.body.get("path") or self.root)),
+                str(self.client_address[0]), str(self.body.get("path") or self.root)),
             "/api/doctor/fix": lambda: api_doctor_fix(
-                str(self.server.server_address[:2][0]), self.root, self.body),
+                str(self.client_address[0]), self.root, self.body),
             "/api/index": lambda: api_index(self.root, self.body),
             "/api/suites/save": lambda: api_suite_save(self.root, self.body),
             "/api/suites/delete": lambda: api_suite_delete(self.root, self.body),
-            "/api/apps/install": lambda: api_apps_install(self.root, self.body),
+            "/api/apps/install": lambda: api_apps_install(
+                self.root, str(self.client_address[0]), self.body),
+            "/api/app/note": lambda: api_app_note_put(self.root, self.body),
             "/api/apps/uninstall": lambda: api_apps_uninstall(
-                self.root, str(self.server.server_address[:2][0]), self.body),
+                self.root, str(self.client_address[0]), self.body),
             "/api/calibrate/apply": lambda: api_calibrate_apply(
-                self.root, str(self.server.server_address[:2][0]), self.body),
+                self.root, str(self.client_address[0]), self.body),
             "/api/explore/calibrate": lambda: api_explore_calibrate(
-                self.root, str(self.server.server_address[:2][0]), self.body),
+                self.root, str(self.client_address[0]), self.body),
             "/api/describe": lambda: api_describe(self.root, self.body),
             "/api/diagnose": lambda: api_diagnose(self.root, self.body),
             "/api/export": lambda: api_export(self.root, self.body),
             "/api/cred": lambda: api_cred_write(
-                str(self.server.server_address[:2][0]), self.body),
-            "/api/seats/check": lambda: api_seat_check(self.root, self.body),
-            "/api/seats/remove": lambda: api_seat_remove(self.root, self.body),
+                str(self.client_address[0]), self.body),
+            "/api/seats/check": lambda: api_seat_check(self.root, self.body, self._shared()),
+            "/api/seats/remove": lambda: api_seat_remove(self.root, self.body, self._shared()),
             "/api/prompts/select": lambda: api_prompts_select(self.root, self.body),
             "/api/prompts/save": lambda: api_prompts_save(self.root, self.body),
+            # 过期模板副本升级（2026-10-25：改名备份回落包内新版，追加段不受影响）
+            "/api/prompts/upgrade": lambda: api_prompts_upgrade(self.root, self.body),
         }
 
     def do_POST(self) -> None:
@@ -437,20 +512,34 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "cross-origin rejected"})
             if path == "/api/auth":
                 # 口令校验（团队协作 P1）——唯一无需先过鉴权的写端点（它本身就是为了拿到鉴权）。
-                # 6 hex 随机口令 + 可信内网，风险不高，但仍用 compare_digest 走规范。
+                # 爆破防护（2026-10-20 评审 P1-4）：窗口内失败 5 次 ⇒ 冷却 30s，
+                # 失败落审计（此前失败零痕迹）；比对用 compare_digest。
+                key = self._auth_key()
+                ip = str(self.client_address[0])
+                if key is not None:
+                    cooldown = self._auth_cooldown_remaining(ip)
+                    if cooldown > 0:
+                        return self._json(429, {"error": f"口令错误次数过多，"
+                                                f"请 {int(cooldown) + 1} 秒后重试",
+                                                "auth": True})
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}") if length else {}
-                key = self._auth_key()
                 given = str(body.get("key") or "")
                 if key is not None and hmac.compare_digest(given, key):
+                    self._auth_reset_fails(ip)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Set-Cookie",
-                                     f"{AUTH_COOKIE}={key}; Path=/; Max-Age=31536000; SameSite=Lax")
+                                     f"{AUTH_COOKIE}={key}; Path=/; Max-Age=31536000;"
+                                     " SameSite=Lax; HttpOnly")
                     self.send_header("Content-Length", "2")
                     self.end_headers()
                     self.wfile.write(b"{}")
                     return
+                if key is not None:
+                    self._auth_record_fail(ip)
+                    self.body = {}  # _audit 读 self.body；口令本体绝不落审计
+                    self._audit("/api/auth:fail")
                 return self._json(401, {"error": "口令不对", "auth": True})
             if not self._authed():
                 return self._json(401, {"error": "需要访问口令", "auth": True})
@@ -481,7 +570,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 # 人数闸（2026-10-12 补洞）：写操作必须带已登记的执行人名字——匿名/未登记
                 # 一律拒绝，堵死「先匿名绕过名额」。豁免登记入口自身与机器级激活。
                 if path not in ("/api/seats/check", "/api/activate"):
-                    gate = seat_enforce(self.root, self.body)
+                    gate = seat_enforce(self.root, self.body, self._shared())
                     if gate is not None:
                         return self._json(*gate)
                 self._audit(path)  # 团队协作：所有写操作落审计（谁改的/谁下发的，发起人 2026-10-12）

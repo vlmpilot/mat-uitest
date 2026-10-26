@@ -14,6 +14,20 @@ from .device import list_adb_devices as _list_adb_devices
 from .driver_base import BaseDriver
 
 
+def _shell_text(out: Any) -> str:
+    """驱动 `shell()` 的返回统一转文本。
+
+    Android 走 uiautomator2⇒adbutils 时返回 `ShellResponse`（**不是 str**），iOS 走 WDA
+    时返回 str。此前只有 `app_version` 做了兼容，`app_apk_sha256` 与 `device_meta`
+    直接按 str 用 ⇒ TypeError 被 `except` 吞掉、产物里的指纹/型号恒为空
+    （2026-10-25 真机评测：对外数字必须能回答"测的是哪个构建"）。
+    """
+    if isinstance(out, str):
+        return out
+    text = getattr(out, "output", "")
+    return text if isinstance(text, str) else str(text or "")
+
+
 def app_version(drv, package: str) -> str:
     """被测 App 的版本号；取不到返回空串（**绝不因为版本探测失败影响主流程**）。
 
@@ -38,7 +52,7 @@ def app_version(drv, package: str) -> str:
         pass
     try:
         out = drv.shell(f"dumpsys package {package}")
-        text = out if isinstance(out, str) else getattr(out, "output", "") or ""
+        text = _shell_text(out)
         match = re.search(r"versionName=([^\s]+)", text)
         return match.group(1) if match else ""
     except Exception:  # noqa: BLE001 —— 两条都失败 ⇒ 空串，不影响主流程
@@ -59,7 +73,7 @@ def app_apk_sha256(drv, package: str, prefix: int = 12) -> str:
     if not package:
         return ""
     try:
-        match = re.search(r"package:(\S+\.apk)", drv.shell(f"pm path {package}"))
+        match = re.search(r"package:(/\S+\.apk)", _shell_text(drv.shell(f"pm path {package}")))
         if not match:
             return ""
         apk = match.group(1)
@@ -67,7 +81,8 @@ def app_apk_sha256(drv, package: str, prefix: int = 12) -> str:
         return ""
     for tool in ("sha256sum", "md5sum"):
         try:
-            found = re.search(r"\b([0-9a-fA-F]{16,64})\b", drv.shell(f"{tool} {apk}"))
+            found = re.search(r"\b([0-9a-fA-F]{16,64})\b",
+                              _shell_text(drv.shell(f"{tool} {apk}")))
             if found:
                 return found.group(1)[:prefix].lower()
         except Exception:  # noqa: BLE001 —— 换下一个工具
@@ -93,6 +108,24 @@ def app_apk_sha256(drv, package: str, prefix: int = 12) -> str:
 #:
 #: ⇒ 取 **2.0s**：比实测翻转点（1.2s）高 67%，留足余量；且是整数、好记。
 LONG_PRESS_SECONDS = 2.0
+
+
+#: 传输层断连的异常名（假红治理）：u2 走 HTTP 到设备 agent，
+#: `RemoteDisconnected`/`ConnectionError` 族出现时**业务没坏、会话坏了**——
+#: 重建会话重试一次即可救回，不当失败报（实测 gen-184020-3 连跑 7 次 4 次
+#: 假红全是这一类）。名字匹配而非精确类型：u2/requests 的异常跨版本改名，
+#: 名字集合足够窄（只认连接族），不会吞业务错。
+_TRANSPORT_ERROR_NAMES = {
+    "RemoteDisconnected", "ConnectionError", "ConnectionResetError",
+    "ConnectionAbortedError", "ReadTimeout", "GatewayError", "ProtocolError",
+}
+
+
+def is_transport_error(exc: BaseException) -> bool:
+    """是否传输层断连（决定「重建会话重试一次」要不要触发）。"""
+    if isinstance(exc, ConnectionError):
+        return True
+    return type(exc).__name__ in _TRANSPORT_ERROR_NAMES
 
 
 class DeviceDriver(BaseDriver):
@@ -123,15 +156,30 @@ class DeviceDriver(BaseDriver):
     def screenshot_pil(self) -> Any:
         return self._d.screenshot()
 
-    def find(self, by: str, value: str, timeout: float) -> Any:
-        node = self._d(**{by: value})
+    def find(self, by: str, value: str, timeout: float, index: int | None = None) -> Any:
+        kwargs: dict[str, Any] = {by: value}
+        if index is not None:
+            # u2 的 `instance` 直接映射 Android `UiSelector.instance(int)`（0 基，与 DSL 同义）。
+            # 只透传这一个键：`index` 在 u2 里是**控件树层级**的 index 属性，语义不同，别混用。
+            kwargs["instance"] = index
+        node = self._d(**kwargs)
         if timeout > 0:
-            node.wait(timeout=timeout)
+            # u2 的 `wait()` 超时**抛异常**（不是返回 False）。若不吞，`locator` 的
+            # text→description→contains→hint 语义链会在**第一个策略**就中断
+            # （2026-10-25 真机实测：链只剩 `text=… 未命中`，等同链不存在）。
+            # iOS 侧早已用 `raise_error=False`，这里对齐成"未命中"语义。
+            try:
+                node.wait(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                pass
         return node
 
     def find_xpath(self, expr: str, timeout: float) -> Any:
         selector = self._d.xpath(expr)
-        selector.wait(timeout=timeout)
+        try:
+            selector.wait(timeout=timeout)
+        except Exception:  # noqa: BLE001 —— 未命中同理：交给调用方读 `.exists`
+            pass
         return selector
 
     def shell(self, cmd: str) -> Any:
@@ -181,6 +229,29 @@ class DeviceDriver(BaseDriver):
     def swipe_ext(self, direction: str) -> None:
         self._d.swipe_ext(direction, scale=0.8)
 
+    # -- 证据链（P2.2 契约：Android 委托 adb，单一实现仍在 adb.py） ----------------
+
+    def start_evidence(self) -> None:
+        from .adb import logcat_clear
+
+        logcat_clear(self.serial)
+
+    def evidence_tail(self) -> str:
+        from .adb import logcat_tail
+
+        return logcat_tail(self.serial)
+
+    def device_meta(self) -> dict:
+        """型号 + 系统版本（写进产物溯源；取不到就是空串，不猜）。"""
+        def prop(name: str) -> str:
+            try:
+                return _shell_text(self.shell(f"getprop {name}")).strip()
+            except Exception:  # noqa: BLE001 —— 溯源信息缺失不影响执行
+                return ""
+
+        return {"model": prop("ro.product.model"),
+                "os_version": prop("ro.build.version.release")}
+
     def press(self, key: str) -> None:
         self._d.press(key)
 
@@ -191,5 +262,39 @@ class DeviceDriver(BaseDriver):
     def app_start(self, package: str, activity: str | None = None) -> None:
         self._d.app_start(package, activity)
 
+    def reconnect(self) -> None:
+        """重建 u2 会话（P0-1 假红治理）：传输断连后由 runner 的重试路径调用。"""
+        import uiautomator2 as u2
+
+        self._d = u2.connect(self.serial)
+
     def app_stop(self, package: str) -> None:
         self._d.app_stop(package)
+
+
+class NullDriver:
+    """无设备占位驱动（P1-1 评审 P2-1）：纯 `Action.API` 用例不需要真机/模拟器。
+
+    Runner 对 api 步骤在 `_run_step_once` 开头提前返回，全程不触碰设备接口；
+    本类只负责把 `_persist` 的溯源探测（app_version / app_apk_sha256 /
+    device_meta）安全落到**空值**——溯源缺失如实为空，不伪装成有设备。
+    混入任何 UI 步骤的用例不适用（cmd_run 会按需连真设备）。
+    """
+
+    platform = "null"
+    serial = None
+
+    def app_info(self, package: str) -> dict:
+        return {}
+
+    def shell(self, cmd: str) -> str:
+        return ""
+
+    def device_meta(self) -> dict:
+        return {}
+
+    def evidence_tail(self) -> str:
+        return ""
+
+    def foreground_app(self) -> dict:
+        return {}

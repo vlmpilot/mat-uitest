@@ -19,8 +19,22 @@ _FUZZY_MAP = {
 
 
 def collect_proposals(run_dir: Path) -> list[dict]:
-    """从执行目录的 run.json 收集自愈提案。"""
-    data = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8"))
+    """从执行目录的 run.json 收集自愈提案。
+
+    P1-2（2026-10-24 评审）：run.json 是磁盘产物、可能被手改/损坏——此前裸
+    `read_text + json.loads`，CLI 直接 traceback、web 端 500。这里把不可读/损坏
+    翻译成**可行动**的 ValueError（与 apply_heals 对脏提案的防御同一纪律）。
+    """
+    run_json = Path(run_dir) / "run.json"
+    try:
+        data = json.loads(run_json.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(
+            f"run.json 不可读：{run_json}（{exc}）——重跑该用例生成新产物") from exc
+    except ValueError as exc:
+        raise ValueError(
+            f"run.json 已损坏：{run_json}（{exc}）——文件可能被手改，重跑该用例生成新产物"
+        ) from exc
     proposals = []
     for step in data.get("run", {}).get("steps", []):
         if step.get("heal"):

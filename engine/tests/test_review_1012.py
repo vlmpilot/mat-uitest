@@ -188,8 +188,11 @@ def test_c1_base_driver_default_is_noop():
     assert BaseDriver.wake_and_unlock is not None
     assert DeviceDriver.wake_and_unlock is not BaseDriver.wake_and_unlock, (
         "Android 驱动必须 override wake_and_unlock，否则唤醒防护仍是 no-op")
-    # WdaDriver 继承默认 no-op（iOS 场景 WDA 自管屏幕）
-    assert WdaDriver.wake_and_unlock is BaseDriver.wake_and_unlock
+    # WdaDriver 也 override（2026-10-17 真机实测：锁屏后 WDA 完全不可用——
+    # `dump()` 报 "not unlocked" / "Cannot get 'xml' source"）。
+    # 但只在**真机**调 unlock：模拟器上 home+上滑会误开 App 切换器。
+    assert WdaDriver.wake_and_unlock is not BaseDriver.wake_and_unlock, (
+        "真机锁屏是头号环境失败源，WdaDriver 必须 override")
 
 
 # ---- C6 timeout 边界 + DSL 形状校验（重复 id / 包名）--------------------
@@ -475,3 +478,26 @@ def test_heals_skips_malformed_proposal(tmp_path):
     assert len(notes) == 1
     assert healed.steps[0].target.value == "登录"
     assert healed.steps[0].target.strategy == LocatorStrategy.TEXT
+
+
+def test_visible_controls_hint_says_how_many_were_hidden(tmp_path):
+    """归因提示只列前 8 个时，**必须**说明总数与完整清单在哪（2026-10-26）。
+
+    为什么：一次归因复盘就是拿这 8 条判"目标值在不在候选集"的，于是把"元素其实在屏、
+    只是排在 8 条之后"误判成"定位值根本不存在"（后来一个实验推翻了那个结论）。
+    数据一直都在 `screens/*.json` 里，缺的只是"别让读者以为 8 就是全部"。
+    """
+    nodes = "".join(
+        f'<node text="控件{i}" class="android.widget.TextView" clickable="true"'
+        f' package="com.insta.demo" bounds="[0,{i * 20}][100,{i * 20 + 10}]"/>'
+        for i in range(12))
+    drv = _AbsentDriver(dump=f"<hierarchy>{nodes}</hierarchy>")
+    case = _case(steps=[{"id": "s1", "intent": "点按", "action": "tap",
+                         "target": {"strategy": "res-id",
+                                    "value": "com.insta.demo:id/absent"},
+                         "timeoutMs": 200}])
+    result = Runner(drv, tmp_path).run(case).steps[0]
+    w = result.warning or ""
+    assert "当前页面可见控件" in w
+    assert "共 12 个" in w, f"必须报总数，否则读者会把 8 当成全部；实际：{w}"
+    assert "完整清单见" in w and result.screen, f"必须指向落盘文件；实际：{w}"

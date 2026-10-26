@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .safety import SENSITIVE_WORDS as _SENSITIVE  # 单一事实来源（safety.py）
+from .safety import is_ad_slot_rid, is_splash_skip_label
 from .ui_tree import parse_nodes
 
 
@@ -47,7 +48,16 @@ _DYNAMIC_PATTERNS = (
                re.I),                                                        # "581条" "8千+" "649m"
     re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$"),                               # "12:30"
     re.compile(r"^\d{4}[-/年]\d{1,2}(?:[-/月]\d{1,2}日?)?$"),                # "2026-09-28"
-    re.compile(r"^(?:刚刚|昨天|前天)$"),                                      # 相对时间
+    re.compile(r"^(?:刚刚|昨天|前天)$"),
+    # **「标签 + 计数」**（2026-10-22，某内容社区 App实测）：`点赞 1336` / `收藏135` / `评论 409`
+    # 带的是会变的数字，但整体既不是纯数字、也短于 40 字符 ⇒ 旧规则全放过。
+    # 后果：同一个笔记详情页每次进来计数不同 ⇒ `page_key` 每帧都变 ⇒ 回退落点被当成新页，
+    # 探索"每帧一个新页"，26 页里 16 页是同一个页面反复新建，最后 `stuck`。
+    # ⚠️ 必须要求**带数字**：`收藏`/`评论`/`关注` 这种纯标签是稳定入口，不能抹。
+    re.compile(r"^(?:点赞|收藏|评论|赞|阅读|浏览|分享|转发|播放|在看|喜欢|粉丝|关注|浏览)"
+               r"\s*[\d.,]+\s*(?:万|千|亿|w|k)?\+?$", re.IGNORECASE),
+    # 图片位置指示 `1/6`：同一个详情页每张图都不同，但对"这是哪一页"没有信息量。
+    re.compile(r"^\d+\s*/\s*\d+$"),                                      # 相对时间
     re.compile(r"^\d+\s*(?:分钟|小时|天|周|个?月|年)前$"),                     # "3 分钟前"
     # **状态指示文案**（开关/连接/安装状态）。它们不随内容变，而是**随设备状态变**——
     # 但对页面身份而言同样是噪声：同一页只是某个开关被拨了一下，就会被算成两个页面。
@@ -117,10 +127,87 @@ def _dedup_seq(values: list) -> list:
 #: 判据是**名字以数字开头**，不是硬编码某个字符串：Android 资源名必须是合法 Java 标识符
 #: （**不能以数字开头**）⇒ 以数字开头的一律是 aapt2 的占位。
 #: 实测全部 4 个 App 的图谱里，满足这条的**只有** `0_resource_name_obfuscated` 一个。
+#: `tried` 条目的格式：`<bounds>\t<label>\t<rid>`。老格式（裸 bounds）没有分隔符 ⇒ 视为"不可验证"。
+#: 为什么用 \t：a11y 文案里几乎不出现制表符，且 JSON 里可见、好排查。
+TRIED_SEP = "\t"
+
+
+def _clean(value: object) -> str:
+    return str(value or "").replace(TRIED_SEP, " ").strip()
+
+
+#: 语义比较前把**数字段归一化**成 `#`。
+#: 为什么不是"含数字就丢掉"（2026-10-22 实测后改）：丢掉会让"收藏按钮"这类控件退化成
+#: 只比坐标——而坐标在信息流里恰恰不可靠，等于把刚修好的**误跳**又放回来。
+#: 归一化两头都占：同一个控件（计数变了）仍相等，不同内容（标题不同）仍不等。
+#: 实测某内容社区 App："已收藏10004" / "消息，1条未读" / "5475" / "1万" 都是同一个控件的不同计数。
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+
+def _semantic_label(cand: dict) -> str:
+    """可当"控件身份"的文案：数字段归一化为 `#`（见 `_DIGIT_RUN_RE`）。"""
+    return _DIGIT_RUN_RE.sub("#", _clean(cand.get("label")))
+
+
+def tried_entry(cand: dict) -> str:
+    """候选 → `tried` 条目：`bounds \t label \t rid`。
+
+    为什么三个都记（2026-10-22 实测）：原来只记 `(page_key, bounds)`，等于**用屏幕坐标
+    当"这个分支是什么"**。信息流/列表页的卡片按坐标重排 ⇒ 同一坐标每次是不同内容 ⇒
+    旧条目**误跳新入口**（静默漏页）。但单靠任一个语义字段也不够稳：
+
+    | 字段 | 什么时候稳 | 什么时候不可靠 |
+    |---|---|---|
+    | `label` | 按钮/页签文案 | 图标入口没有文案 |
+    | `rid`   | 原生 App | RN/混淆包（`0_resource_name_obfuscated`）或每次变（实测部分 App 如此）|
+    | `bounds`| 固定布局 | 信息流/长列表 |
+
+    ⇒ 三个都记，**匹配时要求 bounds 相同、且 label / rid 至少有一个相同**（空字段不算）。
+    """
+    return TRIED_SEP.join((_clean(cand.get("bounds")), _semantic_label(cand),
+                           _clean(cand.get("rid"))))
+
+
+def tried_matches(entry: str, cand: dict) -> bool:
+    """历史条目是否**就是**这个候选。
+
+    - 老格式（没有分隔符）⇒ **不匹配**：不可验证，宁可不跳（重探一次）也不误跳（静默漏页）；
+    - 新格式 ⇒ bounds 必须相同，且 label / rid **至少一个相同**（两者都空则只比 bounds）。
+    """
+    parts = str(entry).split(TRIED_SEP)
+    if len(parts) < 3:
+        return False
+    old_bounds, old_label, old_rid = parts[0], parts[1], parts[2]
+    if old_bounds != _clean(cand.get("bounds")):
+        return False
+    # ⚠️ **退化 rid 不参与比较**：`0_resource_name_obfuscated` 这类占位名在**所有**控件上
+    # 都一样，拿它判"同一个控件"等于没判（实测某内容社区 App全 App 共用一个占位名）。
+    now_rid = _clean(cand.get("rid"))
+    if is_degenerate_res_id(old_rid):
+        old_rid = ""
+    if is_degenerate_res_id(now_rid):
+        now_rid = ""
+    # 存量条目里存的是**未归一化**的原文案，读的时候也要归一化一次（幂等）
+    label_ok = bool(old_label) and _DIGIT_RUN_RE.sub("#", old_label) == _semantic_label(cand)
+    rid_ok = bool(old_rid) and old_rid == now_rid
+    if not old_label and not old_rid:
+        return True          # 两个语义字段都空（罕见）：只能退回比坐标
+    return label_ok or rid_ok
+
+
+def is_legacy_tried(entry: str) -> bool:
+    """老格式条目（没有语义段）——读回图谱时丢弃并计数。"""
+    return str(entry).count(TRIED_SEP) < 2
+
+
 def is_degenerate_res_id(res_id: str) -> bool:
     """资源名是不是「占位/无区分度」的那种（只按**名字**判，不看包名）。"""
     name = (res_id or "").rsplit("/", 1)[-1].strip()
     return bool(name) and name[0].isdigit()
+
+
+#: 稳定信号少于这个数时，补一层**结构信号**（见 `identities_from_controls`）。
+STRUCTURAL_MIN_SIGNALS = 3
 
 
 def identities_from_controls(controls: list[dict]) -> frozenset[str]:
@@ -144,7 +231,159 @@ def identities_from_controls(controls: list[dict]) -> frozenset[str]:
         for prefix, value in (("text:", c.get("text")), ("desc:", c.get("desc"))):
             if value and not is_dynamic_text(value):
                 signals.add(prefix + value)
+    # **结构性兜底**（2026-10-22，某内容社区 App实测）：内容页（搜索结果/信息流/详情）的文案
+    # 全是动态的、res-id 又全混淆 ⇒ 稳定信号可能只剩 1~3 个，包含度认页直接失效：
+    # 153 页里 **17 页只有 1 个信号**，两两近重复对 1112 组 —— 探索于是"每帧一个新页"，
+    # 深度爆炸后 `stuck`。此时补一层**与内容无关**的结构信号（控件类名 + 是否可点），
+    # 让"同一个页面类型"仍然认得出彼此。
+    # ⚠️ 只在信号**稀薄时**才补（阈值 3）：文案充足的页面不该被结构信号稀释，
+    # 否则「设置」这类同布局不同标题的页会被误并。
+    if len(signals) < STRUCTURAL_MIN_SIGNALS:
+        for c in controls or []:
+            cls = str(c.get("class") or "").rsplit(".", 1)[-1].strip()
+            if cls:
+                signals.add(f"cls:{cls}:{'1' if c.get('clickable') else '0'}")
     return frozenset(signals)
+
+
+#: 判定「同逻辑页碎片」的 identities Jaccard 门槛（实测同页稳定性仅 12%，
+#: 同一逻辑页常碎片化成多个 page_key；0.5 在实测样例 J≥0.76 的真碎片与凑巧
+#: 同 activity 的无关页之间留了余量）。
+EQUIV_SIM = 0.5
+
+
+def _ident_jaccard(a: dict, b: dict) -> float:
+    sa = {str(s) for s in (a.get("identities") or [])}
+    sb = {str(s) for s in (b.get("identities") or [])}
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def pages_equivalent(a: dict, b: dict, min_sim: float = EQUIV_SIM) -> bool:
+    """两页是否为**同一逻辑页的碎片**：同 activity 且 identities Jaccard ≥ 阈值。
+
+    用途：落点核对/状态核对不再按 page_key 精确相等——内容轮换/弹窗变体产生的
+    碎片会让精确核对把「实际已到达」误判为「落点不符」（走链重放与执行期置备
+    共用这一判据，见 arrivals._walk_chain）。identities 任一为空或 activity 不同
+    ⇒ 不等价（宁可判不符，不可把真不同页放进来）。
+    """
+    if not a or not b:
+        return False
+    if (a.get("activity") or "") != (b.get("activity") or ""):
+        return False
+    return _ident_jaccard(a, b) >= min_sim
+
+
+#: iconfont 私有区字符（Android 图标字体常落在 BMP PUA 与两个补充私有区）。
+_PUA_RE = re.compile(r"^[\s\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]+$")
+
+
+def is_pua_label(label: str) -> bool:
+    """文案是否纯 iconfont 私有区字符（如 ``\\ue90f``）——重放按文案匹配不到语义。
+
+    实测（第 4 层，tx-news）：explore 把图标按钮的 iconfont 字符记成 parent_action，
+    真机重放按「文案」逐跳匹配必死——字符看着非空，实际没有控件语义。
+    混合了正常文字的（如「IP属地：云南+图标」）仍有文案语义，不算。
+    """
+    s = str(label or "").strip()
+    return bool(s) and bool(_PUA_RE.match(s))
+
+
+#: 内容型文案的最短长度：**无 rid** 纯文案跳、文案 ≥ 该长度判「内容型」——
+#: 推荐流标题/榜单名等随内容轮换的文本，重放按文案匹配必挂（tx-news 2026-10-17
+#: 真机实测：8 条内容文案链 24 轮 0 通过，失败文案 7~24 字全 ≥7；tab/菜单等稳定
+#: 短文案 2~4 字不受影响）。宁漏勿错：误伤罕见的 ≥7 字稳定菜单项（少验一条链）
+#: 好过把必挂链当可靠（每条白烧 3 轮冷启动真机预算）。
+CONTENT_LABEL_MIN = 7
+
+
+def is_content_label(label: str) -> bool:
+    """文案是否内容型（随内容轮换、重放必挂）——长度判据见 `CONTENT_LABEL_MIN`。
+
+    只对**无 rid** 的纯文案跳生效：有 rid 走资源 id 通道，文案轮换无所谓。
+    `BACK_HOP` 哨兵（15 字符）是确定性系统动作，显式豁免。
+    """
+    s = str(label or "").strip()
+    return bool(s) and s != BACK_HOP and len(s) >= CONTENT_LABEL_MIN
+
+
+#: 系统 back 到达链的**专用标记**（explore 记录 / arrivals 重放 / repair 放行三方共用）。
+#:
+#: explore 回退恢复时 `press("back")` 可能落到**没爬过的页**（关弹窗露出底层页、
+#: 回到未收录的列表页）——此前只能记 `parent_action=None`（结构性断链，tx-news
+#: 实测 62/75 新页无链的主因之二）。back 是确定性动作，**可重放**：走到 back 前
+#: 的页再按同一动作回放。标记串取不可能与真实控件文案冲突的哨兵值；
+#: `is_back_word` 是全等匹配不会误中它，故 repair/verify 的回退过滤自动放行。
+BACK_HOP = "__system_back__"
+
+
+def hop_replayable(action: str | None, rid: str | None) -> bool:
+    """单个到达动作是否有**可重放通道**：资源 id，或非 iconfont、非内容型的真实文案。
+
+    explore（`_record` 换链判据）、合并（`_merge_page`）、修复（graph_repair 的
+    语义校验）三处共用，避免口径漂移——iconfont 字符看着非空，同样写不出重放序列；
+    内容型长文案（`is_content_label`）看着有语义，重放时内容早已轮换，同理必挂。
+    """
+    if rid:
+        return True
+    return bool(action) and not is_pua_label(action) and not is_content_label(action)
+
+
+#: 广告落地页的 activity 标记（**窄判据**：只认 activity 名，不看文案）。
+#: 为什么需要它（2026-10-23 实测 tx-news 图谱）：53 条记录里 **15 条**是
+#: `.tad.business.ui.activity.WebAdvertActivityV2`——点信息流广告进去的落地页
+#: （「商品详情页」「淘宝精选」）。它们不是被测 App 的功能页，却会被当成"可途经的页面"
+#: 写进父链：`graph-repair` 实测借到的链，到达动作就是 `天猫双11热卖中`——**重放必死**。
+#: ⚠️ 判据刻意**只看 activity**：新闻标题里带「广告」二字很常见，按文案判会误杀真页面。
+_AD_ACTIVITY_MARKERS = ("webadvert", "advertactivity", "adactivity", ".ad.")
+
+
+def is_ad_landing(page: dict) -> bool:
+    """这页是不是**广告落地页**（不是被测 App 的功能页）。
+
+    用途：路由（`arrivals._chain_of`）不把它当可途经节点，修复器（`graph_repair`）
+    不把它当修复目标、也不拿它的链当 donor。**不删页**——证据留在图谱里可审。
+    """
+    activity = str(page.get("activity") or "").lower()
+    return bool(activity) and any(m in activity for m in _AD_ACTIVITY_MARKERS)
+
+
+def is_transient_frame(page: dict) -> bool:
+    """根页是否「瞬态启动帧」：控件含「跳过」类一次性控件（splash/开屏广告）。
+
+    词表见 `safety.is_splash_skip_label`。只对**链根**（depth-0）判：launch 后该帧
+    被 App 自动翻过，其下父链的第 1 跳是对「帧还活着」的竞态，结构性不可重放
+    （实测 tx-news：11 个根里只有 2 个含「跳过」词，73-77 控件的 SplashActivity
+    首页变体不含——判据在真机语料上零误伤）。
+    """
+    for c in page.get("controls") or []:
+        label = (c.get("text") or c.get("desc") or "").strip()
+        if label and is_splash_skip_label(label):
+            return True
+    return False
+
+
+def root_reachable(root: dict, launch_activity: str | None) -> bool:
+    """链根是否 **launch 可达**：根 activity 与冷启动落点一致（全等判）。
+
+    不可达根的来源：App 停在遗留页（实测：上次会话留下的播客详情页）时建的根，
+    activity 与 launch 落点不同——launch 重放永远落不到它，其下链结构性不可重放
+    （实测 tx-news：245/252 条可重放链挂这种根，真机验证 0/20 全在根核对处拦下）。
+    一边取不到（根无 activity 或图谱未记录 launch_activity）就不表态（"不知道"
+    ≠ "不可达"），照旧走链，由真机根核对兜底。
+
+    ⚠️ 教训（2026-10-17 真机实证，勿再「放宽」）：activity 名含 splash/launch
+    等词 **≠** 瞬态帧——tx-news 冷启动翻开屏后的稳定落点就是
+    `.activity.SplashActivity`，它就是首页 activity（重探两次结果一致）。曾按
+    命名词表把这类基准判为「旧口径脏数据」并放宽判据，结果 7 条借到
+    HippyActivity 首页根的链 3 轮全灭在根核对（21 次冷启动白烧）。瞬态帧的
+    判定只认控件特征（`is_transient_frame`：含「跳过」类控件），不认 activity 名。
+    """
+    if not launch_activity:
+        return True
+    act = (root.get("activity") or "").strip()
+    return (not act) or act == launch_activity
 
 
 def describe_structure(controls: list[dict], max_elements: int = 8,
@@ -198,6 +437,48 @@ def describe_structure(controls: list[dict], max_elements: int = 8,
 
 # -- 控件索引（原有） -------------------------------------------------------------
 
+def res_evidence(index_path: Path, res_ids: list[str], limit: int = 4) -> dict:
+    """批量查一组 res-id 在页面图谱里的**存在性与历史可见文案**（诊断归因用）。
+
+    与 `rid_hints` 同源（rid_hints 就是本函数的单 id 薄包装）：同一份 json 只读一次、
+    同一套去重/动态文案过滤/可点击优先排序。返回::
+
+        {"updated_at": "2026-10-14T…" or None,   # 快照时间——引用方必须把它喂给 LLM，
+         "hits": {                                # 否则模型无从判断图谱是否已过期
+           "<res_id>": {"exists": bool, "labels": ["登录", …], "pages": 2},
+         }}
+
+    图谱文件缺失/损坏/包名非法 → `{"updated_at": None, "hits": {}}`（调用方静默降级）。
+    """
+    empty: dict = {"updated_at": None, "hits": {}}
+    try:
+        data = json.loads(Path(index_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return empty
+    want = [r for r in res_ids if r]
+    if not want:
+        return empty
+    hits: dict[str, dict] = {r: {"exists": False, "labels": [], "pages": 0} for r in want}
+    for page in data.get("pages") or []:
+        for control in page.get("controls") or []:
+            rid = control.get("res-id")
+            if rid not in hits:
+                continue
+            hit = hits[rid]
+            hit["exists"] = True
+            hit["pages"] += 1
+            label = (control.get("text") or control.get("desc") or "").strip()
+            # 去重必须**跨桶**做：同一文案可能同时出现在可点击与不可点击的节点上，
+            # 按桶去重会让它在拼接后重复出现（rid_hints 的老教训）。
+            if not label or label in hit["labels"] or is_dynamic_text(label):
+                continue
+            hit["labels"].append(label)
+    for hit in hits.values():
+        hit["labels"] = hit["labels"][:limit]
+    return {"updated_at": data.get("updated_at") or data.get("generated_at"),
+            "hits": hits}
+
+
 def rid_hints(index_path: Path, res_id: str, limit: int = 4) -> list[str]:
     """从页面图谱反查某个 res-id 曾经对应的**可见文案**（供「改 id 后零成本自愈」使用）。
 
@@ -208,25 +489,8 @@ def rid_hints(index_path: Path, res_id: str, limit: int = 4) -> list[str]:
 
     返回顺序：**可点击控件的文案优先**（同一 id 若在多页出现，先给最可能是操作目标的那条）。
     """
-    try:
-        data = json.loads(Path(index_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    clickable: list[str] = []
-    other: list[str] = []
-    seen: set[str] = set()
-    for page in data.get("pages") or []:
-        for control in page.get("controls") or []:
-            if control.get("res-id") != res_id:
-                continue
-            label = (control.get("text") or control.get("desc") or "").strip()
-            # 去重必须**跨桶**做：同一文案可能同时出现在可点击与不可点击的节点上，
-            # 按桶去重会让它在 clickable + other 拼接后重复出现。
-            if not label or label in seen or is_dynamic_text(label):
-                continue
-            seen.add(label)
-            (clickable if control.get("clickable") else other).append(label)
-    return (clickable + other)[:limit]
+    return (res_evidence(index_path, [res_id]).get("hits", {}).get(res_id)
+            or {}).get("labels", [])[:limit]
 
 
 def digest_page(xml: str, package: str = "") -> dict:
@@ -282,6 +546,67 @@ def page_purpose_lines(pages: list[dict], max_notes: int = 60,
     return lines
 
 
+def _round_robin(groups: list[list[str]], limit: int) -> list[str]:
+    """从多组候选里**轮流**取，取满 `limit` 条为止。
+
+    为什么不是"一组取完再取下一组"（2026-10-26）：控件清单是按页分组的，而
+    "第一组取完再取下一组"等价于"把 token 预算全给第一个页面"。某资讯类 App 图谱 24 页，
+    首页 600 个控件 ⇒ 120 条配额被首页吃光，模型只看到 1 页，却要写"进详情页/搜索结果页"
+    的定位值——它没见过那些控件，只能编。轮转不增加预算，只让每一页都露面。
+    """
+    out: list[str] = []
+    depth = 0
+    while len(out) < limit:
+        added = False
+        for group in groups:
+            if depth < len(group):
+                out.append(group[depth])
+                added = True
+                if len(out) >= limit:
+                    break
+        if not added:
+            break
+        depth += 1
+    return out
+
+
+#: 广度配额占比（2026-10-26 真机标定）。**纯轮转是过冲**——见 `_quota_split`。
+BREADTH_SHARE = 0.5
+
+
+def _quota_split(groups: list[list[str]], limit: int,
+                 breadth_share: float = BREADTH_SHARE) -> list[str]:
+    """一半预算按页轮转（广度），另一半按页顺序补（深度）。
+
+    ⚠️ **不要改回纯轮转（`breadth_share=1.0`）**。2026-10-26 在真机图谱上扫过配比，
+    两个指标一起看（活动覆盖数 / 16 条用例真机修正后的定位值有多少落在注入清单里）：
+
+    | App | 0%（全深度） | 40–60% | 80% | 100%（纯轮转） |
+    |---|---|---|---|---|
+    | 资讯类 A | 1 act，召回 21/29 | **6 act，召回 21/29** | 6 act，19/29 | 6 act，**12/29** |
+    | 社区类 B | 3 act，召回 6/8 | **9 act，召回 6/8** | 9 act，6/8 | 9 act，6/8 |
+
+    ⇒ 40–60% 就把活动覆盖吃满、召回**一点不掉**；纯轮转把首页压到只剩 5 条，
+    首页控件（频道栏/搜索框/列表项）被挤出清单，召回掉 43%。
+    「覆盖更广」不等于「更好」——广度是手段，召回才是目的。
+    """
+    if limit <= 0:
+        return []
+    breadth = int(limit * breadth_share)
+    out = _round_robin(groups, breadth) if breadth > 0 else []
+    seen = set(out)
+    if len(out) < limit:
+        for group in groups:  # 深度：按页顺序补齐（第一页优先）
+            for line in group:
+                if line in seen:
+                    continue
+                out.append(line)
+                seen.add(line)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
 def controls_context(pages: list[dict], max_controls: int = 120, text_limit: int = 30,
                      max_text_controls: int | None = None,
                      max_page_notes: int = 60) -> str:
@@ -296,15 +621,28 @@ def controls_context(pages: list[dict], max_controls: int = 120, text_limit: int
     2026-10-13 起在最前面追加**页面用途段**（`page_purpose_lines`）——AI 写用例时
     先「看懂每个页面是干什么的」，减少定位错页面（同类页选错）的问题；仍以控件
     清单为主体，用途段只是导航头。
+
+    ⚠️ **2026-10-26：配额改成「一半按页轮转、一半补深度」，不再让第一页吃光，也不是纯轮转。**
+    原来是"按 pages 顺序往列表里塞，塞满 `max_controls` 就停"——第一个页面控件一多，
+    后面的页面一条都进不去。真机实测（某资讯类 App 图谱 24 页 / 1499 控件）：**120 条 res-id
+    配额被首页（600 控件）全部占满，模型只看到 24 页里的 1 页**；某电商 App 117 页只看到 8 页、
+    内容社区类 App 55 页只看到 11 页。而模型被要求写"点进详情页 / 进搜索结果页 / 去我的页"——
+    那些页面的控件它**一条都没见过**，只能凭先验编（一次同代重测的 49 次失败里
+    41 次是"目标值根本不在候选集"，机制同源）。
+    **但纯轮转是过冲**：它把首页压到只剩 5 条，首页控件被挤出清单，召回反掉 43%。
+    标定后取 50/50（见 `_quota_split`）——**不增加 token 预算**，只改变"预算花在哪些页上"。
     """
     if max_text_controls is None:
         max_text_controls = max_controls
-    rid_lines: list[str] = []
-    text_lines: list[str] = []
     seen_rid: set[tuple] = set()
     seen_label: set[str] = set()
+    #: 逐页展开 → 全局去重（先到先得）→ 再由 `_quota_split` 一半轮转一半补深度。
+    per_page_rid: list[list[str]] = []
+    per_page_text: list[list[str]] = []
     for page in pages:
         activity = page.get("activity", "")
+        rids: list[str] = []
+        texts: list[str] = []
         for control in page.get("controls", []):
             rid = control.get("res-id", "")
             label = (control.get("text") or control.get("desc") or "").strip()
@@ -312,17 +650,17 @@ def controls_context(pages: list[dict], max_controls: int = 120, text_limit: int
                 if (rid, label) in seen_rid:
                     continue
                 seen_rid.add((rid, label))
-                rid_lines.append(f"- res-id: {rid}  文案: {label[:text_limit]}  页面: {activity[:40]}")
-                if len(rid_lines) >= max_controls:
-                    break
+                rids.append(f"- res-id: {rid}  文案: {label[:text_limit]}  页面: {activity[:40]}")
             elif (control.get("clickable") and label
                   and not is_dynamic_text(label) and label not in seen_label):
                 seen_label.add(label)
-                text_lines.append(f"- 文案: {label[:text_limit]}  类型: clickable  页面: {activity[:40]}")
-                if len(text_lines) >= max_text_controls:
-                    break
-        if len(rid_lines) >= max_controls and len(text_lines) >= max_text_controls:
-            break
+                texts.append(f"- 文案: {label[:text_limit]}  类型: clickable  页面: {activity[:40]}")
+        if rids:
+            per_page_rid.append(rids)
+        if texts:
+            per_page_text.append(texts)
+    rid_lines = _quota_split(per_page_rid, max_controls)
+    text_lines = _quota_split(per_page_text, max_text_controls)
     purpose = page_purpose_lines(pages, max_notes=max_page_notes)
     total_purpose = sum(1 for p in pages or [] if (p.get("summary") or "").strip())
     head = ""
@@ -367,13 +705,20 @@ def controls_context_for(package: str, base_dir: Path | str | None = None) -> st
 
 
 def controls_list_for(package: str, base_dir: Path | str | None = None,
-                      max_controls: int = 300) -> list[dict]:
+                      max_controls: int | None = 300) -> list[dict]:
     """索引 → **结构化**控件清单（配置台编辑器的 target 下拉候选，发起人 2026-10-12 P0）。
 
     与 controls_context 同源同口径（同去重、同动态文案过滤、res-id 优先），只是输出
     结构化条目而非 prompt 文本。条目：{"res_id": 非空则为 res-id 候选否则为 text 候选,
     "label": 稳定文案, "page": activity, "clickable": bool}。
     文件缺失/损坏返回 []——调用方按「无清单」降级（前端允许手填并提示，不阻断）。
+
+    ⚠️ **`max_controls=None` 表示不截断**（2026-10-26 加）。默认 300 是给**下拉候选**用的
+    展示上限，但 `case_audit` 的 R18 拿它做**存在性判定**——用截断后的集合判"不在清单里"
+    就是把没截到的页面全判成编造。实测某资讯类 App 图谱 1499 个控件，前 300 条**只覆盖 1 个
+    activity**（首页），于是详情页的 `news_detail_title` / `action_bar_comment` /
+    `title_bar_share_btn` 全被 R18 误报成"不在控件清单"——而这几个 rid 在真机上确实存在
+    （同批用例 3/3 通过）。⇒ **展示要限量，判定不能限量。**
     """
     from .pkgname import safe_package_name
 
@@ -394,6 +739,7 @@ def controls_list_for(package: str, base_dir: Path | str | None = None,
         pages = list(pages.values())
     if not isinstance(pages, list):
         return []
+    full = None if max_controls is None else max_controls
     items: list[dict] = []
     seen: set[tuple] = set()
     for page in pages:
@@ -413,9 +759,9 @@ def controls_list_for(package: str, base_dir: Path | str | None = None,
                 seen.add(("txt", label))
                 items.append({"res_id": "", "label": label[:30],
                               "page": activity[:60], "clickable": True})
-            if len(items) >= max_controls:
+            if full is not None and len(items) >= full:
                 break
-        if len(items) >= max_controls:
+        if full is not None and len(items) >= full:
             break
     return items
 
@@ -465,7 +811,27 @@ def home_labels_for(package: str, base_dir: Path | str | None = None,
     return rids, texts
 
 
-def graph_context(pages: list[dict], max_pages: int = 12) -> str:
+#: 页面用途（summary）在页面结构上下文里的截断上限。describe 要求 summary ≤40 字，
+#: 这里留同样的余量：`max_pages=12` 时最多多出 ~500 字符，相对控件清单仍是很小的一块。
+GRAPH_SUMMARY_CHARS = 40
+
+
+def _one_line(text, limit: int = 0) -> str:
+    """把可能多行/带多余空白的字段压成单行（超长截断加省略号）。
+
+    为什么必须做：这份上下文是**单行拼接**（`" → ".join(...)`），而 `summary` 是模型
+    生成的自由文本——真跑里出现过换行与连续空格。不归一就会把一条记录劈成两行，
+    读起来像两个页面（且长度不可控）。
+    """
+    if not isinstance(text, str):
+        return ""
+    out = re.sub(r"\s+", " ", text).strip()
+    if limit and len(out) > limit:
+        out = out[:limit - 1] + "…"
+    return out
+
+
+def graph_context(pages: list[dict], max_pages: int = 12, with_summary: bool = True) -> str:
     """图谱页面 → 注入 prompt 的页面结构上下文（严格限量防 prompt 膨胀）。
 
     **取哪 12 页比取多少页更重要**（实测的三个缺陷，T54 修正）：
@@ -474,6 +840,16 @@ def graph_context(pages: list[dict], max_pages: int = 12) -> str:
     - **有 parent_action 的页优先**：没有它就没有「点[X] →」导航边，上下文退化成平铺标签
       （实测 79% 的页没有 parent_action ⇒ 默认排序下输出里一条导航边都没有）；
     - **depth 缺失不静默丢弃**：标 `L?`（曾用 `isinstance(depth, int)` 把 5 页静默滤掉）。
+
+    **每页带上它的用途（`summary`）**（2026-10-16）：此前只注入 `title`，等于只告诉 AI
+    「这页叫什么」，不说「这页是干什么的」——而 `summary` 才是 `describe` 花额度换来的
+    业务理解（例："搜索商家与商品，可看历史搜索与热搜榜"）。评测线的零成本核查正是
+    卡在这里：注入内容太弱时，A/B 无论正负都不可解释。缺 `summary`（未跑 describe）时
+    输出与旧版**逐字一致**，不改动未描述图谱的行为。
+
+    `with_summary=False` ⇒ **只给页名**（= 2026-10-16 之前的行为）。这个参数只为
+    **三臂消融**服务：不把"页名"这一层单独跑一臂，就无法证明效果来自 `summary`
+    而不是来自页名（评测总结过的结论缺口）。
     纯函数：不读盘、不看环境变量，便于 CLI / console 共用与单测。
     """
     def dedup_key(p: dict):
@@ -507,6 +883,9 @@ def graph_context(pages: list[dict], max_pages: int = 12) -> str:
         depth = page.get("depth")
         depth_txt = f"L{depth}" if isinstance(depth, int) else "L?"
         suffix = f"{label}({page.get('node_count', 0)} 控件)"
+        summary = _one_line(page.get("summary"), GRAPH_SUMMARY_CHARS) if with_summary else ""
+        if summary:
+            suffix += f"：{summary}"
         parts.append(f"点[{page['parent_action']}] → {depth_txt} {suffix}"
                      if page.get("parent_action") else f"{depth_txt} {suffix}")
     return "【页面结构】" + " → ".join(parts)
@@ -518,9 +897,15 @@ def graph_context_for(package: str, base_dir: Path | str | None = None,
 
     默认**关闭**，`GEN_GRAPH_CONTEXT=1` 开启：这是会改变 AI 生成输出的增强，
     应先做真机 A/B 对照再决定是否默认打开（诚实边界）。
+
+    `GEN_GRAPH_SUMMARY=0` 可**只注入页名、不注入页面用途**（默认 1）。
+    这个开关存在的唯一目的是做**三臂消融**：`off`（无注入）/ `title`（只有页名，
+    即 2026-10-16 之前的行为）/ `full`（页名+用途）。没有它就无法把效果归因到
+    `summary` 本身——页名在改动前就已经注入了（评测记录在案）。
     """
     if os.environ.get("GEN_GRAPH_CONTEXT", "0").strip().lower() not in ("1", "true", "yes"):
         return ""
+    with_summary = os.environ.get("GEN_GRAPH_SUMMARY", "1").strip().lower() in ("1", "true", "yes")
     base = Path(base_dir) if base_dir is not None else Path("artifacts/page_index")
     # A3 同口径（见 controls_context_for）：非法包名按"无图谱"静默降级。
     from .pkgname import safe_package_name
@@ -532,7 +917,8 @@ def graph_context_for(package: str, base_dir: Path | str | None = None,
     index = load_index(base / f"{package}.json")
     if not index:
         return ""
-    return graph_context(index.get("pages", []), max_pages=max_pages)
+    return graph_context(index.get("pages", []), max_pages=max_pages,
+                         with_summary=with_summary)
 
 
 _PERMISSION_PKGS = (
@@ -628,7 +1014,11 @@ def crawl(drv, package: str, max_steps: int = 30, max_pages: int = 15,
                 continue  # 防误点黑名单
             if node.cls == "android.widget.EditText":
                 continue  # 不点输入框（避免污染后续页面）
-            out.append({"bounds": node.bounds, "label": label})
+            # **广告位不点**（2026-10-23）：点信息流广告卡片会把设备跳到应用市场
+            # （`explore` 一轮实测离场 18 次）。判据只看 rid 且刻意窄，见 `safety.is_ad_slot_rid`。
+            if is_ad_slot_rid(node.rid):
+                continue
+            out.append({"bounds": node.bounds, "label": label, "rid": node.rid})
         return out
 
     for _ in range(max_steps):
@@ -639,6 +1029,21 @@ def crawl(drv, package: str, max_steps: int = 30, max_pages: int = 15,
             app = {"package": current.get("package"), "activity": current.get("activity")}
         except Exception:
             pass
+        # **广告落地页不登记**（2026-10-23，与 explore 同一判据）：`mat index` 也会点到
+        # 信息流广告，前台仍是被测 App 自己（`WebAdvertActivityV2`）⇒ 离场检测抓不到。
+        # 实测 tx-news 的图谱 `sources: ["index","explore"]`，53 页里 15 条广告页——
+        # 两个生产入口都得拦，否则"只修 explore"等于没修（同"闸门只有一处实现"的纪律）。
+        if is_ad_landing({"activity": app.get("activity") or ""}):
+            try:
+                drv.press("back")
+            except Exception:
+                break
+            backs += 1
+            if backs >= 3:
+                break          # 回不去（广告页常自带返回按钮拦 back）⇒ 结束，别空转
+            _pause(1.2)
+            continue
+
         key = page_key(xml, package)
         digest = digest_page(xml, package)
         # 0 控件页不入图谱（2026-10-12）：crawl 末段 back 会退到桌面/锁屏等非被测界面，
@@ -674,7 +1079,7 @@ def crawl(drv, package: str, max_steps: int = 30, max_pages: int = 15,
                 break
 
         candidates = [a for a in _clickable_candidates(xml)
-                      if (key, a.get("bounds", "")) not in tried]
+                      if (key, tried_entry(a)) not in tried]
         if not candidates:
             if backs >= 3:
                 break  # 连续 back 无新页，结束
@@ -687,8 +1092,8 @@ def crawl(drv, package: str, max_steps: int = 30, max_pages: int = 15,
             continue
 
         target = candidates[0]
-        tried.add((key, target["bounds"]))
-        tried_by_key.setdefault(key, set()).add(target["bounds"])
+        tried.add((key, tried_entry(target)))
+        tried_by_key.setdefault(key, set()).add(tried_entry(target))
         match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", target["bounds"])
         if match:
             x1, y1, x2, y2 = (int(g) for g in match.groups())
@@ -724,17 +1129,21 @@ def _latest(*values: str | None) -> str | None:
 
 
 def _dedup_entries(entries: list) -> list[dict]:
-    """alt_entries 去重（按 父页 + 到达动作）。"""
+    """alt_entries 去重（按 父页 + 到达动作 + 动作资源 id）。"""
     seen: set[tuple] = set()
     out: list[dict] = []
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-        pair = (entry.get("parent_key"), entry.get("parent_action"))
+        pair = (entry.get("parent_key"), entry.get("parent_action"),
+                entry.get("parent_rid") or "")
         if pair in seen:
             continue
         seen.add(pair)
-        out.append({"parent_key": pair[0], "parent_action": pair[1]})
+        item = {"parent_key": pair[0], "parent_action": pair[1]}
+        if pair[2]:
+            item["parent_rid"] = pair[2]
+        out.append(item)
     return out
 
 
@@ -767,6 +1176,7 @@ def _normalize_page(page: dict, now: str) -> dict:
     normalized.setdefault("depth", None)
     normalized.setdefault("parent_key", None)
     normalized.setdefault("parent_action", None)
+    normalized.setdefault("parent_rid", None)
     normalized.setdefault("controls", [])
     normalized.setdefault("node_count", len(normalized.get("controls") or []))
     normalized.setdefault("screenshot", None)
@@ -807,12 +1217,31 @@ def _merge_page(old: dict, new: dict) -> dict:
         if new.get(field):
             merged[field] = new[field]
 
-    # depth 取更浅；父链随之更新为「更浅到达」的那条
+    # depth 取更浅；父链随之更新为「更浅到达」的那条。
+    # 但更浅到达若**不可重放**（parent_action 为空，back/直达场景），不替换——
+    # 否则一次 back 到达就会把可点击的父链抹成断链（实测 tx-news 深层页 75/99
+    # 因此缺 parent_action、arrival 无法重放）。depth 与父链一体，不换链就不换深度。
     old_depth, new_depth = old.get("depth"), new.get("depth")
     if new_depth is not None and (old_depth is None or new_depth < old_depth):
+        new_ok = hop_replayable(new.get("parent_action"), new.get("parent_rid"))
+        old_ok = hop_replayable(old.get("parent_action"), old.get("parent_rid"))
+        if new_ok or not old_ok or old_depth is None:
+            merged["depth"] = new_depth
+            merged["parent_key"] = new.get("parent_key")
+            merged["parent_action"] = new.get("parent_action")
+            merged["parent_rid"] = new.get("parent_rid")
+    elif (new_depth is not None and new_depth == old_depth
+          and hop_replayable(new.get("parent_action"), new.get("parent_rid"))
+          and not hop_replayable(old.get("parent_action"), old.get("parent_rid"))):
+        # 同深度升级：旧链的到达动作是 iconfont 字符/空且无 rid（重放必死，第 4 层
+        # 实测 0/25），新观测带可重放通道 ⇒ 换链保深度。iconfont 字符看着「有文案」，
+        # 旧的「有 parent_action 就不换」判据会让死链永久占坑——重探永远修不了它。
         merged["depth"] = new_depth
         merged["parent_key"] = new.get("parent_key")
         merged["parent_action"] = new.get("parent_action")
+        merged["parent_rid"] = new.get("parent_rid")
+        merged.pop("alias_of", None)   # 链已换，旧借链留档随链作废（下次 repair 重算）
+        merged.pop("alias_sim", None)
     elif old_depth is not None:
         merged["depth"] = old_depth
     else:
@@ -821,7 +1250,12 @@ def _merge_page(old: dict, new: dict) -> dict:
     merged["first_seen"] = _earliest(old.get("first_seen"), new.get("first_seen"))
     merged["last_seen"] = _latest(old.get("last_seen"), new.get("last_seen"))
     merged["hits"] = int(old.get("hits", 0)) + int(new.get("hits", 0))
-    merged["tried"] = sorted(set(old.get("tried") or []) | set(new.get("tried") or []))
+    # `tried` 并集，但**丢掉老格式条目**（只有坐标、没有 label/rid）：它们不可验证，
+    # 留着只会在每轮被丢弃一次（噪声）——本轮既然重新观测过这页，就让新观测说了算。
+    merged["tried"] = sorted({e for e in (set(old.get("tried") or []) | set(new.get("tried") or []))
+                              if not is_legacy_tried(e)})
+    # 滚动探测"到底"是事实（2026-10-15）：一旦成立跨轮保持——旧页 True、新页 False 不回退
+    merged["scroll_done"] = bool(old.get("scroll_done")) or bool(new.get("scroll_done"))
     # findings 累加（T19）：崩溃/白屏/离场计数是"高风险页"的依据，跨轮只增不减
     old_f, new_f = old.get("findings"), new.get("findings")
     if isinstance(old_f, dict) or isinstance(new_f, dict):

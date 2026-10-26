@@ -63,7 +63,7 @@ def test_ios_sim_boot_also_starts_wda(monkeypatch):
 def test_ios_wda_start_requires_booted_sim(monkeypatch):
     monkeypatch.setattr(ios_wda, "booted_udid", lambda: None)
     ok, detail = ios_wda.start_on_booted(wait_seconds=1)
-    assert not ok and "先启动模拟器" in detail
+    assert not ok and detail == "没有已启动的模拟器或已连接的真机"
 
 
 def test_booted_udid_parses_simctl_output(monkeypatch):
@@ -103,6 +103,32 @@ def test_ios_wda_build_fallback(monkeypatch):
     assert ok and calls == ["src", "build", "start"] and "首次构建" in detail
 
 
+def test_wda_bundle_id_must_end_with_xctrunner(monkeypatch):
+    """快路径的 bundle id 必须是 `...xctrunner`（2026-10-17 实测）。
+
+    这个拼错**不会让任何测试变红**——它只让「装过 WDA 的模拟器免构建秒起」静默退化成
+    "每次构建兜底"（DerivedData 命中所以用户只觉得慢）。实测证据：
+    `simctl launch …xctruntime` 报 failed to launch，`…xctrunner` 返回 pid。
+    ⇒ 必须由断言钉住，否则下次手滑又回来。
+    """
+    assert ios_wda.WDA_BUNDLE_ID.endswith(".xctrunner"), \
+        f"WDA_BUNDLE_ID 后缀错了：{ios_wda.WDA_BUNDLE_ID}（应为 .xctrunner，不是 .xctruntime）"
+
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, timeout):
+        seen.append(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ios_wda, "booted_udid", lambda: "u-1")
+    monkeypatch.setattr(ios_wda, "_run", fake_run)
+    monkeypatch.setattr(ios_wda, "_poll_status", lambda seconds: True)
+    ok, _ = ios_wda.start_on_booted(wait_seconds=1)
+    assert ok, "快路径应就绪"
+    assert seen and seen[0][:4] == ["xcrun", "simctl", "launch", "u-1"], seen
+    assert seen[0][4] == ios_wda.WDA_BUNDLE_ID, "快路径用的 id 必须与常量一致（防两处漂移）"
+
+
 def test_doctor_start_wda_fix_action(monkeypatch, tmp_path):
     monkeypatch.setattr(ios_wda, "start_on_booted",
                         lambda wait_seconds=40: (True, "WDA 已就绪"))
@@ -110,19 +136,51 @@ def test_doctor_start_wda_fix_action(monkeypatch, tmp_path):
     assert code == 200 and body["ok"] and body["detail"] == "WDA 已就绪"
 
     monkeypatch.setattr(ios_wda, "start_on_booted",
-                        lambda wait_seconds=40: (False, "没有已启动的模拟器——先启动模拟器再拉 WDA"))
+                        lambda wait_seconds=40: (False, "没有已启动的模拟器或已连接的真机"))
     code, body = doctor.run_fix("start-wda", tmp_path)
-    assert code == 400 and "先启动模拟器" in body["error"]
+    assert code == 400 and "已连接的真机" in body["error"]
 
 
 def test_doctor_wda_server_row_carries_start_fix(monkeypatch):
+    # 这条测的是 **macOS** 的 WDA 一键启动：非 macOS 上 simctl/devicectl 都不存在，
+    # 实现会收起这个按钮（doctor.ios_checks 的 not supported 分支，2026-10-25 D-1）。
+    # 不钉平台的话它在 Linux CI 上会因「按钮不该出现」而红。
+    monkeypatch.setattr(doctor.sys, "platform", "darwin")
     monkeypatch.setattr(doctor, "_wda_installed", lambda: True)
     monkeypatch.setattr(doctor, "_booted_simulators", lambda: ["iPhone (u) (Booted)"])
     monkeypatch.setattr(doctor, "_wda_status_ok", lambda: False)
+    # 宿主机有没有插 USB 真机会改变修复动作（start-wda ↔ start-wda-device）：
+    # 不打桩的话本机插上 iPhone 后这条测试就红（2026-10-22 实测）
+    monkeypatch.setattr(doctor, "_usb_device_udid", lambda: None)
     rows = {c.id: c.as_dict() for c in doctor.run("ios")}
     assert rows["wda-server"]["fix"] == {"action": "start-wda", "kind": "wda", "label": "启动"}
+
+    # 有 USB 真机 → 修复动作切真机启动
+    monkeypatch.setattr(doctor, "_usb_device_udid", lambda: "TEST-UDID")
+    rows = {c.id: c.as_dict() for c in doctor.run("ios")}
+    assert rows["wda-server"]["fix"]["action"] == "start-wda-device"
 
     # 服务已起 → 不给修复按钮
     monkeypatch.setattr(doctor, "_wda_status_ok", lambda: True)
     rows = {c.id: c.as_dict() for c in doctor.run("ios")}
     assert rows["wda-server"]["fix"] is None
+
+
+def test_start_device_service_survives_unwritable_log(monkeypatch, tmp_path):
+    """日志目录不可写不能阻断真机 WDA 启动（沙箱/权限场景，2026-10-22 实测）。"""
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)  # 只读目录：mkdir/open 都会 EACCES
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    monkeypatch.setattr(ios_wda, "WDA_DEVICE_LOG_DIR", ro / "logs")
+    monkeypatch.setattr(ios_wda.tempfile, "gettempdir", lambda: str(fallback))
+    spawned: dict = {}
+    monkeypatch.setattr(ios_wda.subprocess, "Popen",
+                        lambda cmd, **kw: spawned.update(kw) or mock.Mock())
+
+    ios_wda._start_wda_device_service("TEST-UDID", tmp_path / "x.xctestrun")
+
+    assert spawned, "Popen 必须被调用——日志写不了不是启动失败的理由"
+    assert (fallback / "mat-wda-TEST-UDID.log").exists()
+    ro.chmod(0o700)  # 交还 tmp_path 清理权限

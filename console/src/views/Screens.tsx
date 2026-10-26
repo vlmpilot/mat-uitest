@@ -32,7 +32,10 @@ const STATUS_TAG: Record<string, string> = {
 function deviceJobs(jobs: JobInfo[], sel: Sel): JobInfo[] {
   return jobs.filter((j) => {
     if ((j.platform || "android") !== sel.platform) return false;
-    if (sel.platform === "android" && sel.serial && j.serial && j.serial !== sel.serial) return false;
+    // iOS（2026-10-19）：真机按 udid 对齐；模拟器（serial=null）只看没有 serial 的
+    // 任务——否则真机跑的任务会混进模拟器日志，反之亦然
+    if (sel.platform === "ios") return sel.serial ? j.serial === sel.serial : !j.serial;
+    if (sel.serial && j.serial && j.serial !== sel.serial) return false;
     return true;
   });
 }
@@ -50,8 +53,15 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
     return () => clearInterval(t);
   }, []);
 
-  const online = state.devices.filter((d) => d.state === "device");
-  const notReady = state.devices.filter((d) => d.state !== "device");
+  // 真机 = Android(adb) + iOS USB 真机；iOS 模拟器来自 simctl 清单，不在 state.devices 里
+  // iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 不拉模拟器清单、不进入设备候选
+  const iosSupported = state.ios_supported !== false;
+  const androidOnline = state.devices.filter(
+    (d) => d.state === "device" && (d.platform || "android") === "android");
+  const iosOnline = iosSupported ? state.devices.filter(
+    (d) => d.state === "device" && d.platform === "ios") : [];
+  const notReady = state.devices.filter(
+    (d) => d.state !== "device" && (d.platform || "android") === "android");
 
   // iOS 模拟器清单（发起人 2026-10-12：支持切换模拟器）——15s 轮询保持启动状态新鲜；
   // xcrun 不可用（未装 Xcode）返回空清单，退化为单条 WDA 入口（行为与旧版一致）
@@ -70,21 +80,26 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
     listIosSims().then((d) => setSims(d.simulators)).catch(() => setSims([]));
   }, []);
   useEffect(() => {
+    if (!iosSupported) { setSims([]); return; }
     loadSims();
     const t = setInterval(loadSims, 15000);
     return () => clearInterval(t);
-  }, [loadSims]);
+  }, [loadSims, iosSupported]);
 
-  // 候选设备:在线 Android(带系统版本) + iOS 模拟器(booted 直接投屏,未启动点击即启动)
+  // 候选设备:在线 Android(带系统版本) + iOS USB 真机(serial=udid，直接透传驱动层)
+  // + iOS 模拟器(booted 直接投屏,未启动点击即启动)
   const candidates: Sel[] = [
-    ...online.map((d) => ({ serial: d.serial, platform: "android" as const,
+    ...androidOnline.map((d) => ({ serial: d.serial, platform: "android" as const,
       label: d.model || d.serial,
       sub: d.os ? `Android ${d.os} · ${d.serial}` : d.serial })),
-    ...(sims === null || sims.length === 0
+    ...iosOnline.map((d) => ({ serial: d.serial, platform: "ios" as const,
+      label: d.model || d.serial,
+      sub: `iOS ${d.os || "?"} · USB · ${d.serial}` })),
+    ...(iosSupported ? (sims === null || sims.length === 0
       ? [{ serial: null, platform: "ios" as const, label: "iOS 模拟器 (WDA)" }]
       : sims.map((s) => ({ serial: null, platform: "ios" as const, label: s.name,
           sub: `${s.os} · ${s.state === "booted" ? "已启动" : "未启动"}`,
-          udid: s.udid, booted: s.state === "booted" }))),
+          udid: s.udid, booted: s.state === "booted" }))) : []),
   ];
   const [sel, setSel] = useState<Sel | null>(null);
   const selected = sel ?? candidates[0] ?? null;
@@ -166,10 +181,18 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
       // iOS 模拟器清单未就绪时**不消费深链**——此前直接落入 "ios:wda" 兜底选中,
       // 清单加载后 keyOf 与真实模拟器失配,设备列表永远没有选中高亮(发起人 2026-10-13)
       if (sims === null) return;
-      const b = sims.find((s) => s.state === "booted");
-      setSel(b ? { serial: null, platform: "ios", label: b.name,
-        sub: `${b.os} · 已启动`, udid: b.udid, booted: true }
-        : { serial: null, platform: "ios", label: "iOS 模拟器 (WDA)" });
+      // 真机任务（serial=udid）优先定位到该真机；其余（serial=null）落到已启动模拟器
+      const dev = j.serial
+        ? state.devices.find((d) => d.serial === j.serial && d.platform === "ios") : undefined;
+      if (dev) {
+        setSel({ serial: dev.serial, platform: "ios", label: dev.model || dev.serial,
+          sub: `iOS ${dev.os || "?"} · USB · ${dev.serial}` });
+      } else {
+        const b = sims.find((s) => s.state === "booted");
+        setSel(b ? { serial: null, platform: "ios", label: b.name,
+          sub: `${b.os} · 已启动`, udid: b.udid, booted: true }
+          : { serial: null, platform: "ios", label: "iOS 模拟器 (WDA)" });
+      }
     } else if (j.serial) {
       const d = state.devices.find((x) => x.serial === j.serial);
       setSel({ serial: j.serial, platform: "android", label: `${d?.model || j.serial} · ${j.serial}` });
@@ -183,9 +206,16 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
   // (发起人 2026-10-13:点下方任务要能"切"到它的设备,展开日志仍走行首 +)
   const pickDeviceForJob = (j: JobInfo) => {
     if ((j.platform || "android") === "ios") {
-      const b = sims?.find((s) => s.state === "booted");
-      if (b) setSel({ serial: null, platform: "ios", label: b.name,
-        sub: `${b.os} · 已启动`, udid: b.udid, booted: true });
+      const dev = j.serial
+        ? state.devices.find((d) => d.serial === j.serial && d.platform === "ios") : undefined;
+      if (dev) {
+        setSel({ serial: dev.serial, platform: "ios", label: dev.model || dev.serial,
+          sub: `iOS ${dev.os || "?"} · USB · ${dev.serial}` });
+      } else {
+        const b = sims?.find((s) => s.state === "booted");
+        if (b) setSel({ serial: null, platform: "ios", label: b.name,
+          sub: `${b.os} · 已启动`, udid: b.udid, booted: true });
+      }
     } else if (j.serial) {
       const d = state.devices.find((x) => x.serial === j.serial);
       setSel({ serial: j.serial, platform: "android", label: `${d?.model || j.serial} · ${j.serial}` });
@@ -210,8 +240,8 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
         {/* ① 设备列表（发起人 2026-10-12：真机/模拟器分组展示） */}
         <Card size="small" title="设备列表" style={{ width: 210, flex: "none" }}>
           {candidates.length === 0 && <span style={{ color: "#999" }}>无在线设备——手机开启 USB 调试并插上</span>}
-          {([["真机", candidates.filter((c) => c.platform === "android")],
-             ["模拟器", candidates.filter((c) => c.platform === "ios")]] as const)
+          {([["真机", candidates.filter((c) => c.platform === "android" || c.serial != null)],
+             ["模拟器", candidates.filter((c) => c.platform === "ios" && c.serial == null)]] as const)
             .filter(([, list]) => list.length > 0)
             .map(([title, list]) => (
               <div key={title} style={{ marginBottom: 8 }}>
@@ -354,7 +384,7 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
           placeholder={selected?.platform === "ios"
             ? "bundleId，如 com.example.app" : "包名，如 com.example.app"} />
         <div style={{ marginTop: 8, color: "#8a919f", fontSize: 12 }}>
-          卸载会清除该应用的全部数据，不可恢复；iOS 仅支持模拟器（真机卸载属 P2）。
+          卸载会清除该应用的全部数据，不可恢复；iOS 真机卸载请用 mat run --fresh-install（配置台暂不支持）。
         </div>
       </Modal>
     </>

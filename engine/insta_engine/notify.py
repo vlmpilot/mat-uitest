@@ -28,6 +28,9 @@ def send_run_finished(summary: str, webhook_url: str | None = None,
     url = webhook_url or os.environ.get("MAT_WEBHOOK_URL")
     if not url:
         return False
+    from .offline import is_offline
+    if is_offline():
+        return False  # 离线模式（P0-4）：通知是尽力而为的出网动作，直接跳过
     fmt = (fmt or os.environ.get("MAT_NOTIFY_FORMAT", "generic")).lower()
     try:
         resp = requests.post(url, json=_payload(fmt, summary), timeout=5)

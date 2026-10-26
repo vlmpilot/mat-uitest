@@ -147,27 +147,45 @@ def test_reuse_survives_partial_churn_via_containment(tmp_path: Path) -> None:
         "这正是修复前的老毛病：page_key 精确匹配失效 ⇒ 增量探索整轮白跑")
 
 
-def test_reuse_is_lost_when_every_signal_churns(tmp_path: Path) -> None:
-    """**最坏情况边界**：所有信号都抖动 ⇒ 交集为空 ⇒ 包含度也救不了，增量确实归零。
+def test_reuse_survives_full_churn_via_structural_signals(tmp_path: Path) -> None:
+    """**全部信号都抖动**时的兜底（2026-10-22 起）：靠**结构信号**认回同一页。
 
-    留这条是为了标出兜底路径的**能力边界**，避免把"包含度认页"当成万能：
-    如果页面上一个稳定信号都没有，任何基于信号匹配的方案都无解，只能靠指纹之外的
-    手段（例如坐标 + 层级 + 人工锚点）。
+    这条原来断言"增量归零"（`skipped_by_history == 0`），理由是"页面上一个稳定信号都没有
+    就无解"。某内容社区 App实测把这个前提推翻了：内容页的文案全是动态的、res-id 又全混淆，
+    稳定信号只剩 1~3 个 —— 于是 153 页里 17 页只有 1 个信号、两两近重复 1112 组，
+    探索"每帧一个新页"，深度爆炸后 `stuck`。
 
-    ⚠️ 同时锁住一个**指标陷阱**：`reused_tried`（读回数）会 > 0 而
-    `skipped_by_history`（真跳过数）为 0。只报前者就会把"历史一条没用上"说成"复用了 N 个分支"——
-    CLI 原先正是这么写的（2026-10-01 已修）。两个字段必须分开看。
+    现在 `identities_from_controls` 在信号稀薄（<3）时补一层**与内容无关**的结构信号
+    （控件类名 + 是否可点）⇒ 全抖动也能认回同一页，增量不再归零。
+
+    ⚠️ 仍然锁住那个**指标陷阱**：`reused_tried`（读回数）与 `skipped_by_history`（真跳过数）
+    必须分开看——只报前者会把"历史一条没用上"说成"复用了 N 个分支"（CLI 原先正是这么写的）。
     """
     r1, r2 = _run_twice(tmp_path, churn="full")
     assert r1["steps"] >= 1, "第 1 轮应至少点一次"
     assert r2["prior_pages"], "图谱本身是读回来了的"
     assert r2["reused_tried"] > 0, (
         "res-id 抖动时应当**读回**了历史（图谱里有 tried），读回数为 0 说明夹具没造对")
-    assert r2["skipped_by_history"] == 0, (
-        f"res-id 抖动时第 2 轮居然真正跳过了 {r2['skipped_by_history']} 个分支——"
-        f"那说明还有别的稳定信号在起作用，本测试的前提需要重估")
-    # 关键对照：第 2 轮**没有**因此少点 —— 这正是"越探越深"失效的表现
-    assert r2["steps"] >= 1, "第 2 轮仍然会重复点已试分支（没有被跳过）"
+    assert r2["skipped_by_history"] > 0, (
+        "全抖动时第 2 轮仍未跳过任何分支——结构信号兜底没生效"
+        f"（读回 {r2['reused_tried']} 条 / 跳过 {r2['skipped_by_history']} 个）")
+
+
+def test_structural_fallback_does_not_fire_when_text_is_rich() -> None:
+    """**反向**：文案充足的页面不许被结构信号稀释（否则同布局不同标题的页会被误并）。
+
+    判据是"只在稳定信号 < 3 时补"。这条守住阈值，防止有人把兜底改成无条件生效。
+    """
+    from insta_engine.page_index import identities_from_controls
+
+    rich = [{"text": f"设置项{i}", "class": "android.widget.TextView", "clickable": True}
+            for i in range(4)]
+    assert not any(sig.startswith("cls:") for sig in identities_from_controls(rich))
+
+    thin = [{"text": "", "class": "android.widget.TextView", "clickable": True},
+            {"text": "", "class": "android.widget.ImageView", "clickable": True}]
+    sigs = identities_from_controls(thin)
+    assert sigs and all(sig.startswith("cls:") for sig in sigs), sigs
 
 
 # -- 外部评审 P0-3：mat index 建的图谱必须也带 identities（首次使用主路径兜底） -------
@@ -246,10 +264,14 @@ def test_skip_rate_denominator_is_same_kind_as_numerator(tmp_path):
     assert r2["candidates_considered"] >= r2["skipped_by_history"] >= 0
     if r2["candidates_considered"]:
         assert abs(r2["skip_rate"] - r2["skipped_by_history"] / r2["candidates_considered"]) < 1e-3
-    # 全部分支都试过的页面：检查过的候选全部因历史被跳过 ⇒ 跳过率 1.0，而不是"看起来很低"
-    assert r2["skip_rate"] == 1.0, (
-        f"该夹具下第 2 轮没有新分支可点，跳过率应为 1.0，实际 {r2['skip_rate']}"
-        f"（检查过 {r2['candidates_considered']}、跳过 {r2['skipped_by_history']}）")
+    # ⚠️ 这里原来断言 `skip_rate == 1.0`，**那其实是"同坐标不同控件被误跳"的症状**
+    # （2026-10-22 查出来）：该夹具把三个不同控件都放在 `[0,0][10,10]` 上，而旧 `tried`
+    # 只记坐标 ⇒ 一个都没真试过的控件也因"坐标撞了"被跳过。现在 `tried` 带语义
+    # （`bounds\tlabel\trid`，要求 label/rid 至少一个相同），这类撞坐标**不再跳**。
+    # 所以正确的断言是"口径一致 + 确有跳过 + 不是全跳"。
+    assert 0 < r2["skip_rate"] < 1.0, (
+        f"第 2 轮应只跳过真正试过的分支（不是 0，也不该是 1.0=撞坐标全跳）："
+        f"{r2['skipped_by_history']}/{r2['candidates_considered']} = {r2['skip_rate']}")
 
 
 # -- 分级回退 + 系统弹窗识别 ------------------------------
@@ -610,3 +632,51 @@ def test_degenerate_res_id_falls_back_to_text():
     # **反例**：正常 res-id 仍然优先（不能因为这次改动把 rid 丢了）
     c = identities_from_controls([{"res-id": "com.x:id/search_box", "text": "搜索"}])
     assert c == {"rid:com.x:id/search_box"}, f"正常 rid 应优先，实际 {c}"
+
+
+# -- 渐进加载归并（老覆盖率）+ 选点重放语义加权（2026-10-17，tx-news 重探实测）----------------------
+
+
+def test_prev_coverage_direction_semantics():
+    """老覆盖率的方向语义：渐进加载（老⊆新）≈1；内容轮换/真新页低。"""
+    from insta_engine.explore import _prev_coverage
+    old = frozenset({"a", "b", "c", "d"})
+    grown = frozenset({"a", "b", "c", "d", "e", "f"})       # 渐进加载：老全保留
+    churned = frozenset({"e", "f", "g", "h"})               # 内容轮换：老全没了
+    assert _prev_coverage(old, grown) == 1.0
+    assert _prev_coverage(old, churned) == 0.0
+    assert _prev_coverage(frozenset(), grown) == 0.0        # 空老帧不表态
+
+
+def test_prev_coverage_beats_containment_for_progressive_loading():
+    """containment 被新增信号稀释（20→50 信号 0.4<0.8），老覆盖率 1.0 ——
+    这正是 tx-news 重探 62/75 新页无链的主因（渐进帧被判新页，pending_nav 已清）。"""
+    from insta_engine.explore import _containment, _prev_coverage
+    old = frozenset({f"s{i}" for i in range(20)})
+    new = old | {f"n{i}" for i in range(30)}
+    assert _containment(old, new) < 0.8                     # 旧判据漏归并
+    assert _prev_coverage(old, new) >= 0.9                  # 新判据归并
+
+
+def test_pick_replay_semantics_weighting():
+    """选点重放语义加权：非PUA文案+3 / rid+2 / 两者+5 / PUA且无rid=0。"""
+    from insta_engine.explore import _pick
+    cands = [
+        {"label": "\ue90f", "rid": "", "bounds": "[0,0][10,10]"},     # PUA 无 rid：0
+        {"label": "设置", "rid": "", "bounds": "[0,10][10,20]"},      # 文案：3
+        {"label": "", "rid": "a/btn_x", "bounds": "[0,20][10,30]"},   # rid：2
+        {"label": "我的", "rid": "a/btn_me", "bounds": "[0,30][10,40]"},  # 5
+    ]
+    assert _pick(cands, set(), 0, {}, {})["label"] == "我的"
+    # 去掉最高分，轮转范围只含可重放候选，PUA 垫底
+    rest = [c for c in cands if c["label"] != "我的"]
+    picks = {_pick(rest, set(), i, {}, {})["bounds"] for i in range(8)}
+    assert "[0,0][10,10]" not in picks, "PUA 且无 rid 的控件不应被选中"
+
+
+def test_pick_pua_with_rid_still_replayable():
+    """iconfont 控件带 rid 仍可重放（rid 通道）——不能一刀切降到底。"""
+    from insta_engine.explore import _pick
+    pua_rid = {"label": "\ue9b9", "rid": "a/btn_listener", "bounds": "[0,0][10,10]"}
+    no_sem = {"label": "", "rid": "", "bounds": "[0,20][10,30]"}
+    assert _pick([pua_rid, no_sem], set(), 0, {}, {})["bounds"] == "[0,0][10,10]"

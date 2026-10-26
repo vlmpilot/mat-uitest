@@ -1,5 +1,4 @@
 """MCP server 测试（无需 MCP SDK 也能测的部分：工作区解析/工具注册/越权防护）。"""
-from pathlib import Path
 
 import pytest
 
@@ -8,15 +7,27 @@ from insta_engine.mcp_server import build_server, resolve_workspace
 
 def test_resolve_workspace_three_rules(tmp_path, monkeypatch):
     monkeypatch.delenv("MAT_WORKSPACE", raising=False)
-    # ① 当前目录非工作区 → 回退 ~/.mat/workspace
+    monkeypatch.setenv("MAT_HOME", str(tmp_path / "mat"))  # 隔离兜底播种，别写进真实 home
+    # ① 当前目录非工作区 → 回退默认工作区，且自动铺到开箱即用（示例用例 + prompt 模板）
     monkeypatch.chdir(tmp_path)
-    assert resolve_workspace(None) == (Path.home() / ".mat" / "workspace").resolve()
-    # ② 当前目录已是工作区（有 cases/）→ 用它
+    root = resolve_workspace(None)
+    assert root == (tmp_path / "mat" / "workspace").resolve()
+    assert (root / "cases" / "example-settings.json").exists(), "默认工作区必须自动备好示例用例（免 mat init）"
+    assert (root / "artifacts").is_dir()
+    assert (root / "prompts" / "gen.prompt").exists(), "prompt 模板必须自动播种"
+    # ①' 幂等：已存在的文件不被覆盖（用户改过也不许动）
+    (root / "cases" / "example-settings.json").write_text("{}", encoding="utf-8")
+    resolve_workspace(None)
+    assert (root / "cases" / "example-settings.json").read_text(encoding="utf-8") == "{}"
+    # ② 当前目录已是工作区（有 cases/）→ 用它，且绝不往用户目录里塞文件
     (tmp_path / "cases").mkdir()
     monkeypatch.chdir(tmp_path)
     assert resolve_workspace(None) == tmp_path.resolve()
-    # ③ 显式指定优先
-    assert resolve_workspace(str(tmp_path / "custom")) == (tmp_path / "custom").resolve()
+    assert not (tmp_path / "prompts").exists(), "用户自己的工作区不得代铺"
+    # ③ 显式指定优先，同样不播种
+    custom = resolve_workspace(str(tmp_path / "custom"))
+    assert custom == (tmp_path / "custom").resolve()
+    assert not (custom / "cases").exists()
 
 
 def test_build_server_registers_eleven_tools(tmp_path):

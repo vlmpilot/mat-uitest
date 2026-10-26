@@ -11,13 +11,12 @@ AI 移动端 App UI 自动化测试工具——执行引擎与 CLI（命令 `mat
 ```bash
 # Windows
 py -m pip install --user mat-uitest
-# macOS / Linux（没有 pipx 时先 brew install pipx / sudo apt install pipx）
-pipx install mat-uitest && pipx ensurepath
-# 不想装 brew？改用 uv（不需要 root）：https://astral.sh/uv/install.sh 装 uv 后
-#   uv tool install mat-uitest && uv tool update-shell   （最后一步把 ~/.local/bin 加进 PATH，重开终端生效）
+# macOS / Linux（推荐：uv 自动解决 Python 3.11+，不需要预装；已有 uv 跳过第一行）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install mat-uitest && uv tool update-shell   # 最后一步把 ~/.local/bin 加进 PATH，重开终端生效
+# 已装 pipx（等价备选）：pipx install mat-uitest && pipx ensurepath
 
-mat doctor   # 环境自检
-mat init     # 初始化工作区
+mat doctor   # 环境自检（首次启动控制台会自动建好工作区与示例用例）
 ```
 
-文档：https://github.com/vlmpilot/mat-uitest/tree/main/docs （含产品使用手册 docs/13）
+文档：https://mobileaitest.com/manual.html

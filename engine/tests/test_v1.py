@@ -18,13 +18,8 @@ from PIL import Image
 from insta_engine.credentials import CredentialStore
 from insta_engine.dsl import Locator, LocatorStrategy, TestCase
 from insta_engine.heals import apply_heals, collect_proposals
-from insta_engine.quota import (
-    FREE_GEN_LIMIT,
-    FREE_VISION_LIMIT,
-    PRO_VISION_LIMIT,
-    QuotaExceeded,
-    UsageStore,
-)
+from insta_engine.quota import QuotaExceeded, UsageStore
+from insta_engine.quota_policy import plan_limits
 from insta_engine.report import render_html, render_junit_xml
 from insta_engine.runner import Runner
 from insta_engine.web_api import runtime as web_server_rt
@@ -36,7 +31,8 @@ REPO = Path(__file__).resolve().parents[2]
 # 用**测试专用密钥**，因此这里造出的码在真实环境里是无效的。
 # 诚实说明：签名算法与校验端同源，本仓库天然包含可复现签名的代码——这是设计取舍
 #（licensing.py 已写明该机制"只用于提高门槛"），真正的边界在服务端校验。
-# 变量名刻意不叫 *_SECRET：导出脚本的密钥自查会把「secret = <16位以上字符串>」当成疑似密钥。
+# 变量名刻意避开敏感词形状：发布链路的密钥自查会把这类赋值形状当硬编码密钥拦下
+#（fail-closed 是扫描该有的行为；invite.py 有同款先例——要改的是命名/措辞，不是扫描）
 TEST_LICENSE_KEY = "test-only"
 
 
@@ -173,11 +169,13 @@ class _StubClient:
     """最小 GenClient 桩：按脚本吐文本，并记录每次收到的 messages。"""
 
     base_url = "http://stub"
-    api_key = "k"
     model = "m"
 
     def __init__(self, outputs):
         self.outputs = list(outputs)
+        # 桩的 api_key 是 1 字符假值，不触发导出护栏的秘密扫描（需 ≥16 字符），
+        # 直接赋值即可——不要用运行时拼装绕过护栏（ruff B010，且架空护栏威慑力）。
+        self.api_key = "k"
         self.seen: list[list[dict]] = []
 
     def complete_raw_text(self, messages, context="生成"):
@@ -275,7 +273,7 @@ def test_local_payload_has_json_mode_and_degrades(monkeypatch):
         return _Resp(400 if "response_format" in json else 200)
 
     monkeypatch.setattr(ai_client.requests, "post", fake_post)
-    client = ai_client.GenClient(base_url="http://stub", api_key="k", model="m")
+    client = ai_client.GenClient("http://stub", "k", "m")
     assert client.complete_raw_text([{"role": "user", "content": "x"}]) == "{}"
     assert payloads[0].get("response_format") == {"type": "json_object"}, "首次应带约束"
     assert "response_format" not in payloads[1], "400 后应去掉该字段重试"
@@ -305,7 +303,7 @@ def test_polish_task_strips_json_mode(monkeypatch):
 
     monkeypatch.setattr(ai_client.requests, "post",
                         lambda url, **kw: (payloads.append(dict(kw["json"])), _Resp())[1])
-    client = ai_client.GenClient(base_url="http://stub", api_key="k", model="m")
+    client = ai_client.GenClient("http://stub", "k", "m")
     assert client.complete_raw_text(
         [{"role": "user", "content": "x"}], task="polish") == "润色后的文本"
     assert "response_format" not in payloads[0], "polish 任务不该带 json_object"
@@ -337,12 +335,13 @@ class _StubClient:
     """最小 GenClient 桩：按脚本吐文本，并记录每次收到的 messages。"""
 
     base_url = "http://stub"
-    api_key = "k"
     model = "m"
 
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.seen: list[list[dict]] = []
+        # 同上：1 字符假值不触发秘密扫描，直接赋值。
+        self.api_key = "k"
 
     def complete_raw_text(self, messages, context="生成"):
         self.seen.append(messages)
@@ -657,66 +656,74 @@ def test_credential_store_vars(tmp_path):
 
 # -- 配额（体验版 50 次/月） ----------------------------------------
 
-def test_quota_free_limit_and_rollover(tmp_path, monkeypatch):
+def test_quota_gen_counts_but_never_blocks(tmp_path, monkeypatch):
+    """P0-2：生成只计数不拦截（官方代理 429 权威 / BYOK 不限）；月度滚动照旧归零。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     store = UsageStore(tmp_path / "usage.json")
-    for _ in range(FREE_GEN_LIMIT):  # 体验版 50 次/月（发起人 2026-10-14 定，无欢迎额度双轨）
-        store.check_gen()
-    with pytest.raises(QuotaExceeded):
-        store.check_gen()
+    free_gen = plan_limits("free")["gen"]
+    for _ in range(free_gen):
+        store.consume()  # 旧 check_gen = 预检+核销；现在只剩核销
+    snap = store.snapshot()
+    assert snap["gen_count"] == free_gen
+    assert snap["gen_limit"] == free_gen and snap["gen_enforced"] is False
+    store.consume()  # 超过策略参考值也不拦
+    assert store.snapshot()["gen_count"] == free_gen + 1
 
-    # 月份滚动重置：计数清零、额度恢复满额
+    # 月份滚动重置：计数清零（展示口径，不存在"恢复额度"语义了）
     data = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
     data["month"] = "2000-01"
     (tmp_path / "usage.json").write_text(json.dumps(data), encoding="utf-8")
-    for _ in range(FREE_GEN_LIMIT):
-        store.check_gen()
-    with pytest.raises(QuotaExceeded):
-        store.check_gen()
+    assert store.snapshot()["gen_count"] == 0
 
 
-def test_quota_pro_unlimited(tmp_path, monkeypatch):
+def test_quota_pro_gen_display_and_no_block(tmp_path, monkeypatch):
+    """Pro 的生成额度只是展示口径（策略 2000）；本地永不拦截。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     monkeypatch.setenv("MAT_LICENSE_SECRET", TEST_LICENSE_KEY)
     from insta_engine.licensing import activate
     activate(mint_test_code("pro", months=1))  # 真签名激活（v0.4.0：license 需 HMAC 校验）
     store = UsageStore(tmp_path / "usage.json")
-    for _ in range(FREE_GEN_LIMIT + 5):
-        store.check_gen()
-    assert store.snapshot()["gen_limit"] is None
+    for _ in range(10):
+        store.consume()
+    snap = store.snapshot()
+    assert snap["plan"] == "pro"
+    assert snap["gen_limit"] == plan_limits("pro")["gen"] == 2000
+    assert snap["gen_enforced"] is False
 
 
 # -- 视觉兜底配额（体验版 20、标准版 300 次/月） -----------------------
 
 def test_quota_free_vision_limit(tmp_path, monkeypatch):
-    """体验版视觉兜底 20 次/月：用尽后抛 QuotaExceeded（调用方负责优雅降级）。"""
+    """体验版视觉兜底 50 次/月（policy/quota.json）：用尽后抛 QuotaExceeded（调用方优雅降级）。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     store = UsageStore(tmp_path / "usage.json")
-    for _ in range(FREE_VISION_LIMIT):
+    free_vision = plan_limits("free")["vision"]
+    for _ in range(free_vision):
         store.check_vision()
     with pytest.raises(QuotaExceeded):
         store.check_vision()
     snap = store.snapshot()
-    assert snap["vision_count"] == FREE_VISION_LIMIT
-    assert snap["vision_limit"] == FREE_VISION_LIMIT
+    assert snap["vision_count"] == free_vision
+    assert snap["vision_limit"] == free_vision
     assert snap["gen_count"] == 0  # 视觉核销不影响生成计数
 
 
 def test_quota_pro_vision_limit_300(tmp_path, monkeypatch):
-    """标准版视觉兜底 300 次/月（发起人 2026-10-14 定）：vision_limit 不再是 None，用尽后抛 QuotaExceeded。"""
+    """标准版视觉兜底 300 次/月（策略文件）：vision_limit 不再是 None，用尽后抛 QuotaExceeded。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     monkeypatch.setenv("MAT_LICENSE_SECRET", TEST_LICENSE_KEY)
     from insta_engine.licensing import activate
     activate(mint_test_code("pro", months=1))  # 真签名激活
     store = UsageStore(tmp_path / "usage.json")
-    assert store.snapshot()["vision_limit"] == PRO_VISION_LIMIT
-    for _ in range(PRO_VISION_LIMIT):
+    pro_vision = plan_limits("pro")["vision"]
+    assert store.snapshot()["vision_limit"] == pro_vision == 300
+    for _ in range(pro_vision):
         store.check_vision()
     with pytest.raises(QuotaExceeded) as exc:
         store.check_vision()
     assert "300" in str(exc.value)  # 触顶文案说明标准版月额度
     snap = store.snapshot()
-    assert snap["vision_count"] == PRO_VISION_LIMIT
+    assert snap["vision_count"] == pro_vision
     assert snap["gen_count"] == 0
 
 
@@ -742,7 +749,7 @@ def test_quota_vision_rollover_zeroes_both_counters(tmp_path, monkeypatch):
     """月度滚动：gen_count 与 vision_count 一并归零（两个计数同源同生命周期）。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     store = UsageStore(tmp_path / "usage.json")
-    store.check_gen()
+    store.consume()
     store.check_vision()
 
     data = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
@@ -800,16 +807,23 @@ def test_vision_before_call_exception_propagates(tmp_path):
 
 
 def test_runner_vision_quota_exhausted_degrades_gracefully(tmp_path, monkeypatch):
-    """额度耗尽时优雅降级：步骤退回定位失败（locate-fail），不中断本地执行。"""
+    """官方代理下额度耗尽优雅降级：步骤退回定位失败（locate-fail），不中断本地执行。
+
+    ⚠️ 额度闸**只对官方代理生效**（2026-10-23）：自带 API Key 的 token 由用户自己的服务商
+    计费，不再按平台额度拦截（对照见 `test_vision_quota.py::test_vision_locate_byok_ignores_quota`）。
+    所以这里必须显式设为 server 模式，否则测到的是 BYOK 路径。
+    """
     from insta_engine.runner import Runner
 
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
+    monkeypatch.setenv("GEN_PROMPT_MODE", "server")
     monkeypatch.setenv("GEN_BASE_URL", "https://example.invalid/v1")
     monkeypatch.setenv("GEN_API_KEY", "test-key")
     monkeypatch.setenv("GEN_VL_MODEL", "fake-vl")
     month = datetime.now(UTC).strftime("%Y-%m")
     (tmp_path / "usage.json").write_text(
-        json.dumps({"month": month, "gen_count": 0, "vision_count": FREE_VISION_LIMIT}),
+        json.dumps({"month": month, "gen_count": 0,
+                    "vision_count": plan_limits("free")["vision"]}),
         encoding="utf-8",
     )
 
@@ -827,7 +841,7 @@ def test_runner_vision_quota_exhausted_degrades_gracefully(tmp_path, monkeypatch
         "steps": [{"id": "s1", "intent": "点击我的", "action": "tap", "onFailure": "heal",
                    "target": {"strategy": "text", "value": "不存在"}}],
     })
-    # vision_client=None → 走环境配置路径，按免费档额度核销
+    # vision_client=None → 走环境配置路径，官方代理按档位额度核销
     runner = Runner(VisionDrv(), tmp_path, history_path=tmp_path / "h.jsonl")
     run = runner.run(case)
     step = run.steps[0]
@@ -965,6 +979,44 @@ def test_sweep_stale_jobs_marks_timeout():
         with web_server._JOB_LOCK:
             assert web_server._JOBS[fresh]["status"] == "running"
             del web_server._JOBS[fresh]
+    finally:
+        with web_server._JOB_LOCK:
+            web_server._JOBS.pop(job_id, None)
+
+
+def test_sweep_counts_inactivity_not_total_duration():
+    """2026-10-21 修正：跑满 15 分钟但一直在推进的任务不能被误杀（旧实现按 started_ts）。"""
+    from insta_engine import web_server
+
+    job_id = "longrunning"
+    with web_server._JOB_LOCK:
+        web_server._JOBS[job_id] = {"kind": "import", "status": "running",
+                                    "started_ts": time.time() - 40 * 60,
+                                    "last_activity_ts": time.time() - 30,
+                                    "events": [], "seq": 0}
+    try:
+        assert web_server.sweep_stale_jobs(timeout_seconds=15 * 60) == 0
+        with web_server._JOB_LOCK:
+            assert web_server._JOBS[job_id]["status"] == "running"
+    finally:
+        with web_server._JOB_LOCK:
+            web_server._JOBS.pop(job_id, None)
+
+
+def test_sweep_timeout_hint_is_kind_aware():
+    """导入任务超时不能给设备归因（导入不碰设备）。"""
+    from insta_engine import web_server
+
+    job_id = "staleimport"
+    with web_server._JOB_LOCK:
+        web_server._JOBS[job_id] = {"kind": "import", "status": "running",
+                                    "started_ts": time.time() - 30 * 60,
+                                    "events": [], "seq": 0}
+    try:
+        assert web_server.sweep_stale_jobs(timeout_seconds=15 * 60) >= 1
+        with web_server._JOB_LOCK:
+            err = web_server._JOBS[job_id]["error"]
+        assert "AI 转换" in err and "解锁" not in err and "adb" not in err
     finally:
         with web_server._JOB_LOCK:
             web_server._JOBS.pop(job_id, None)
@@ -1455,15 +1507,41 @@ def test_explore_respects_max_depth(tmp_path):
     assert max(depths) <= 1  # L2 从未到达：深度上限阻止下钻
 
 
+def test_explore_force_stops_app_at_session_start(tmp_path):
+    """会话开始先 app_stop 再拉前台（根锚定）：`app_start` 对后台任务是热恢复，
+    App 停在遗留页时会把遗留页当根页，整棵子树挂在「从 launch 不可达」的根下
+    （真机教训 2026-10-16：106 条链全挂在遗留播客页根下，重放全灭）。"""
+    from insta_engine.explore import explore
+
+    calls: list[str] = []
+
+    class ColdDriver(FakeExploreDriver):
+        def app_stop(self, package):
+            calls.append("stop")
+
+        def app_start(self, package):
+            calls.append("start")
+            super().app_start(package)
+
+    explore(ColdDriver(), "com.x", minutes=0.05, max_steps=6,
+            artifacts_dir=tmp_path, max_depth=3, sleep_scale=0.01)
+    assert calls and calls[0] == "stop" and "start" in calls
+
+
 # -- 页面图谱沉淀（schema v2 / 并集合并 / 增量探索） ----
 
 def test_is_dynamic_text_detection():
     from insta_engine.page_index import is_dynamic_text
 
     for dynamic in ("3", "1,234", "50%", "581条", "8千+", "649m", "12:30",
-                    "2026-09-28", "刚刚", "3 分钟前"):
+                    "2026-09-28", "刚刚", "3 分钟前",
+                    # 「标签 + 计数」（2026-10-22 某内容社区 App）：数字会变，整串既不是纯数字
+                    # 也不够长 ⇒ 旧规则全放过，导致同一个详情页每次进来都变成"新页"
+                    "点赞 1336", "收藏135", "评论 409", "粉丝 1.2万", "1/6"):
         assert is_dynamic_text(dynamic), dynamic
-    for stable in ("登录", "搜索", "去B", "bottom-tab", "我的订单", "R_筛选_筛选栏_入口_点击"):
+    # ⚠️ 反向：**纯标签**必须稳定——`收藏`/`评论` 是入口，抹掉会把整页信号清空
+    for stable in ("登录", "搜索", "去B", "bottom-tab", "我的订单", "R_筛选_筛选栏_入口_点击",
+                   "关注", "收藏", "评论", "评论框"):
         assert not is_dynamic_text(stable), stable
     assert is_dynamic_text("这是一段很长的商品描述文案" * 4)  # 长文本按内容处理（≥40 字符）
     assert not is_dynamic_text("")
@@ -1499,16 +1577,20 @@ def test_load_index_upgrades_v1_flat_table(tmp_path):
 def test_merge_pages_union_semantics():
     from insta_engine.page_index import merge_pages, new_index
 
+    # `tried` 条目自 2026-10-22 起带语义（`bounds\tlabel\trid`）；老格式（只有坐标）在合并时
+    # 会被丢掉（不可验证），所以这里必须用新格式来测"并集"这件事。
+    T1, T2 = "[0,0][10,10]\t去A\tcom.x:id/a", "[0,20][10,30]\t去B\tcom.x:id/b"
+
     index = new_index("com.x")
     merge_pages(index, [{
         "page_key": "k1", "depth": 2, "parent_key": "k0", "parent_action": "深路径",
-        "controls": [{"res-id": "a"}], "tried": ["b2"], "hits": 1,
+        "controls": [{"res-id": "a"}], "tried": [T1], "hits": 1,
         "first_seen": "2026-09-01T00:00:00+00:00", "last_seen": "2026-09-01T00:00:00+00:00",
         "step_health": {"tap|深路径": {"ok": 1, "fail": 0}},
     }], source="explore")
     merge_pages(index, [{
         "page_key": "k1", "depth": 1, "parent_key": "k9", "parent_action": "浅路径",
-        "controls": [{"res-id": "a"}, {"res-id": "b"}], "tried": ["b1"], "hits": 1,
+        "controls": [{"res-id": "a"}, {"res-id": "b"}], "tried": [T2], "hits": 1,
         "first_seen": "2026-09-05T00:00:00+00:00", "last_seen": "2026-09-05T00:00:00+00:00",
         "alt_entries": [{"parent_key": "k9", "parent_action": "浅路径"}],
         "step_health": {"tap|浅路径": {"ok": 0, "fail": 2}},
@@ -1518,7 +1600,7 @@ def test_merge_pages_union_semantics():
     page = index["pages"][0]
     assert page["depth"] == 1 and page["parent_action"] == "浅路径"    # 取更浅，父链随之更新
     assert page["hits"] == 2                                        # 计数累加
-    assert page["tried"] == ["b1", "b2"]                            # 并集
+    assert page["tried"] == sorted([T1, T2])                        # 并集
     assert page["node_count"] == 2                                  # 控件取最新
     assert page["first_seen"] == "2026-09-01T00:00:00+00:00"         # 最早
     assert page["last_seen"] == "2026-09-05T00:00:00+00:00"          # 最新
@@ -2254,3 +2336,55 @@ def test_api_activate_roundtrip(tmp_path, monkeypatch):
     assert bad_code == 400 and "error" in bad
     missing_code, _ = web_server.api_activate({})
     assert missing_code == 400
+
+
+
+def test_controls_context_rotates_across_pages():
+    """2026-10-26：配额必须**按页轮转**，不能被第一个页面吃光。
+
+    真机背景：某资讯类 App 图谱 24 页 / 1499 控件，首页 600 个控件把 120 条 res-id 配额
+    全部占满 ⇒ 模型只看到 1 页，却被要求写"点进详情页 / 进搜索结果页"的定位值——
+    它没见过那些页面的控件，只能凭先验编。一次同代重测的 49 次失败里 41 次是"目标值根本不在
+    候选集"，机制同源。轮转**不增加 token 预算**，只改变预算花在哪些页上。
+    """
+    from insta_engine.page_index import controls_context
+
+    big = {"activity": "HomeActivity",
+           "controls": [{"res-id": f"com.x:id/home_{i}", "text": f"首页{i}"} for i in range(400)]}
+    small = {"activity": "DetailActivity",
+             "controls": [{"res-id": "com.x:id/detail_title", "text": "详情标题"}]}
+    context = controls_context([big, small])
+    assert "detail_title" in context, "第二个页面必须也进清单（否则模型只能编详情页控件）"
+    assert context.count("- res-id:") == 120, "总预算不变，仍是 120 条"
+
+
+def test_controls_context_keeps_depth_on_the_first_page():
+    """广度拿到之后必须**把深度补回来**——纯轮转是过冲。
+
+    2026-10-26 真机标定（某资讯类 App 24 页 / 1499 控件）：纯轮转让首页只剩 5 条，
+    首页控件（频道栏/搜索框/列表项）被挤出清单，16 条用例的定位值召回 21/29 → **12/29**。
+    一半预算轮转（第 2 页必须露面）、一半按页顺序补深度（首页不能只剩前几条）。
+    """
+    from insta_engine.page_index import controls_context
+
+    big = {"activity": "HomeActivity",
+           "controls": [{"res-id": f"com.x:id/home_{i}", "text": f"首页{i}"} for i in range(400)]}
+    small = {"activity": "DetailActivity",
+             "controls": [{"res-id": "com.x:id/detail_title", "text": "详情标题"}]}
+    context = controls_context([big, small])
+    assert "detail_title" in context, "广度：第二个页面必须露面"
+    assert "home_59" in context, "深度：首页不能只剩轮转那几条"
+    assert context.count("- res-id:") == 120, "总预算不变，仍是 120 条"
+
+
+def test_controls_context_rotation_keeps_budget_per_page():
+    """轮转不等于"每页平均"——多页都还有候选时会一直轮到预算用完。"""
+    from insta_engine.page_index import controls_context
+
+    pages = [{"activity": f"A{i}", "controls": [{"res-id": f"com.x:id/p{i}_{j}"}
+                                                for j in range(10)]} for i in range(5)]
+    context = controls_context(pages, max_controls=20)
+    rid_lines = [ln for ln in context.splitlines() if ln.startswith("- res-id:")]
+    assert len(rid_lines) == 20
+    for i in range(5):
+        assert f"p{i}_0" in context, f"第 {i} 页一条都没进"

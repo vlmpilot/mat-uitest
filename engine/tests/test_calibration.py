@@ -349,3 +349,74 @@ def test_build_items_include_passed_lists_passed_steps(tmp_path: Path) -> None:
     items = calibration.build_items(payload, tmp_path, include_passed=True)
     assert [i["step_id"] for i in items] == ["s1", "s2"]
     assert items[0]["status"] == "passed"
+
+
+# -- Runner 的工作区基准（2026-10-20 评审 P1-3）-------------------------------------
+
+class _MiniDriver:
+    """最小桩：只够跑一条 wait+exists 断言的 failing case（校准规则读取链路用）。"""
+
+    serial = None
+
+    def dump(self) -> str:
+        return "<hierarchy stable/>"
+
+    def screenshot(self, path: str) -> None:
+        Path(path).write_bytes(b"\x89PNG fake")
+
+    def press(self, key: str) -> None:
+        pass
+
+    def find(self, by, value, timeout):
+        raise AttributeError("无 raw——等价元素缺失")
+
+    def find_xpath(self, expr, timeout):
+        raise AttributeError("无 raw")
+
+    def fallback_input(self, text: str) -> bool:
+        return False
+
+
+def test_runner_reads_calibration_rules_from_workspace_root(tmp_path, monkeypatch) -> None:
+    """评审 P1-3：控制台可 --root 指向他处、/api/workspace/switch 可在线换根，进程 cwd
+    不变。Runner 必须按 workspace_root 读校准规则；若退回 Path.cwd()，控制台写入的
+    规则会静默失效（退化为内置规则且毫无提示）。"""
+    from insta_engine.dsl import TestCase
+    from insta_engine.runner import Runner
+
+    ws = tmp_path / "ws"
+    (ws / "calibration").mkdir(parents=True)
+    calibration.save_rules(ws, [{"when": {"category": "assert-fail", "error_contains": "absent"},
+                                 "set_category": "app-crash"}], source="test")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # cwd ≠ 工作区（控制台切换工作区后的真实形态）
+
+    case = TestCase.model_validate({
+        "caseId": "c_ws", "name": "工作区基准", "target": {"package": "com.insta.demo"},
+        "steps": [{"id": "s1", "intent": "校验", "action": "wait", "params": {"ms": 10},
+                   "timeoutMs": 400,
+                   "assertions": [{"type": "exists",
+                                   "target": {"strategy": "res-id",
+                                              "value": "com.insta.demo:id/absent"}}]}]})
+    run = Runner(_MiniDriver(), tmp_path / "art", workspace_root=ws).run(case)
+    assert run.status == "failed"
+    assert run.steps[0].category == "app-crash", (
+        f"校准规则未生效（实际 {run.steps[0].category}）——runner 仍在按 cwd 读规则")
+
+
+def test_runner_arrival_index_path_uses_workspace_root(tmp_path, monkeypatch) -> None:
+    """同族第二点：_ensure_arrival 的图谱路径也必须按 workspace_root 解析。"""
+    from insta_engine.dsl import TestCase
+    from insta_engine.runner import Runner
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    case = TestCase.model_validate({
+        "caseId": "c_ws2", "name": "图谱基准", "target": {"package": "com.insta.demo"},
+        "steps": [{"id": "s1", "intent": "等待", "action": "wait", "params": {"ms": 10}}]})
+    ev = Runner(_MiniDriver(), tmp_path / "art", workspace_root=ws)._ensure_arrival(case)
+    assert str(ws) in ev.get("reason", ""), f"图谱路径未指向 workspace_root: {ev}"

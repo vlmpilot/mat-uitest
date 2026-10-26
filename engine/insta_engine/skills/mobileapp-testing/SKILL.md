@@ -8,14 +8,52 @@ license: Complete terms in LICENSE.txt
 
 To test Android apps on a connected device, use the `mat` CLI. Every command is self-documenting: run `mat --help` first, and `<command> --help` before inventing flags. Do not read the engine source — the CLI is the interface.
 
-## Prerequisites
+## Setup (agent-executable — run this first; covers not-installed and already-installed)
 
-- One Android device with USB debugging enabled (or an emulator), `adb` available
-- Python ≥ 3.11
-- MAT CLI — **Windows**: `py -m pip install --user mat-uitest`; **macOS / Linux**: `pipx install mat-uitest && pipx ensurepath` (or, without brew: install uv then `uv tool install mat-uitest && uv tool update-shell`)
-- Verify once: `mat doctor` — it prints what is missing and how to fix it
+Version floor: **mat-uitest ≥ 0.7.0**; the `mat summary` digest command used
+throughout this skill needs **≥ 0.7.1** — always install the latest available.
+Human-only prerequisite: an Android device
+with USB debugging enabled (or an emulator) plugged in — everything else below the
+agent can do itself.
 
-**Limited**: iOS — **simulator preview only** (`mat run --platform ios`; needs the `[ios]` extra and WDA on localhost:8100). Not available on iOS: real device, `index` / `explore` / `arrival`.
+```bash
+# 1) Already installed? → verify and move on
+command -v mat && mat doctor
+
+# 2) Not installed → uv route (recommended: ships its own Python ≥3.11,
+#    so an old system Python doesn't matter)
+curl -LsSf https://astral.sh/uv/install.sh | sh    # skip if `command -v uv` succeeds
+export PATH="$HOME/.local/bin:$PATH"   # CRITICAL, same-session PATH —
+                                       # `uv tool update-shell` only affects FUTURE shells,
+                                       # so without this line the just-installed `mat`
+                                       # is invisible in the current session
+uv tool install mat-uitest
+mat doctor
+
+# 3) `mat` still not found (unusual shell setups) → run without installing:
+uvx --from mat-uitest mat <args...>
+
+# 4) Alternatives, only if you prefer them AND system Python ≥ 3.11:
+pipx install mat-uitest && pipx ensurepath
+py -m pip install --user mat-uitest                   # Windows
+```
+
+**adb missing** (`mat doctor` reports it) — self-installable:
+
+```bash
+# macOS (Linux: same URL with `linux` instead of `darwin`)
+curl -sL -o /tmp/pt.zip https://dl.google.com/android/repository/platform-tools-latest-darwin.zip \
+  && unzip -q /tmp/pt.zip -d "$HOME/.local" && export PATH="$HOME/.local/platform-tools:$PATH"
+adb version
+```
+
+(Windows: Android Studio's SDK Manager, or `choco install adb`.)
+
+**Workspace bootstrap**: run `mat init` once in the project where tests will live —
+it creates `cases/` (with an example case) and `artifacts/`. Every `mat run
+cases/<file>.json` path below assumes this layout.
+
+**iOS (beta)**: simulator (`mat run --platform ios`; needs the `[ios]` extra and WDA on `localhost:8100`) **and USB real device** — run `mat ios-setup` first (Xcode signed-in account, device trusted, one ⌘U build; `--start` also builds and launches WDA). Real-device limits: **USB only**, device must stay **unlocked** with auto-lock set to **Never**, free-provisioning cert expires in **7 days**, no `--record`. **Blocked on iOS** (do not attempt): `index` / `explore` / `arrival` — Android is the full-capability platform.
 **Not supported** (do not attempt): cloud device
 farms, web apps (for web testing see Anthropic's webapp-testing skill).
 
@@ -28,13 +66,19 @@ farms, web apps (for web testing see Anthropic's webapp-testing skill).
 ```
 Task → Is there an existing test case (cases/*.json)?
     ├─ Yes → mat run cases/<file>.json
-    │        → python -m insta_engine.run_summary <run_dir>   (see below)
+    │        → mat summary <run_dir>   (≤40-line digest; see below)
     │
     ├─ No, but you can describe the flow in one sentence
     │        → mat gen "<description>" --package <pkg> --calibrate
     │
     └─ No idea what to test → mat explore <pkg> --minutes 2
 ```
+
+**AI capability tiers** (what a fresh install can do): with **no API key** configured,
+`run` / `explore` / `index` / `heal` / `devices` / `summary` all work — execution,
+evidence, and locator self-healing are local. `gen` and `diagnose` need a key: see
+the "AI 接入" item in `mat doctor` (your own OpenAI-compatible key in the workspace
+`.env`, or the official proxy token).
 
 **Before generating cases or relying on them long-term**: run `mat index <pkg>`
 once to crawl the app into a page graph. With an index, locator renames — the
@@ -57,8 +101,12 @@ rename breaks your cases.
    reading it will blow up your context window. Read `<run_dir>/run.json`
    (≈6 KB) instead — or better, get a ≤40-line digest:
    ```bash
-   python -m insta_engine.run_summary <run_dir>
+   mat summary <run_dir>          # use this CLI form; `python -m insta_engine.run_summary`
+                                   # only works when insta_engine is importable by the
+                                   # current Python (NOT the case under uv tool / pipx)
    ```
+   `mat summary` ships from mat-uitest **0.7.1**; if `mat --version` is older, it
+   does not exist yet — read `run.json` directly in that case.
    `run.json` carries `run.status`, `run.step_success_rate`,
    `run.failed_categories`, and per-step `status / category / error / warning /
    screenshot / logcat_file`. Every step carries a **rule-based five-way
@@ -74,6 +122,14 @@ rename breaks your cases.
 4. **Self-healing produces proposals, not rewrites**: `mat heal list <run_dir>`
    shows them; `mat heal apply` writes `*-healed.json` and **never overwrites
    the original case**. Review before applying.
+5. **Give the human a live view (not for you)**: while a long job runs, the
+   user can watch it — if a local console session exists (`mat console`),
+   the run/explore API responses carry a `live` field (`/live/<job_id>`).
+   Surface it as a clickable link — same base URL you called the API on
+   (`mat console` defaults to `http://127.0.0.1:7420`), e.g.
+   `http://127.0.0.1:7420/live/<job_id>` — so the user sees the device
+   screen + step events in real time. You do not
+   need this page — your ground truth stays `run.json` / tool outputs.
 
 ## Common Pitfalls (real-device lessons)
 
@@ -87,6 +143,12 @@ rename breaks your cases.
   UI: walk through them once manually, or add a tap step for "继续但不同步".
 - **Screen must be on and unlocked**: `mat run` wakes the device, but a locked
   device mid-run still stalls — check `mat doctor` if steps hang.
+- **Login flows need credentials stored via `mat cred`** (the only hidden
+  prerequisite): save once with `mat cred set` (e.g. name `测试号`; input is
+  hidden), reference it in case params as `${cred.测试号}` — the engine injects
+  the real value at run time and it never appears in reports/logs. If a login
+  case fails with wrong-password errors, check the credential exists
+  (`mat cred list`) before blaming the case. See `mat cred --help`.
 - **Exploration is not deterministic**: page-graph walks depend on device state
   (toggles, logged-in state). Run twice and compare distributions before
   concluding anything; a "perfect 100%" on 4 steps deserves suspicion, not celebration.
@@ -102,6 +164,9 @@ rename breaks your cases.
 - One behavior per case — a failing case should pinpoint one regression.
 - Reports are single-file HTML with inline screenshots: attach them to bug
   reports as-is. (Humans read the report; agents read `run.json`.)
+- After `explore`: `mat promote <pkg>` turns walked paths into replayable
+  cases; `mat coverage <pkg>` lists graph controls no case touches. Both are
+  one-shot follow-ups — not part of the main loop.
 
 ## Prior Art
 

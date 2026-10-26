@@ -61,6 +61,9 @@ def start_background_check() -> None:
     """serve() 启动时调用：后台守护线程查一次，成功与否都不阻塞/不影响服务。"""
     if os.environ.get("MAT_NO_UPDATE_CHECK", "").strip() == "1":
         return
+    from ..offline import is_offline
+    if is_offline():
+        return  # 离线模式（P0-4）：版本检查是出网动作，直接不做
 
     def _run() -> None:
         global _result

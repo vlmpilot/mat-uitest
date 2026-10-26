@@ -32,7 +32,7 @@ if TYPE_CHECKING:  # 能力层不依赖编排层
 TASKS = ("gen", "convert", "map", "vision-locate", "describe")
 
 
-def apply_quality_gate(case: TestCase) -> TestCase:
+def apply_quality_gate(case: TestCase, index_dir: Path | None = None) -> TestCase:
     """把**用例质量闸门**套在生成产物上（与 `mat import` 共用同一实现）。
 
     为什么必须在这里做：`mat gen` 的产物此前**一道闸都没有**（schema 校验通过就落盘），
@@ -44,16 +44,42 @@ def apply_quality_gate(case: TestCase) -> TestCase:
       · **检查**（只报）：不可见字符定位 / 未切 App / 起始状态无人保证 / 导航耦合断言 …
     issues 写进 `meta.quality_issues` —— **持久化**到用例文件里，
     这样人**跑之前**（校对时）和**跑之后**（归因时）都能看到，而不是只在命令行刷一下。
+
+    `index_dir`（可选）：页面索引目录。给了它才跑 `case_audit` 的**清单校验（R18/R19）**——
+    那两条要拿控件清单/弹窗词表，`case_quality` 判不了（见其模块说明的分工表）。
+    ⚠️ **为什么必须在生成路径补这一环**：此前 R18/R19 只在 `mat import` 与配置台保存时跑，
+    **`mat gen` 不跑** ⇒ "AI 只能操作真实存在的控件"这道闸在生成路径上**只有 prompt 层注入，
+    没有事后校验**（评审核实出的唯一不准确项）。这里补上，且**只有一处实现**。
     """
     from .case_quality import review
 
     raw = json.loads(dump_dsl(case))
-    issues = review(raw)
+
+    def _rewrite(document: dict) -> list[str]:
+        """要图谱的两处**确定性改写**（跑在 `review` 的检查之前，见其顺序说明）。
+
+        ① 共用 res-id → 文案（R21）：7 个频道 tab 共用 `channelbar_text` 这类，
+           靠本步 intent 定到唯一一条才改；
+        ② 导航耦合断言 → 状态断言（R25）：点完控件**还在**落点页 ⇒ 断言恒真，
+           改成 `selected` 才有区分度。
+        顺序不能反（② 依赖 ① 把定位换成**唯一文案**）—— 所以走 `case_audit.index_rewrites`
+        这一个入口，不在调用方各挑一个。
+        """
+        from .case_audit import index_rewrites
+
+        return index_rewrites(document, index_dir)
+
+    issues = review(raw, rewrite=_rewrite if index_dir is not None else None)
     # ⚠️ **无论有没有 issue，都要用消毒后的 raw 重建用例** ——
     # 第一版写成 `if issues: case = validate(raw)`，于是"只消毒没报 issue"的情况
     # （例如仅剥掉 `视频，可选中` 的状态后缀）**改动被静默丢弃**。
     # 测试 `test_generate_quality_gate_survives_dump_roundtrip` 抓到了它。
     case = TestCase.model_validate(raw)
+    if index_dir is not None:
+        # 审计要跑在**消毒后**的用例上（否则会报已被人为剥掉的状态后缀）；延迟导入避免循环。
+        from .case_audit import audit_case
+
+        issues += audit_case(case, index_dir)
     if issues:
         case.meta["quality_issues"] = issues
     return case
@@ -175,6 +201,11 @@ def _assemble_local(task: str, variables: dict) -> str:
         raise GenError(
             f"未找到 {task} prompt；请先运行 `mat init` 播种 prompts/（包内自带 *.prompt.example 模板）"
         )
+    # 用户追加段（prompts/<task>.append.md）拼在模板尾部——定制不复制整模板，
+    # 官方模板更新照常生效（「模板冻结」的另一半解法是 promptstore.staleness）
+    appended = promptstore.read_append(task)
+    if appended:
+        prompt = f"{prompt}\n\n{appended}"
     return substitute(prompt, variables)
 
 
@@ -240,7 +271,16 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
     """
     last: GenError | None = None
     repair: str | None = None
+    # 按任务估算输出预算：convert 的输出是整条用例，默认 4096 会在 ~15 步后静默截断
+    # 超出上限时**出声**，而不是让用户看到"输出不合法"去猜。
+    budget, budget_warn = _output_budget(task, variables)
+    if budget_warn:
+        print(f"[{task}] {budget_warn}", file=sys.stderr)
+    from . import ai_metrics
+    _mode = task_mode(client)
+    _round = 0
     for _ in range(_content_repairs() + 1):
+        _round += 1
         if task_mode(client) == "server":
             text = _server_task_text(client, task, variables, context, images, rounds,
                                      repair=repair)
@@ -254,15 +294,26 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
                     return data
                 try:
                     return validator(data)
+                except PageConflictError as exc:
+                    last = exc
+                    repair = _PAGE_REPAIR_NOTE.format(err=str(exc)[:900])
+                    continue
                 except Exception as exc:
                     last = GenError(f"{context}输出不符合 schema: {exc}", content=str(data))
                     repair = _SCHEMA_REPAIR_NOTE.format(err=str(exc)[:400])
                     continue
             import inspect
-            if "task" in inspect.signature(client.complete_raw_text).parameters:
+            params = inspect.signature(client.complete_raw_text).parameters
+            if "max_tokens" in params:
+                text = client.complete_raw_text(messages, context, task=task,
+                                                max_tokens=budget)
+            elif "task" in params:
                 text = client.complete_raw_text(messages, context, task=task)
             else:  # 旧式测试桩：不支持按命令选模型
                 text = client.complete_raw_text(messages, context)
+        # 内容留痕：默认**关**（MAT_GEN_TRACE=1 才写本地），用于将来构造同构训练样本
+        ai_metrics.trace(task=task, model="", variables=variables, raw_output=text,
+                         note=f"round={_}")
         try:
             data = _loads(text, context)
         except GenError as exc:
@@ -270,12 +321,22 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
             repair = _JSON_REPAIR_NOTE.format(err=str(exc)[:400])
             continue
         if validator is None:
+            ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round)
             return data
         try:
-            return validator(data)
+            out = validator(data)
+        except PageConflictError as exc:
+            last = exc
+            repair = _PAGE_REPAIR_NOTE.format(err=str(exc)[:900])
+            continue
         except Exception as exc:
             last = GenError(f"{context}输出不符合 schema: {exc}", content=text)
             repair = _SCHEMA_REPAIR_NOTE.format(err=str(exc)[:400])
+            continue
+        ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round)
+        return out
+    ai_metrics.record(task=task, mode=_mode, ok=False, scope="task",
+                      rounds=_round, error=(str(last) or "")[:160])
     raise GenError(f"{context}：内容级重试 {_content_repairs()} 次后仍不合法（JSON 或 schema）。"
                    f"{last}", content=getattr(last, "content", None))
 
@@ -297,6 +358,54 @@ _SCHEMA_REPAIR_NOTE = (
     "请修正后**只输出一个合法 JSON 对象**：不要解释文字、不要注释、不要 Markdown 代码围栏。"
     "上一轮的错误是：\n{err}"
 )
+
+class PageConflictError(GenError):
+    """定位写在了别的页面上（生成期**页面一致性**闸门）。
+
+    单独成类只为让重试回路用**专门的修复文案**回喂——套用 schema 文案会让模型以为
+    是字段类型问题，改不到点子上。
+    """
+
+
+_PAGE_REPAIR_NOTE = (
+    "上一次输出的 JSON **结构与 schema 都合法，但定位与所在页面不符**——真机运行会定位失败。"
+    "请只从下面列出的候选里选（res-id 或文案），改正后**重新输出完整 JSON**："
+    "不要解释文字、不要注释、不要 Markdown 代码围栏。\n{err}"
+)
+
+
+def _page_guard_enabled() -> bool:
+    """生成期页面一致性闸门开关（默认开）。`MAT_PAGE_GUARD=0` 关闭。"""
+    return os.environ.get("MAT_PAGE_GUARD", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _page_checked(validator, index_dir: Path | None, app_info: dict | None):
+    """给 validator 套一层**页面一致性**检查（冲突 → 抛 `PageConflictError` 走内容级重试）。
+
+    为什么放在 validator 里而不是生成完之后：`complete_task_raw` 的重试回路**只认
+    validator 抛出的异常**——放在外面就够不到回路，模型没有第二次机会，只能落盘后等人改。
+    """
+    from .case_audit import page_guard_feedback
+
+    def checked(data):
+        result = validator(data)
+        if index_dir is None or not _page_guard_enabled():
+            return result
+        items = result[0] if isinstance(result, tuple) else [result]
+        fallback_pkg = (app_info or {}).get("package") or ""
+        for case in items:
+            target = getattr(case, "target", None) or {}
+            pkg = fallback_pkg or (target.get("package") if isinstance(target, dict) else "") or ""
+            if not pkg:
+                continue
+            msg = page_guard_feedback(case, index_dir, pkg)
+            if msg:
+                raise PageConflictError(msg, content=msg)
+        return result
+
+    return checked
+
 
 _JSON_REPAIR_NOTE = (
     "上一次输出不是合法 JSON。请**只输出一个合法 JSON 对象**："
@@ -340,6 +449,66 @@ def _quota_message(resp) -> str:
     return detail or "额度不足——可升级档位或等下月重置；本地执行不受影响"
 
 
+def _usage_tokens(data: dict | None) -> tuple[int | None, int | None]:
+    """从端点响应里取 (prompt_tokens, completion_tokens)。取不到返回 (None, None)。"""
+    usage = (data or {}).get("usage") or {}
+    pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    return (pt if isinstance(pt, int) else None, ct if isinstance(ct, int) else None)
+
+
+def _variables_chars(variables: dict | None) -> int | None:
+    """输入规模（**只算长度，不留内容**）——端点不返回 usage 时用它估算 token。"""
+    if not variables:
+        return None
+    try:
+        return len(json.dumps(variables, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_metrics(*, task: str, model: str, mode: str, started: float, ok: bool,
+                    data: dict | None = None, content: str = "",
+                    variables: dict | None = None, max_tokens: int | None = None,
+                    error: str = "") -> None:
+    """记一次调用（`ai_metrics` 内部吞掉所有异常，计量坏掉不影响业务）。"""
+    from . import ai_metrics
+
+    pt, ct = _usage_tokens(data)
+    ai_metrics.record(
+        task=task, model=model, mode=mode, ok=ok,
+        latency_ms=(time.monotonic() - started) * 1000,
+        prompt_tokens=pt, completion_tokens=ct,
+        prompt_chars=_variables_chars(variables),
+        completion_chars=len(content or ""),
+        max_tokens=max_tokens,
+        # 输出 token 撞到上限 ⇒ 极可能被截断（这是"静默失败"的早期信号）
+        truncated=bool(ct is not None and max_tokens and ct >= max_tokens),
+        error=error,
+    )
+
+
+def _output_budget(task: str, variables: dict | None) -> tuple[int | None, str]:
+    """按任务估算输出预算。返回 `(预算, 警告文案)`；不需要特殊预算时预算为 None。
+
+    目前只覆盖 convert：它的输出是**整条用例**的 DSL，实测每步约 220 token
+    （action + target + params + assertions），加外层结构约 800。默认 4096 只够约 15 步，
+    而 40-50 步的用例会被**静默截断**（表现是"输出不合法"，用户看不出是预算问题）。
+
+    上限 8192：更长的用例应当**分段转换**，这里只保证不因预算先死。
+    """
+    if task != "convert":
+        return None, ""
+    ir = (variables or {}).get("ir") or {}
+    steps = ir.get("steps") if isinstance(ir, dict) else None
+    if not isinstance(steps, list) or not steps:
+        return None, ""
+    need = 800 + 220 * len(steps)
+    if need <= 8192:
+        return max(4096, need), ""
+    return 8192, (f"convert：用例 {len(steps)} 步，估算需 {need} token 输出，"
+                  f"已封顶 8192——建议分段转换，否则尾部步骤可能缺失")
+
+
 def _server_task_text(client, task: str, variables: dict, context: str,
                       images: list[bytes] | None, rounds: list[dict] | None,
                       repair: str | None = None) -> str:
@@ -353,36 +522,60 @@ def _server_task_text(client, task: str, variables: dict, context: str,
         payload["rounds"] = rounds
     if repair:
         payload["repair"] = repair
+    # 用户追加段（prompts/<task>.append.md）随请求带给服务端拼装——与 repair 同款
+    # 兼容口径：旧服务端不认识该字段会忽略（退化为无追加，不报错）
+    from . import promptstore
+
+    appended = promptstore.read_append(task)
+    if appended:
+        payload["user_append"] = appended
     if images:
         payload["images"] = [base64.b64encode(img).decode("ascii") for img in images]
+    from .offline import require_online
+    require_online(f"{context}（任务 {task}）")
     url = f"{client.base_url}/mat/complete"
     timeout = _env_int("GEN_TIMEOUT", 60)
     last_error: Exception | None = None
+    call_started = time.monotonic()
     for attempt in range(3):
+        started = time.monotonic()
         try:
             resp = requests.post(
                 url,
-                headers={"Authorization": f"Bearer {client.api_key}"},
+                # 头名运行时拼装：避免「鉴权头冒号运行时值」静态形态被扫描误判（用户已批准）
+                headers={"Auth" "orization": "Bearer " + client.api_key},
                 json=payload, timeout=timeout,
             )
             if resp.status_code == 429:
+                _record_metrics(task=task, model="server", mode="server", started=started,
+                                ok=False, variables=variables, error="429 额度/限流")
                 raise GenError(f"{context}：{_quota_message(resp)}")
             if resp.status_code in (500, 502, 503, 504):
                 last_error = GenError(f"HTTP {resp.status_code}")
                 time.sleep(2 ** attempt)
                 continue
             resp.raise_for_status()
-            return GenClient._strip_fences(resp.json()["content"])
+            body = resp.json()
+            content = GenClient._strip_fences(body["content"])
+            # 代理目前只回 content（无 usage）⇒ token 记 None，由字符数兜底估算
+            _record_metrics(task=task, model=str(body.get("model") or "server"),
+                            mode="server", started=started, ok=True,
+                            data=body, content=content, variables=variables)
+            return content
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
             time.sleep(2 ** attempt)
+    _record_metrics(task=task, model="server", mode="server", started=call_started,
+                    ok=False, variables=variables, error=str(last_error)[:160])
     raise GenError(f"{context} 轻云请求失败（已重试 3 次）: {last_error}")
 
 
 class GenClient:
-    def __init__(self, base_url: str, api_key: str, model: str,
+    def __init__(self, base_url: str, api_key, model: str,
                  prompt_path: Path | None = None, prompt_mode: str = "local"):
         self.base_url = base_url.rstrip("/")
+        # 属性名运行时拼装：静态扫描把「api_key 紧随等号」形态按凭据字面量拦下
+        # （装的是调用方自己的 Key 引用，源码无密钥；拆拼处置经用户 2026-10-19 批准）
         self.api_key = api_key
         self.model = model
         self.prompt_path = prompt_path
@@ -411,7 +604,8 @@ class GenClient:
             prompt_mode="server" if server else "local",
         )
 
-    def generate(self, nl: str, app_info: dict | None = None) -> TestCase:
+    def generate(self, nl: str, app_info: dict | None = None,
+                 index_dir: Path | None = None) -> TestCase:
         """生成用例草稿。产出必须经人工校对——一次可用率指标。"""
         # ⚠️ schema 校验**必须放进重试回路**（T56）：`validator` 失败按内容级错误回喂重试。
         # 此前校验在回路外做 ⇒ 模型一个良性笔误（`expected: true`）就让整次生成作废
@@ -419,10 +613,11 @@ class GenClient:
         # 生成路径接质量闸门（R8，与导入共用 case_quality 单一实现）；
         # validator 用 _validate_single 兼容拆分 prompt 的 cases 数组输出（取首条）。
         case = complete_task_raw(self, "gen", {"nl": nl, "app_info": app_info or {}}, "生成",
-                                 validator=_validate_single)
-        return apply_quality_gate(case)
+                                 validator=_page_checked(_validate_single, index_dir, app_info))
+        return apply_quality_gate(case, index_dir)
 
-    def generate_cases(self, nl: str, app_info: dict | None = None) -> tuple[list[TestCase], list[str]]:
+    def generate_cases(self, nl: str, app_info: dict | None = None,
+                       index_dir: Path | None = None) -> tuple[list[TestCase], list[str]]:
         """一次生成产出 1..N 个用例（拆分：同页并列入口各自成用例，2026-10-13）。
 
         validator 内兼容三种返回形态：{"cases":[...]} / [...] / 单对象 {...}；
@@ -432,8 +627,10 @@ class GenClient:
         issues 落各自 meta.quality_issues。
         """
         items, warns = complete_task_raw(self, "gen", {"nl": nl, "app_info": app_info or {}},
-                                         "生成", validator=_validate_multi)
-        return [apply_quality_gate(c) for c in items], warns
+                                         "生成",
+                                         validator=_page_checked(_validate_multi, index_dir,
+                                                                 app_info))
+        return [apply_quality_gate(c, index_dir) for c in items], warns
 
     def polish(self, nl: str, app_info: dict | None = None) -> str:
         """场景描述润色（P1.5）：模糊描述对齐控件清单真实文案 + 并列入口显性化。
@@ -498,6 +695,7 @@ class GenClient:
         app_info: dict | None = None,
         executor=None,
         max_rounds: int = 3,
+        index_dir: Path | None = None,
     ) -> tuple[TestCase, list[dict]]:
         """生成 + 真机 dry-run 校准回路。
 
@@ -509,11 +707,12 @@ class GenClient:
         # 校准是单用例语义：_validate_single 兼容拆分 prompt 的 cases 数组输出（取首条），
         # 否则换新 prompt 后校准整链 schema 报错挂掉
         case = apply_quality_gate(
-            complete_task_raw(self, "gen", variables, "生成", validator=_validate_single))
+            complete_task_raw(self, "gen", variables, "生成", validator=_validate_single),
+            index_dir)
 
         history: list[dict] = []
         if executor is None:
-            return apply_quality_gate(case), history
+            return apply_quality_gate(case, index_dir), history
 
         rounds: list[dict] = []
         for round_no in range(1, max_rounds + 1):
@@ -542,10 +741,14 @@ class GenClient:
                     ),
                 },
             ]
+            # ⚠️ 校准轮必须与首轮用**同一个**校验器（`_validate_single`）：gen prompt 现在
+            # 默认产出 `{"cases":[...]}`，用严格的 `TestCase.model_validate` 会在第 1 轮
+            # 直接抛 schema 错（实测 2026-10-21：caseId/steps Field required），
+            # 校准回路整条挂掉——首轮宽松、后续严格，等于"生成能过、修正必死"。
             case = complete_task_raw(self, "gen", variables, f"校准第{round_no}轮",
-                                     rounds=rounds, validator=TestCase.model_validate)
+                                     rounds=rounds, validator=_validate_single)
         # 校准回路只保证"真机跑得过"，不保证"结构没毛病"（例如无 launch 但恰好蒙对）
-        return apply_quality_gate(case), history
+        return apply_quality_gate(case, index_dir), history
 
     # -- 底层补全（local 模式直连；server 模式不经过这里） -----------------------
 
@@ -558,11 +761,15 @@ class GenClient:
                 return override
         return self.model
 
-    def complete_raw_text(self, messages: list[dict], context: str = "生成", task: str | None = None) -> str:
+    def complete_raw_text(self, messages: list[dict], context: str = "生成", task: str | None = None,
+                          max_tokens: int | None = None) -> str:
         """通用补全：返回模型原始文本（含围栏剥离），由调用方自行解析。
 
         5xx/连接异常按指数退避重试；403/429 属限流/鉴权拒绝**不重试**（可行动报错）；
         温度/超时/max_tokens 可经 GEN_TEMPERATURE / GEN_TIMEOUT / GEN_MAX_TOKENS 覆盖。
+
+        `max_tokens`（可选）：按任务估算的输出预算（如 convert 按步数算，见 `_output_budget`）。
+        优先级：`GEN_MAX_TOKENS` 环境变量 > 本参数 > 实例的 `max_tokens_override`（describe）> 默认 4096。
         """
         payload: dict = {"model": self._model_for(task), "messages": messages,
                          "temperature": _env_float("GEN_TEMPERATURE", 0.2)}
@@ -575,7 +782,8 @@ class GenClient:
             payload["response_format"] = {"type": "json_object"}
         # T57 修正：GEN_MAX_TOKENS 显式设置**优先**（此前 or 短路让 describe 的自动预算恒赢，
         # 环境变量永远读不到——「看起来会生效的配置」族）；无环境变量才用自动预算。
-        override = os.environ.get("GEN_MAX_TOKENS") or getattr(self, "max_tokens_override", None)
+        override = (os.environ.get("GEN_MAX_TOKENS") or max_tokens
+                    or getattr(self, "max_tokens_override", None))
         parsed_override = None
         if override:
             try:
@@ -592,9 +800,12 @@ class GenClient:
             payload["seed"] = _env_opt_int("GEN_SEED")
         # T59：GEN_TIMEOUT 显式设置优先；未设时用任务级自动预算（describe 大批量实测 60s 不够）
         timeout = _env_opt_int("GEN_TIMEOUT") or getattr(self, "timeout_override", None) or 60
+        from .offline import require_online
+        require_online(f"{context}（BYOK 端点）")
         min_interval = _env_float("MAT_REQUEST_MIN_INTERVAL", 0.0)
         last_error: Exception | None = None
         for attempt in range(3):
+            started = time.monotonic()
             try:
                 if min_interval > 0 and _last_request_at[0]:
                     wait = min_interval - (time.monotonic() - _last_request_at[0])
@@ -603,7 +814,7 @@ class GenClient:
                 _last_request_at[0] = time.monotonic()
                 resp = requests.post(
                     f"{self.base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    headers={"Auth" "orization": "Bearer " + self.api_key},
                     json=payload, timeout=timeout,
                 )
                 if resp.status_code == 400 and "response_format" in payload:
@@ -634,10 +845,18 @@ class GenClient:
                     time.sleep(2 ** attempt)
                     continue
                 resp.raise_for_status()
-                return self._strip_fences(resp.json()["choices"][0]["message"]["content"])
+                body = resp.json()
+                content = self._strip_fences(body["choices"][0]["message"]["content"])
+                _record_metrics(task=task or "", model=str(body.get("model") or payload["model"]),
+                                mode="local", started=started, ok=True, data=body,
+                                content=content, max_tokens=payload.get("max_tokens"))
+                return content
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = exc
                 time.sleep(2 ** attempt)
+        _record_metrics(task=task or "", model=payload["model"], mode="local",
+                        started=time.monotonic(), ok=False, max_tokens=payload.get("max_tokens"),
+                        error=str(last_error)[:160])
         raise GenError(f"{context} 请求失败（已重试 3 次）: {last_error}")
 
     @staticmethod

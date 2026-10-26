@@ -102,3 +102,43 @@ def test_ios_control_implementations():
     drv.open_settings()
     # bundleId 直启、不走 app_start ⇒ 不会 _bind_session 把会话漂到设置 App
     assert calls[1] == ("launch", "com.apple.Preferences")
+
+
+def test_fingerprint_and_meta_accept_shell_response():
+    """驱动 `shell()` 返回 `ShellResponse` 时，指纹/型号不能被静默吞成空串。
+
+    2026-10-25 真机评测：Android 走 uiautomator2⇒adbutils 时 `shell()` 不是 str，
+    `app_apk_sha256` / `device_meta` 按 str 用 ⇒ TypeError 被 `except` 吞掉，
+    `run.json` 的 `app_apk_sha256` 与 `device.model` 恒为空 ⇒ 数字无法对上构建。
+    """
+    from insta_engine.driver import app_apk_sha256, app_version
+
+    class _Out:
+        def __init__(self, output: str):
+            self.output = output
+
+    class _Drv:
+        platform = "android"
+
+        @staticmethod
+        def app_info(package: str) -> dict:  # noqa: ARG004
+            return {}
+
+        @staticmethod
+        def shell(cmd: str):
+            if cmd.startswith("pm path"):
+                return _Out("package:/data/app/base.apk\n")
+            if cmd.startswith("sha256sum"):
+                return _Out("ab" * 32 + "  /data/app/base.apk\n")
+            if cmd.startswith("dumpsys package"):
+                return _Out("versionName=1.0\n")
+            if cmd.startswith("getprop ro.product.model"):
+                return _Out("ELE-AL00\n")
+            if cmd.startswith("getprop ro.build.version.release"):
+                return _Out("10\n")
+            return _Out("")
+
+    drv = _Drv()
+    assert app_apk_sha256(drv, "com.insta.demo") == "abababababab"
+    assert app_version(drv, "com.insta.demo") == "1.0"
+    assert DeviceDriver.device_meta(drv) == {"model": "ELE-AL00", "os_version": "10"}

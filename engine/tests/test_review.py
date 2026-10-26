@@ -38,7 +38,11 @@ def test_apply_sets_manual_source_and_counts_each_bucket() -> None:
     assert stats["missing"] == ["k9"], "**找不到的 key 必须被报出来**，不能静默丢弃"
     assert idx["pages"][0]["title"] == "搜索结果页"
     assert idx["pages"][0]["title_source"] == "manual", "必须标 manual，否则 describe 会顶掉"
-    assert "title_source" not in idx["pages"][1], "没改的页不该被标 manual"
+    # 2026-10-25 契约升级：提交了该 key 且值相同 ⇒ 认可当前值（批量确认的落章路径），
+    # 来源升级 manual（describe/重建不再覆盖）；没提交的页（k3）依然不动。
+    assert idx["pages"][1]["title_source"] == "manual", "值相同的确认也该落章 manual"
+    assert stats["promoted"] == 1
+    assert "title_source" not in idx["pages"][2], "没提交的页不该被标 manual"
 
 
 def test_apply_is_idempotent() -> None:
@@ -59,6 +63,44 @@ def test_apply_allows_clearing_a_title() -> None:
     idx = _index([_page("k1", "被子搜索页")])
     stats = review.apply_corrections(idx, {"k1": ""})
     assert stats["applied"] == ["k1"] and idx["pages"][0]["title"] == ""
+
+
+# -- 批量确认（2026-10-25）：认可当前值 ⇒ 落章 manual -----------------------------------
+
+def test_confirm_promotes_ai_title_without_change() -> None:
+    """批量确认主路径：AI 标题原样提交 ⇒ 值不变、来源升 manual、promoted 计数。"""
+    idx = _index([{**_page("k1", "搜索结果页"), "title_source": "ai"}])
+    stats = review.apply_corrections(idx, {"k1": "搜索结果页"})
+    assert stats["applied"] == [] and stats["unchanged"] == ["k1"]
+    assert idx["pages"][0]["title_source"] == "manual", "确认后的 AI 标题不再被 describe/重建覆盖"
+    assert stats["promoted"] == 1
+
+
+def test_confirm_empty_title_not_promoted() -> None:
+    """空标题不落章：升级 manual 会让 describe 永远不给它补名。"""
+    idx = _index([_page("k1", "")])
+    stats = review.apply_corrections(idx, {"k1": ""})
+    assert stats["unchanged"] == ["k1"] and stats["promoted"] == 0
+    assert "title_source" not in idx["pages"][0]
+
+
+def test_confirm_already_manual_not_recounted() -> None:
+    """重复确认幂等：已 manual 的页不再计入 promoted（前端「新认可 N 页」口径）。"""
+    idx = _index([{**_page("k1", "搜索结果页"), "title_source": "manual"}])
+    stats = review.apply_corrections(idx, {"k1": "搜索结果页"})
+    assert stats["promoted"] == 0
+
+
+def test_confirm_summary_promotes_too() -> None:
+    """描述同规则：AI 描述原样确认升 manual，空描述不升。"""
+    idx = _index([{**_page("k1", "搜索结果页"), "summary": "搜索与筛选",
+                   "summary_source": "ai"}, _page("k2", "空描述页")])
+    stats = review.apply_corrections(idx, {"k1": "搜索结果页", "k2": "空描述页"},
+                                     {"k1": "搜索与筛选", "k2": ""})
+    assert idx["pages"][0]["summary_source"] == "manual"
+    assert "summary_source" not in idx["pages"][1], "空描述确认无意义（会让 describe 永不补）"
+    # 3 = k1/k2 标题各升一次 + k1 描述升一次（标题与描述都算「新认可」）
+    assert stats["promoted"] == 3
 
 
 # -- 功能描述的人工结论（2026-10-13） ---------------------------------------------------
