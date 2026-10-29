@@ -1626,6 +1626,20 @@ def cmd_upgrade(args) -> int:
                        open_browser=not args.no_open, timeout=args.timeout)
 
 
+def cmd_team(args) -> int:
+    """团队协作：共享用例库 / 云端报告分享 / 审计（Team/Private）。"""
+    from . import team as team_mod
+
+    root = Path.cwd()
+    if args.team_cmd == "push":
+        return team_mod.push(root, app=args.app)
+    if args.team_cmd == "pull":
+        return team_mod.pull(root, app=args.app, force=args.force)
+    if args.team_cmd == "share":
+        return team_mod.share_report(Path(args.report), title=args.title, ttl_days=args.days)
+    return team_mod.audit(limit=args.limit, action=args.action or "")
+
+
 def cmd_activate(args) -> int:
     from . import licensing
 
@@ -2790,6 +2804,25 @@ def main(argv: list[str] | None = None) -> None:
                      help="不自动打开浏览器，只打印支付页路径")
     upg.add_argument("--timeout", type=int, default=900, help="等待付款的秒数（默认 900）")
     upg.set_defaults(func=cmd_upgrade)
+    team_p = sub.add_parser(
+        "team", help="团队协作：共享用例库 / 云端报告 / 审计（Team/Private 档）")
+    team_sub = team_p.add_subparsers(dest="team_cmd", required=True)
+    tp = team_sub.add_parser("push", help="把本地用例推到团队库（同 app+name 覆盖）")
+    tp.add_argument("--app", help="只推这个包名的用例（缺省=全部）")
+    tp.set_defaults(func=cmd_team)
+    tpl = team_sub.add_parser("pull", help="把团队库拉到本地 cases/（默认不覆盖同名文件）")
+    tpl.add_argument("--app", help="只拉这个包名（缺省=全部）")
+    tpl.add_argument("--force", action="store_true", help="覆盖本地同名文件")
+    tpl.set_defaults(func=cmd_team)
+    tsh = team_sub.add_parser("share", help="把一次执行报告发成链接（默认 30 天）")
+    tsh.add_argument("report", help="run.json 路径（或含 run.json 的目录）")
+    tsh.add_argument("--title", help="分享页标题（缺省用用例名）")
+    tsh.add_argument("--days", type=int, help="有效期天数（1-365，默认 30）")
+    tsh.set_defaults(func=cmd_team)
+    tau = team_sub.add_parser("audit", help="看团队审计日志（谁改了什么）")
+    tau.add_argument("--limit", type=int, default=50, help="条数（默认 50，上限 500）")
+    tau.add_argument("--action", help="只看某类动作（case.push / report.share）")
+    tau.set_defaults(func=cmd_team)
     inv_p = sub.add_parser("invite", help="邀请同事用 MAT，分享人得额度（需联网；仅本命令会注册匿名 ID）")
     inv_p.add_argument("--accept", metavar="邀请码", help="接受别人的邀请（对方将获得额度）")
     inv_p.add_argument("--confirm", action="store_true",
