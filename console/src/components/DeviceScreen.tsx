@@ -14,7 +14,7 @@ const OFFLINE_AFTER = 3;
 const SCREEN_WIDTH = 227;
 
 export default function DeviceScreen({ serial, platform, extra }: {
-  serial: string | null; platform: "android" | "ios"; extra?: ReactNode }) {
+  serial: string | null; platform: "android" | "ios" | "harmony"; extra?: ReactNode }) {
   const [live, setLive] = useState(true);
   const [ts, setTs] = useState(Date.now());
   const [fails, setFails] = useState(0);
@@ -63,6 +63,8 @@ export default function DeviceScreen({ serial, platform, extra }: {
             textAlign: "center" }}>
             {platform === "ios"
               ? "仍未恢复——大概率 WDA 未就绪：请到「概览」页检查 iOS WDA 状态，一键启动后回到本页等待自动恢复"
+              : platform === "harmony"
+              ? "仍未恢复——请到「概览」页检查鸿蒙设备连接与 hdc 状态（hdc list targets）"
               : "仍未恢复——请到「概览」页检查设备连接与 adb 授权"}
           </div>
         )}

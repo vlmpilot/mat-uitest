@@ -10,6 +10,10 @@
   **自带 Key（BYOK）不设额度**（`check_vision(enforce=False)`）：token 由用户自己的服务商
   计费，本地只计数供 `mat status` 展示——否则就是拿别人的钱、还替别人限额。
 - **本地执行/自愈/报告**：不限量，无配额逻辑（不变承诺）。
+- **计数按来源拆分**（2026-10-28）：`gen_count`/`vision_count` 仍是总数，
+  另有 `gen_byok`/`vision_byok` 记录其中「自带 Key」的部分，官方用量 = 总数 − BYOK。
+  拆分**只影响展示**，不参与任何拦截——目的是让用户看清「用自己的 Key 用了多少、
+  官方额度有没有白买」，而不是把 BYOK 也纳入额度。
 
 V1 为本地诚实计数；轻云上线后服务端配额为权威（license.json 校验随之升级，
 见 README 的 open-core 边界——配额策略不放在开源仓库的信任边界内）。
@@ -40,7 +44,7 @@ class QuotaExceeded(RuntimeError):
 
 
 def _vision_limit_for(plan: str) -> int | None:
-    """视觉兜底月上限：pro 走服务端可配值（默认 300）；private 不限；其余按策略文件。"""
+    """视觉兜底月上限：pro 走服务端可配值（默认 100）；private 不限；其余按策略文件。"""
     if plan == "private":
         return None
     if plan == "pro":
@@ -48,9 +52,29 @@ def _vision_limit_for(plan: str) -> int | None:
     return _policy_limits(plan)["vision"]
 
 
+#: 总数 → BYOK 分项字段名（见 `UsageStore._bump`）。
+_BYOK_FIELD = {"gen_count": "gen_byok", "vision_count": "vision_byok"}
+
+
+def _current_source() -> str:
+    """当前接入方式：`official`=走官方代理（平台出钱），`byok`=直连用户端点。
+
+    判据与请求路径同源：`promptstore.is_server()` 为真时客户端打 `/mat/complete`，
+    由平台转发并计费；否则直连用户自己的 `GEN_BASE_URL`，token 由用户结算。
+    """
+    try:
+        from . import promptstore
+
+        return "official" if promptstore.is_server() else "byok"
+    except Exception:  # noqa: BLE001 - 配置异常按 BYOK 记，宁可少报官方用量
+        return "byok"
+
+
 class UsageStore:
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, source: str | None = None):
         self.path = path or (insta_home() / "usage.json")
+        #: 显式来源优先（"official"/"byok"）；不传则每次记账时按当前接入方式判定。
+        self._source = source
 
     def _load(self) -> dict:
         try:
@@ -62,6 +86,10 @@ class UsageStore:
             data = {"month": month, "gen_count": 0, "vision_count": 0}
         data.setdefault("gen_count", 0)
         data.setdefault("vision_count", 0)  # 兼容 v0.4.0 之前只含 gen_count 的 usage.json
+        # 来源拆分自 2026-10-28 起记录：缺失按 0 处理（升级当月之前的计数无法追溯，
+        # 仍计入总数；usage.json 按月重置，下个月起自然准确）。
+        data.setdefault("gen_byok", 0)
+        data.setdefault("vision_byok", 0)
         return data
 
     def plan(self) -> str:
@@ -75,14 +103,21 @@ class UsageStore:
     def snapshot(self) -> dict:
         data = self._load()
         plan = self.plan()
+        byok_gen = data.get("gen_byok") or 0
+        byok_vision = data.get("vision_byok") or 0
         return {
             "month": data["month"],
             "plan": plan,
             "gen_count": data["gen_count"],
+            # 来源拆分：official = 总数 − byok（只用于展示，见模块文档）
+            "gen_byok": byok_gen,
+            "gen_official": max(0.0, round(data["gen_count"] - byok_gen, 2)),
             # 生成**只统计展示，不再本地拦截**（P0-2）；limit 来自策略文件（private 为 None=不限）
             "gen_limit": _policy_limits(plan)["gen"],
             "gen_enforced": False,
             "vision_count": data["vision_count"],
+            "vision_byok": byok_vision,
+            "vision_official": max(0.0, round(data["vision_count"] - byok_vision, 2)),
             "vision_limit": _vision_limit_for(plan),
         }
 
@@ -95,16 +130,16 @@ class UsageStore:
         """
         return self.snapshot()
 
-    def consume(self, amount: float = 1.0) -> dict:
+    def consume(self, amount: float = 1.0, byok: bool | None = None) -> dict:
         """生成用量核销（写入；成功落盘后调用，仅统计展示）。"""
-        return self._bump("gen_count", amount)
+        return self._bump("gen_count", amount, byok=self._is_byok(byok))
 
     def ensure_vision_capacity(self, amount: float = 1.0) -> dict:
         """视觉兜底额度预检（不写入）；额度不足抛 QuotaExceeded（真实 token 成本闸）。
 
         调用方（runner._vision_locate）捕获本异常后**优雅降级**为"vision 未启用"，
         不中断本地执行——vision 是兜底能力，额度耗尽只应退回定位失败。
-        `private` 档（limit=None）本地不限；pro 的上限服务端可配（默认 300）。
+        `private` 档（limit=None）本地不限；pro 的上限服务端可配（默认 100）。
         """
         data = self._load()
         limit = _vision_limit_for(self.plan())
@@ -126,9 +161,9 @@ class UsageStore:
             )
         return self.snapshot()
 
-    def consume_vision(self, amount: float = 1.0) -> dict:
+    def consume_vision(self, amount: float = 1.0, byok: bool | None = None) -> dict:
         """视觉兜底额度核销（写入；调用前应先 ensure_vision_capacity）。"""
-        return self._bump("vision_count", amount)
+        return self._bump("vision_count", amount, byok=self._is_byok(byok))
 
     def check_vision(self, amount: float = 1.0, enforce: bool = True) -> dict:
         """视觉兜底调用前：预检 + 计数原子完成（文件锁）。
@@ -143,12 +178,20 @@ class UsageStore:
         def _op() -> dict:
             if enforce:
                 self.ensure_vision_capacity(amount)
-            return self.consume_vision(amount)
+            # enforce=False 即自带 Key：成本由用户结算，只记 BYOK 分项
+            return self.consume_vision(amount, byok=not enforce)
         return self._locked(_op)
 
     # -- 内部 ---------------------------------------------------------------
 
-    def _bump(self, field: str, amount: float) -> dict:
+    def _is_byok(self, flag: bool | None) -> bool:
+        """本次记账是否算 BYOK：显式 flag > 构造时来源 > 当前接入方式。"""
+        if flag is not None:
+            return flag
+        source = self._source or _current_source()
+        return source != "official"
+
+    def _bump(self, field: str, amount: float, byok: bool = False) -> dict:
         """读-改-写计数（写盘尽力而为）。
 
         写失败（HOME 只读/沙箱拦截等异常环境）不抛——计数只是展示辅助，把辅助计数
@@ -157,6 +200,9 @@ class UsageStore:
         """
         data = self._load()
         data[field] = round(data[field] + amount, 2)
+        if byok:
+            key = _BYOK_FIELD[field]
+            data[key] = round((data.get(key) or 0) + amount, 2)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")

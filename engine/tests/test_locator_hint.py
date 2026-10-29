@@ -111,7 +111,8 @@ def test_stale_node_read_back_is_not_empty(monkeypatch):
     """
     monkeypatch.setattr(locator_mod.time, "sleep", lambda _s: None)
     element = Element(strategy="text→hint", value="账号", node=_Stale())
-    assert element._read_back_empty() is False
+    assert element._read_text() == (None, False), "读不到 ≠ 空"
+    assert element._input_landed("alice") is True, "读不到不判死"
 
 
 def test_set_text_on_stale_hint_node_still_succeeds(monkeypatch):
@@ -137,6 +138,7 @@ def test_read_back_empty_is_true_for_genuinely_empty_field(monkeypatch):
     """反例：字段确实为空（安全键盘拦截）时仍要走二级通道（iOS 空输入框也返回 None）。"""
     monkeypatch.setattr(locator_mod.time, "sleep", lambda _s: None)
     element = Element(strategy="text", value="账号", node=_Typed(["", ""]))
-    assert element._read_back_empty() is True
+    assert element._read_text() == ("", True), "真空 == 读得到且为空"
+    assert element._input_landed("alice") is False, "回读为空 ⇒ 判未生效 ⇒ 走二级通道"
 
 

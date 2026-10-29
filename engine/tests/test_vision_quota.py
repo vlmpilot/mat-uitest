@@ -136,6 +136,50 @@ def test_vision_locate_server_respects_quota(tmp_path, monkeypatch):
     assert UsageStore(tmp_path / "usage.json").snapshot()["vision_count"] == limit
 
 
+def test_vision_locate_local_endpoint_ignores_quota(tmp_path, monkeypatch):
+    """额度已耗尽 + 官方代理 + **视觉端点在本机** ⇒ 照常定位，且不占平台额度。
+
+    这是「生成走云端、兜底走本地小模型」的混合部署。端点在本机意味着平台没出 token
+    钱，额度闸必须让路：否则本地兜底会把官方视觉额度吃光，额度满后连本地模型都被
+    QuotaExceeded 拒掉——本地化唯一确定的收益（截图不出本机）就被自己废掉了。
+    计数也一并不记：`mat status` 的视觉用量只该反映平台代付的部分。
+    """
+    monkeypatch.setenv("INSTA_HOME", str(tmp_path))
+    monkeypatch.setenv("GEN_PROMPT_MODE", "server")
+    monkeypatch.setenv("GEN_VL_BASE_URL", "http://127.0.0.1:8080/v1")
+    limit = plan_limits("free")["vision"]
+    _fill_usage(tmp_path, limit)
+    _stub_vision(monkeypatch)
+
+    runner = Runner(_ShotDriver(), tmp_path)
+    element = runner._vision_locate(_vision_step(), {})
+
+    assert element is not None, "本地端点的兜底不该被平台额度拦住"
+    assert element.point == (10, 20)
+    assert UsageStore(tmp_path / "usage.json").snapshot()["vision_count"] == limit, \
+        "本地端点不花平台的钱，不该计入平台视觉用量"
+
+
+def test_vision_locate_remote_vl_endpoint_still_counts(tmp_path, monkeypatch):
+    """反向保障：`GEN_VL_BASE_URL` 指向**外部**端点 ⇒ 仍按官方代理限额核销。
+
+    防止「本地端点放行」被写成「配了 GEN_VL_BASE_URL 就放行」——那等于给云端端点
+    开了免费通道，平台额度闸形同虚设。
+    """
+    monkeypatch.setenv("INSTA_HOME", str(tmp_path))
+    monkeypatch.setenv("GEN_PROMPT_MODE", "server")
+    monkeypatch.setenv("GEN_VL_BASE_URL", "https://vl.example.com/v1")
+    limit = plan_limits("free")["vision"]
+    _fill_usage(tmp_path, limit)
+    _stub_vision(monkeypatch)
+
+    runner = Runner(_ShotDriver(), tmp_path)
+    element = runner._vision_locate(_vision_step(), {})
+
+    assert element is None
+    assert "额度" in runner.vision_reason, f"外部端点仍需限额，实际 {runner.vision_reason!r}"
+
+
 # -- mat status：按模式分叉，不把平台额度当限制展示 ------------------------------
 
 def test_status_byok_reports_no_cap(tmp_path, monkeypatch, capsys):

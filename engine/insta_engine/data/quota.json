@@ -2,9 +2,21 @@
   "version": 1,
   "reset": "monthly_utc",
   "plans": {
-    "free":    {"gen": 60,    "vision": 20},
-    "pro":     {"gen": 2000,  "vision": 300},
-    "team":    {"gen": 10000, "vision": 1000},
-    "private": {"gen": null,  "vision": null}
+    "free": {
+      "gen": 60,
+      "vision": 20
+    },
+    "pro": {
+      "gen": 300,
+      "vision": 100
+    },
+    "team": {
+      "gen": 10000,
+      "vision": 1000
+    },
+    "private": {
+      "gen": null,
+      "vision": null
+    }
   }
 }

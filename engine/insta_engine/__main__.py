@@ -1618,6 +1618,14 @@ def cmd_seat(args) -> int:
     return 0
 
 
+def cmd_upgrade(args) -> int:
+    """下单 → 打开支付页 → 轮询 → 领码 → 自动激活（跨设备用 --claim）。"""
+    from . import upgrade
+
+    return upgrade.run(plan=args.plan, claim=args.claim, token=args.token,
+                       open_browser=not args.no_open, timeout=args.timeout)
+
+
 def cmd_activate(args) -> int:
     from . import licensing
 
@@ -1791,6 +1799,18 @@ def _env_kv(name: str, value: str) -> str:
     本无密钥，属误判）。拆开拼接终端输出逐字节不变（处置经用户 2026-10-19 批准）。
     """
     return name + "=" + value
+
+
+def _byok_note(usage: dict, kind: str) -> str:
+    """「其中自带 Key x 次」片段；无 BYOK 用量时为空串（2026-10-28 来源拆分）。
+
+    只做展示：BYOK 的 token 由用户自己的服务商结算，不消耗也不拦截官方额度。
+    有这行是为了让「买了标准版却一直用自带 Key」的人看见额度在闲置。
+    """
+    byok = usage.get(f"{kind}_byok") or 0
+    if not byok:
+        return ""
+    return f"（其中自带 Key {byok:g} 次 · 未消耗官方额度）"
 
 
 def _usage_mode_label(plan: str | None) -> str:
@@ -2152,11 +2172,12 @@ def cmd_status(_args) -> int:
         else:
             print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
             print(f"NL 生成（{usage['month']}）: 已调用 {usage['gen_count']:g} 次"
-                  " · 服务端暂不可达，额度以服务端为准")
+                  f"{_byok_note(usage, 'gen')} · 服务端暂不可达，额度以服务端为准")
     else:
         # 自带 API Key：token 用户自己付 ⇒ **没有额度这个概念**，别把策略数字当限制展示
         print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
         print(f"NL 生成（{usage['month']}）: 已调用 {usage['gen_count']:g} 次"
+              f"{_byok_note(usage, 'gen')}"
               " · 本站不设上限，费用由你的服务商结算")
     key_ok = bool(os.environ.get("GEN_API_KEY"))
     endpoint = "已配置" if key_ok else "未配置（gen 不可用，本地执行不受影响）"
@@ -2165,10 +2186,13 @@ def cmd_status(_args) -> int:
     print("视觉兜底: " + vision_status_text(server=server, key_ok=key_ok, vl=vl))
     if server:
         vision_limit_text = usage["vision_limit"] if usage["vision_limit"] is not None else "不限"
-        print(f"视觉兜底用量（{usage['month']}）: {usage['vision_count']}/{vision_limit_text}"
-              " · 同屏缓存命中不计费")
+        # 官方额度只看 official 部分：BYOK 视觉（GEN_VL_BASE_URL 单独配）不占服务端额度
+        vision_used = usage.get("vision_official", usage["vision_count"])
+        print(f"视觉兜底用量（{usage['month']}）: {vision_used:g}/{vision_limit_text}"
+              f"{_byok_note(usage, 'vision')} · 同屏缓存命中不计费")
     else:
         print(f"视觉兜底用量（{usage['month']}）: 已调用 {usage['vision_count']:g} 次"
+              f"{_byok_note(usage, 'vision')}"
               " · 本站不设上限 · 同屏缓存命中不计费")
     for line in _license_status_lines():
         print(line)
@@ -2296,6 +2320,173 @@ def cmd_heal(args) -> int:
     return 0
 
 
+def cmd_eval(args) -> int:
+    """`mat eval`：评测套件常驻入口（口径同 spike_check，见 eval_suite 模块说明）。"""
+    from .eval_suite import compare, run_eval, save_baseline, summary_line
+
+    if args.eval_cmd in ("first-run", "gen"):
+        # `gen` 是口语名（生成首穿率），`first-run` 是口径名——同一实现、同一产物
+        from .eval_first_run import render, summarize
+
+        dirs = [Path(d) for d in args.dirs]
+        sm = summarize(dirs)
+        if not sm["total"]:
+            print("没有产物（目录里没有 run.json）", file=sys.stderr)
+            return 2
+        print(render(sm))
+        if args.save:
+            from datetime import datetime as _dt
+
+            sm["saved_at"] = _dt.now(UTC).isoformat(timespec="seconds")
+            sm["source_dirs"] = [str(d) for d in dirs]
+            out = Path("artifacts") / "eval" / "first-run-report.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(sm, ensure_ascii=False, indent=1) + "\n",
+                           encoding="utf-8")
+            print(f"\n已保存: {out}（mat metrics 将消费此文件）")
+        return 0
+    if args.eval_cmd == "run":
+        # 逐任务进度实时打印（2026-10-28）：跑批动辄 30-60 分钟，stdout 重定向后
+        # 全缓冲 ⇒ 日志全程空白，只能靠产物目录猜进度。flush=True 逐行出。
+        def _progress(r: dict) -> None:
+            if r.get("env_error"):
+                print(f"  r{r['run']} {r['task']}: ⛔ 设备异常 {r['env_error']}", flush=True)
+            elif r.get("blocked"):
+                print(f"  r{r['run']} {r['task']}: ⛔ 风控拦截（{r['blocked']}）", flush=True)
+            else:
+                print(f"  r{r['run']} {r['task']}: {r['status']}"
+                      f"（步骤 {r['passed']}/{r['total']}）", flush=True)
+
+        report = run_eval(
+            Path(args.suite), repeat=args.repeat, serial=args.serial,
+            artifacts_root=Path(args.artifacts) if args.artifacts else None,
+            quality_gate=args.quality_gate, platform=args.platform,
+            threshold=args.threshold if "--threshold" in sys.argv else None,
+            on_progress=_progress,
+        )
+        overall = report["overall"]
+        print(f"\n=== 结论: {report['verdict']} ===")
+        print(f"  中位 {overall['median']} · 极差 {overall['min']}–{overall['max']}"
+              f"（{overall['spread_pp']}pp） · 套件 {report['suite']}")
+        print(f"  对外引用: {summary_line(report)}")
+        crash = overall.get("crash") or {}
+        crash_tasks = "、".join(crash.get("tasks") or [])
+        print(f"  崩溃: {crash.get('task_runs', 0)} 个「任务×遍」"
+              + (f"（{crash_tasks}）" if crash_tasks else ""))
+        for tid in report["unstable"]:
+            print(f"  ⚠️ 不稳: {tid}")
+        for tid in report["stable_fail"]:
+            print(f"  ❌ 稳定失败: {tid}")
+        if report["aborted"]:
+            print("  ⚠️ 本场**不完整**（设备异常/连续风控中止）——引用时须说明")
+        print(f"  report: {report['report_path']}")
+        if args.save_baseline:
+            p = save_baseline(report, Path(args.suite).stem)
+            print(f"  基线已保存: {p}")
+        return 0 if report["verdict"] == "PASS" else 1
+    # compare
+    report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+    result = compare(report, baseline, threshold_pp=args.threshold_pp)
+    for r in result["regressions"]:
+        print(f"  ❌ {r}")
+    for i in result["improvements"]:
+        print(f"  ✅ {i}")
+    if result.get("note"):
+        # note 不只指纹变化：新增崩溃也在这里（2026-10-27）——只按指纹条件打印会静默吞掉它
+        print(f"  ⚠️ {result['note']}")
+    print(f"=== 对比结论: {result['verdict']}（中位变化 {result['median_delta_pp']:+}pp）===")
+    return 0 if result["verdict"] == "PASS" else 1
+
+
+def cmd_metrics(args) -> int:
+    """`mat metrics`：质量指标卡——全部从既有产物推导，缺产出的项如实标「未建立」。"""
+    from .quality_metrics import build_metrics, render_text
+
+    m = build_metrics(Path(args.root) if args.root else Path.cwd())
+    if args.json:
+        print(json.dumps(m, ensure_ascii=False, indent=1))
+    else:
+        print(render_text(m))
+    return 0
+
+
+def cmd_finetune(args) -> int:
+    """`mat finetune`:用户侧微调工具链 L2(数据抽取/训练/留出评测/加载)。
+
+    边界(工具链文档 §4.5):adapter 与基座绑定;平台不背书质量;数据不出本机。
+    仅 local 模式生效(server 官方代理跑的是平台基座,加载不了用户 adapter)。
+    """
+    from .finetune import (
+        MIN_PAIRS,
+        eval_adapter,
+        export_dataset,
+        load_holdout,
+        train,
+        write_use_config,
+    )
+
+    root = Path.cwd()
+    if args.ft_cmd == "export":
+        stats = export_dataset(root, args.app or None, Path(args.out))
+        print(f"训练对 {stats['pairs']} 对(可训练 {stats['train_pairs']} · 留出"
+              f" {stats['holdout_pairs']} · 剔除无 nl 存量 {stats['no_nl_skipped']} 条)")
+        for pkg, n in sorted(stats["per_app"].items(), key=lambda x: -x[1])[:8]:
+            print(f"  {pkg}: {n}")
+        tag = ("✅ 够训" if stats["enough"] else
+               f"⚠️ 可训练 {stats['train_pairs']} < {MIN_PAIRS}——继续积累"
+               "(正常使用即积累,meta.nl 自动落盘)")
+        print(f"判定: {tag} | JSONL: {stats['train_jsonl']}")
+        return 0
+    if args.ft_cmd == "train":
+        try:
+            r = train(root, Path(args.data), args.base, python=args.python)
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if not r.get("ok"):
+            print(f"❌ {r['error']}", file=sys.stderr)
+            if r.get("output_tail"):
+                print(r["output_tail"][-600:])
+            return 1
+        print(f"✅ adapter 已产出: {r['adapter']}")
+        print(f"下一步: mat finetune eval --data {args.data} --base {args.base}")
+        return 0
+    if args.ft_cmd == "eval":
+        try:
+            holdout = load_holdout(Path(args.data), n=args.holdout)
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if not holdout:
+            print("留出集为空——先 export", file=sys.stderr)
+            return 2
+        r = eval_adapter(root, args.adapter, args.base, holdout,
+                         baseline_url=args.baseline_url,
+                         report_path=Path(args.data) / "eval-report.json")
+        if not r.get("ok"):
+            print(r["error"], file=sys.stderr)
+            return 1
+        print(f"留出 {r['total']} 条: DSL 合法 {r['dsl_ok']} · 步数偏差大 {r['diverged']}"
+              f" · 生成/解析失败 {r['parse_fail']} → 自动初筛通过 {r['auto_pass']:.0%}")
+        if "baseline" in r:
+            print(f"基线 {r['baseline']['auto_pass']:.0%} · adapter {r['auto_pass']:.0%}"
+                  f" · 差 {r['delta_pp']:+.1f}pp")
+        if r.get("baseline_error"):
+            print(f"⚠️ 基线端点不可用: {r['baseline_error']}", file=sys.stderr)
+        print(f"报告: {r.get('report_path')}")
+        print(r["note"])
+        print("可用性人工判(可用/改改能用/不能用)——通过率 ≥70% 才建议 `mat finetune use`")
+        return 0
+    # use
+    p = write_use_config(root, args.adapter, args.base)
+    print(f"已写入 {p}(GEN_BASE_URL/GEN_MODEL/GEN_PROMPT_MODE=local/GEN_API_KEY)")
+    print("gen 现在走本地端点。先起基座+adapter 服务:")
+    print(f"  python3 -m mlx_lm.server --model {args.base} --adapter-path {args.adapter} --port 8080")
+    print("⚠️ adapter 仅 local 模式生效——GEN_PROMPT_MODE=server(官方代理)加载不了用户 adapter")
+    return 0
+
+
 def cmd_skill(args) -> int:
     """`mat skill`：查看随包 skill 的位置 / 装进 AI 助手的 skill 目录。
 
@@ -2314,6 +2505,19 @@ def cmd_skill(args) -> int:
         for path in _skill.bundled_files():
             print(f"  {path.name}")
         print("装进 AI 助手：mat skill install（或把上面的目录整个复制到助手的 skill 目录）")
+        print("助手不认识 --target？先跑 mat skill targets 看已知落点。")
+        return 0
+
+    if args.skill_cmd == "targets":
+        rows = _skill.targets_table()
+        kw = max(len(r["target"]) for r in rows)
+        pw = max(len(r["path"]) for r in rows)
+        print("已知落点（--target 取值 → skill 目录）：")
+        for row in rows:
+            mark = "" if row["verified"] else "  ⚠️ 未实测，装完请确认助手能看到该 skill"
+            print(f"  {row['target']:<{kw}}  {row['path']:<{pw}}  {row['label']}{mark}")
+        print("  其余助手（Cursor 等）用 --dir <它的 skill 目录> 显式指定。")
+        print("  国内多平台通吃：--target agents（~/.agents/skills，魔搭/npx 生态默认）。")
         return 0
 
     try:
@@ -2334,6 +2538,9 @@ def cmd_skill(args) -> int:
         return 1
     print(f"{'已覆盖更新' if result.get('overwritten') else '已安装'}：{dest}"
           f"（{len(result['files'])} 个文件）")
+    if getattr(args, "target", None) in _skill.UNVERIFIED_TARGETS:
+        print("  ⚠️ 该落点未经实测：文件已写入，但助手是否会扫描它需要你自己确认；"
+              "不确定就改用 --target agents。")
     print("  用法：在 AI 编码助手里说「用 mobileapp-testing 技能测一下 <你的 App>」；"
           "新会话才会加载新装的 skill。")
     return 0
@@ -2546,8 +2753,9 @@ def main(argv: list[str] | None = None) -> None:
                      help="目标导向：命中这些词的入口优先点（逗号分隔，如 `地址,设置`）。"
                           "用于常规探索走不到的深层入口——图谱缺页会让静态检查与执行期置备同时失效")
     exp.add_argument("--serial", help="设备 serial")
-    exp.add_argument("--platform", choices=("android", "ios"), default="android",
-                     help="设备平台（iOS 的 explore 适配未完成，传 ios 会被诚实拒绝）")
+    exp.add_argument("--platform", choices=("android", "ios", "harmony"), default="android",
+                     help="设备平台（iOS 的 explore 适配未完成，传 ios 会被诚实拒绝；"
+                          "harmony 走 uitest dumpLayout）")
     exp.set_defaults(func=cmd_explore)
 
     doc = sub.add_parser("doctor", help="环境自检（adb/驱动/AI 配置/设备）")
@@ -2571,6 +2779,17 @@ def main(argv: list[str] | None = None) -> None:
     act.add_argument("--file", metavar="license.json",
                      help="用 license v2 文件激活（Team/Private 签发的 JSON，离线验签）")
     act.set_defaults(func=cmd_activate)
+    upg = sub.add_parser("upgrade", help="购买标准版并自动激活（下单→支付→领码→激活）")
+    upg.add_argument("plan", nargs="?", default="pro_quarter",
+                     choices=("pro_quarter", "pro_year", "pro_month"),
+                     help="档位：pro_quarter=3 个月卡（默认）/ 年付 / 月付（后两者缺省未开售）")
+    upg.add_argument("--claim", metavar="订单号",
+                     help="已付款订单：只领码并激活（跨设备用，需配 --token）")
+    upg.add_argument("--token", metavar="领取令牌", help="与 --claim 搭配的领取令牌")
+    upg.add_argument("--no-open", action="store_true",
+                     help="不自动打开浏览器，只打印支付页路径")
+    upg.add_argument("--timeout", type=int, default=900, help="等待付款的秒数（默认 900）")
+    upg.set_defaults(func=cmd_upgrade)
     inv_p = sub.add_parser("invite", help="邀请同事用 MAT，分享人得额度（需联网；仅本命令会注册匿名 ID）")
     inv_p.add_argument("--accept", metavar="邀请码", help="接受别人的邀请（对方将获得额度）")
     inv_p.add_argument("--confirm", action="store_true",
@@ -2592,8 +2811,8 @@ def main(argv: list[str] | None = None) -> None:
     idx = sub.add_parser("index", help="真机爬取构建页面索引（控件清单，gen/convert 防幻觉底座）")
     idx.add_argument("package", help="被测 App 包名")
     idx.add_argument("--serial", help="设备 serial")
-    idx.add_argument("--platform", choices=("android", "ios"), default="android",
-                     help="设备平台（iOS 适配在 P3）")
+    idx.add_argument("--platform", choices=("android", "ios", "harmony"), default="android",
+                     help="设备平台（iOS 适配在 P3；harmony 走 uitest dumpLayout）")
     idx.add_argument("--refresh", action="store_true", help="强制重新爬取")
     idx.add_argument("--steps", type=int, default=30, help="爬取步数预算（默认 30）")
     idx.add_argument("--pages", type=int, default=15, help="页面数预算（默认 15）")
@@ -2699,7 +2918,7 @@ def main(argv: list[str] | None = None) -> None:
     gen.add_argument("--calibrate", action="store_true", help="真机 dry-run 校准（≤3 轮失败回喂修正）")
     gen.add_argument("--max-rounds", type=int, default=3)
     gen.add_argument("--serial", help="校准用设备 serial")
-    gen.add_argument("--platform", choices=("android", "ios"), default="android",
+    gen.add_argument("--platform", choices=("android", "ios", "harmony"), default="android",
                      help="校准设备平台（仅 --calibrate 用；iOS 支持模拟器与 USB 真机）")
     gen.set_defaults(func=cmd_gen)
 
@@ -2708,9 +2927,10 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--app", help="按包名过滤/校验：单用例校验 target.package 一致，目录则批量跑该 App 全部用例")
     run.add_argument("--serial", help="设备 serial（缺省取唯一在线设备；iOS 缺省自动选中"
                      "唯一 USB 真机，无真机时连模拟器）")
-    run.add_argument("--platform", choices=("android", "ios"), default="android",
-                     help="设备平台：android（默认）或 ios（模拟器连 localhost:8100；"
-                     "USB 真机经 usbmux 直连，--serial <udid> 指定，`mat ios-setup` 查环境）")
+    run.add_argument("--platform", choices=("android", "ios", "harmony"), default="android",
+                     help="设备平台：android（默认）/ ios（模拟器连 localhost:8100；USB 真机"
+                     "经 usbmux 直连）/ harmony（鸿蒙 NEXT，需 hdc 与 DevEco 环境，真机校准进行中；"
+                     "当前为首个可用版本：run 可用，explore/index 尚未接入）")
     run.add_argument("--record", action="store_true",
                      help="执行录屏：全程录制，通过自动删除、失败保留进 artifacts/video/（报告内嵌播放器）")
     run.add_argument("--artifacts", help="产物目录（默认 artifacts/<文件名>）")
@@ -2740,6 +2960,80 @@ def main(argv: list[str] | None = None) -> None:
     heal_apply.add_argument("-o", "--out", help="输出文件（默认 <用例名>-healed.json）")
     heal_apply.set_defaults(func=cmd_heal)
 
+    eval_p = sub.add_parser(
+        "eval",
+        help="评测套件：真机跑批出固定口径报告 + 基线对比守门（发版前跑，退化即非零退出）")
+    eval_sub = eval_p.add_subparsers(dest="eval_cmd", required=True)
+    eval_run = eval_sub.add_parser("run", help="执行评测套件（口径同 spike_check/T34/T76）")
+    eval_run.add_argument("suite", help="任务集 JSON（benchmarks/tasks/*.json）")
+    eval_run.add_argument("--repeat", type=int, default=1,
+                          help="每条任务重复遍数（≥2 才有中位/极差——对外引用要用这个）")
+    eval_run.add_argument("--serial", help="设备 serial（缺省取唯一在线设备）")
+    eval_run.add_argument("--platform", choices=("android", "harmony"), default="android",
+                          help="设备平台（harmony=鸿蒙 NEXT，需 hdc；录屏与靶场指纹暂不支持）")
+    eval_run.add_argument("--artifacts", help="产物根目录（默认 artifacts/eval/<套件名>）")
+    eval_run.add_argument("--threshold", type=float, help="通过阈值（缺省用套件内 pass_threshold）")
+    eval_run.add_argument("--quality-gate", action="store_true",
+                          help="跑前过质量闸门（⚠️ 数字是改后通过率，对外引用须两档都写）")
+    eval_run.add_argument("--save-baseline", action="store_true",
+                          help="把本次 report 存为该套件基线（供 eval compare 对比）")
+    eval_run.set_defaults(func=cmd_eval)
+    eval_cmp = eval_sub.add_parser("compare", help="report vs 基线——退化即非零退出（发版守门）")
+    eval_cmp.add_argument("report", help="本次 report.json（artifacts/eval/…）")
+    eval_cmp.add_argument("--baseline", required=True, help="基线 JSON（baseline-<套件>.json）")
+    eval_cmp.add_argument("--threshold-pp", type=float, default=5.0,
+                          help="中位退化阈值（百分点，默认 5；与 eval_suite.DEFAULT_REGRESSION_PP 一致）")
+    eval_cmp.set_defaults(func=cmd_eval)
+    eval_first = eval_sub.add_parser(
+        "first-run",
+        help="首跑通过率统计（从产物 run.json；前提:用例未经人工修改）")
+    eval_first.add_argument("dirs", nargs="+", help="执行产物目录（可多个,递归找 run.json）")
+    eval_first.add_argument("--save", action="store_true",
+                            help="写 artifacts/eval/first-run-report.json（mat metrics 消费）")
+    eval_first.set_defaults(func=cmd_eval)
+    # 口语别名：`mat eval gen`（生成首穿率）与 first-run **同实现同产物**
+    eval_gen = eval_sub.add_parser(
+        "gen", help="生成首穿率——`first-run` 的口语别名，产物口径完全相同")
+    eval_gen.add_argument("dirs", nargs="+", help="执行产物目录（可多个,递归找 run.json）")
+    eval_gen.add_argument("--save", action="store_true",
+                          help="写 artifacts/eval/first-run-report.json（mat metrics 消费）")
+    eval_gen.set_defaults(func=cmd_eval)
+
+    metrics_p = sub.add_parser(
+        "metrics",
+        help="质量指标卡：产品/工具/成本三组，全部从既有产物推导（缺产出如实标未建立）")
+    metrics_p.add_argument("--root", help="工作区根目录（缺省当前目录）")
+    metrics_p.add_argument("--json", action="store_true", help="输出 JSON（供消费方）")
+    metrics_p.set_defaults(func=cmd_metrics)
+
+    ft = sub.add_parser(
+        "finetune",
+        help="用户侧微调工具链 L2:export(抽数据)/train(LoRA)/eval(留出评测)/use(写配置);"
+             "仅 local 模式生效,数据不出本机")
+    ft_sub = ft.add_subparsers(dest="ft_cmd", required=True)
+    ft_export = ft_sub.add_parser("export", help="从执行记录抽 (nl → DSL) 训练对(只取 passed)")
+    ft_export.add_argument("--app", help="限定被测 App 包名(缺省全 App 混合)")
+    ft_export.add_argument("--out", default="dataset", help="输出目录(默认 dataset/)")
+    ft_export.set_defaults(func=cmd_finetune)
+    ft_train = ft_sub.add_parser("train", help="调 mlx_lm.lora 训练(可训练对 <200 拒绝)")
+    ft_train.add_argument("--data", default="dataset", help="export 输出目录")
+    ft_train.add_argument("--base", required=True, help="基座模型(HF 名或本地路径)")
+    ft_train.add_argument("--python", help="装了 mlx-lm 的解释器(缺省用当前 mat 的解释器)")
+    ft_train.set_defaults(func=cmd_finetune)
+    ft_eval = ft_sub.add_parser("eval", help="留出集逐条走与 gen 同一条链路生成,DSL 合法性自动初筛")
+    ft_eval.add_argument("--data", default="dataset", help="export 输出目录(读其中的 holdout.jsonl)")
+    ft_eval.add_argument("--adapter", required=True, help="adapter 目录(仅用于报告标识)")
+    ft_eval.add_argument("--base", required=True, help="基座模型")
+    ft_eval.add_argument("--holdout", type=int, default=0,
+                         help="最多取多少条留出样本(0=export 切出的全部)")
+    ft_eval.add_argument("--baseline-url",
+                         help="不加载 adapter 的基座端点(给出则报告基线对比)")
+    ft_eval.set_defaults(func=cmd_finetune)
+    ft_use = ft_sub.add_parser("use", help="写入 gen 的 local 配置(指向基座+adapter)")
+    ft_use.add_argument("--adapter", required=True, help="adapter 目录")
+    ft_use.add_argument("--base", required=True, help="基座模型")
+    ft_use.set_defaults(func=cmd_finetune)
+
     summary_p = sub.add_parser(
         "summary",
         help="run.json → ≤40 行运行摘要（AI agent/CI 判读；uv/pipx 装法下用这个，"
@@ -2753,10 +3047,13 @@ def main(argv: list[str] | None = None) -> None:
     skill_sub = skill_p.add_subparsers(dest="skill_cmd", required=True)
     skill_sub.add_parser("path", help="打印随包 skill 的位置（供手动复制）").set_defaults(
         func=cmd_skill)
+    skill_sub.add_parser("targets", help="列出已知的助手 skill 落点（含是否实测）").set_defaults(
+        func=cmd_skill)
     skill_install = skill_sub.add_parser("install", help="安装到 AI 助手的 skill 目录")
     skill_install.add_argument("--target", choices=sorted(KNOWN_TARGETS), default="claude",
-                               help="已知落点：claude=~/.claude/skills（默认）、"
-                                    "workbuddy=~/.workbuddy/skills")
+                               help="已知落点（mat skill targets 看全表）：claude=~/.claude/skills"
+                                    "（默认）、workbuddy、agents=~/.agents/skills（国内跨平台首选）、"
+                                    "trae=Trae 国内版、qoderwork、codebuddy、qwen")
     skill_install.add_argument("--dir", default=None,
                                help="自定义安装根目录（优先于 --target）")
     skill_install.add_argument("--force", action="store_true",

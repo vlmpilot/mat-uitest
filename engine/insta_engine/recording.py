@@ -253,4 +253,8 @@ def make_recorder(platform: str, serial: str | None,
                           "（simctl 只对模拟器有效，xctrace 录的是 Instruments 轨迹）。"
                           "失败步骤的**截图 + 系统日志**仍然完整，可作为证据")
         return Recorder("ios", serial, staging), None
+    if platform == "harmony":
+        # 2026-10-26 鸿蒙首版：uitest 无公开录制子命令——诚实降级(同 iOS 真机先例)，
+        # 失败步骤的**截图**仍是完整证据;后续有公开 API 再补
+        return None, "鸿蒙首版不支持录屏（失败步骤的截图证据仍完整）"
     return None, f"未知平台 {platform!r}"

@@ -23,6 +23,14 @@ class Node:
     clickable: bool
     package: str
     bounds: str
+    #: 真机 `selected` / `checked` 状态（2026-10-28 补采）。
+    #: 为什么必须采：切 tab 的最强断言是 `{"type":"selected", ...}`，但**控件字典原先只有
+    #: 6 个字段**（class/text/desc/res-id/clickable/bounds）⇒ 图谱全量 0 个 `selected=True`，
+    #: 候选集里"哪些控件真的有 selected 可断言"**无从得知**，模型只能猜。
+    #: 实测 xhs 底部「消息」tab 的容器（`desc='消息，3条未读'`）与 TextView（`text='消息'`）
+    #: **都带 `selected=true`**，而图谱里一个都没有 ⇒ 规则 17 说"首选状态断言"其实无处落地。
+    selected: bool = False
+    checked: bool = False
 
     @property
     def label(self) -> str:
@@ -52,6 +60,8 @@ def parse_nodes(xml: str) -> list[Node]:
             clickable=attrs.get("clickable") == "true",
             package=attrs.get("package", ""),
             bounds=attrs.get("bounds", ""),
+            selected=attrs.get("selected") == "true",
+            checked=attrs.get("checked") == "true",
         )
         for attrs in (_ATTR_RE.findall(node) and dict(_ATTR_RE.findall(node)) for node in _NODE_RE.findall(xml))
     ]

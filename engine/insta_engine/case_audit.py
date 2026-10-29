@@ -160,6 +160,44 @@ def _page_has(page: dict, loc) -> bool:
     return False
 
 
+def _selected_instance(page: dict, loc) -> dict | None:
+    """这条定位**实际会命中的那个控件**，若它在图谱快照里已是选中/勾选态 ⇒ 返回它。
+
+    ## 为什么要按运行期语义取实例（而不是"该 rid 里有 selected 的就算"）
+
+    `channel_bar_item_container` 在本页有 7 个实例，`index=5` 才是「国际」。若只看
+    "这个 rid 里存在 selected 的"，那 `index=1`（要闻，采集时就是选中态）会让
+    `index=5`（国际）也被判成"已选中" ⇒ 把**唯一正确写法**报成缺陷（与 R21 那次
+    把 `index` 判成歧义同族）。所以：**无 `index` 取第一个**（u2 的 `exist`/点击都是
+    第一个匹配），**有 `index` 取第 N 个**（越界直接弃权）。
+
+    ## 返回 None 的三种情况都**不报**（宁缺毋滥）
+
+    定位在本页没有实例、`index` 越界、命中的那个控件不是选中态。
+    第四种隐含情况：**老图谱没有 `selected` 字段** ⇒ 恒返回 None ⇒ 本规则静默不生效
+    （不是"没问题"，是"判不了"）。
+    """
+    value = (loc.value or "").strip()
+    if not value:
+        return None
+    hits: list[dict] = []
+    for ctl in page.get("controls") or []:
+        if loc.strategy in _TEXT_LIKE and str(ctl.get("text") or ctl.get("desc") or "") == value:
+            hits.append(ctl)
+        elif loc.strategy in _ID_LIKE and str(ctl.get("res-id") or "") == value:
+            hits.append(ctl)
+    if not hits:
+        return None
+    idx = getattr(loc, "index", None)
+    if idx is None:
+        hits = hits[:1]
+    else:
+        if idx < 0 or idx >= len(hits):
+            return None
+        hits = [hits[idx]]
+    return next((c for c in hits if c.get("selected") or c.get("checked")), None)
+
+
 def _equiv_group(page: dict, pages: list[dict]) -> list[dict]:
     """该页 + 它的**同逻辑页碎片**（`pages_equivalent`）。
 
@@ -167,6 +205,52 @@ def _equiv_group(page: dict, pages: list[dict]) -> list[dict]:
     另一个碎片被误报成"跨页"。按等价组判，宁可漏报不可误报。
     """
     return [page] + [p for p in pages if p is not page and pages_equivalent(p, page)]
+
+
+def _edge_matches(edge: dict, values: set[str], parent: dict) -> bool:
+    """这条边是不是**本步这个控件**产生的（2026-10-28 起按 rid 认边）。
+
+    ## 为什么只看 action/rid 相等不够
+
+    实测（某资讯 App，11 条意图 ×3 轮）：「视频频道切换」**3/3 轮全部生成失败**，
+    错误是「步骤 s3 断言1：`视频` 不在「娱乐热点榜页」上」。查图谱：
+
+    - 首页上有 **3 个** `text=视频`：频道 tab（`channelbar_text`）、底部导航（`nav_btn_text`）、
+      以及频道栏滚动快照里的第二个；
+    - 而 `视频` 那条边来自 `parent_rid=pendant_web_fire_work`——一个**全屏 WebView 挂件**
+      （bounds 覆盖整屏、**没有文案**）。
+
+    ⇒ 老判据 `e.action in values or e.rid in values` 只按**文案**就认了这条边，
+    把"点频道 tab 视频"带到「娱乐热点榜页」，生成期的页面一致性闸门于是判
+    "「视频」不在娱乐热点榜页上" ⇒ 一条本来正确的用例被判死，每轮烧 3 次调用。
+
+    ## 判据
+
+    - 本步给的 rid 就是这条边的 rid ⇒ 认（icon-only 控件的正常路径）；
+    - 文案对不上 ⇒ 不认；
+    - 文案对得上且**边没有 rid**（老图谱）⇒ 认（保持原行为，不能因为缺字段就全线弃权）；
+    - 文案对得上、边有 rid ⇒ 要求**父页上那个 rid 的控件**确实带这个文案。
+      全屏 WebView 挂件没有文案 ⇒ 不认 ⇒ 走链弃权（宁可漏报，不可误判）。
+    """
+    rid = str(edge.get("rid") or "").strip()
+    action = str(edge.get("action") or "").strip()
+    if rid and rid in values:
+        return True
+    if action not in values:
+        return False
+    controls = parent.get("controls") or []
+    if not rid:
+        # 老图谱（顶层 edges 没有 rid）：只能按文案认。但**父页上这个文案若有多个控件**，
+        # 就无从知道这条边是哪一次点击产生的 ⇒ 弃权。实测某资讯 App 首页 `text=视频`
+        # 有 3 个（频道 tab / 底部导航 / 快照），顶层 edge 只记 action ⇒ 认了就等于赌。
+        same = [c for c in controls
+                if str(c.get("text") or c.get("desc") or "").strip() in values]
+        return len(same) == 1
+    labels = {str(c.get("text") or c.get("desc") or "").strip()
+              for c in controls
+              if str(c.get("res-id") or "").strip() == rid}
+    labels.discard("")
+    return bool(labels & values)
 
 
 def _walk_expected_pages(case: TestCase, pages: list[dict],
@@ -203,9 +287,11 @@ def _walk_expected_pages(case: TestCase, pages: list[dict],
             elif st.action in _FORWARD_ACTIONS and st.target is not None:
                 # 按**文案或 res-id** 认边：icon-only 控件没有文案，只能用 rid 重放
                 # （explore 从 2026-10 起记 `parent_rid`；老图谱该字段为空，走文案）。
+                # ⚠️ 边带 rid 时还要校验"父页上那个 rid 的控件确实带这个文案"——否则
+                # 同名控件会把边张冠李戴（见 `_edge_matches`）。
                 values = {v for _st, v in _locator_values(st.target) if v}
                 nxt = next((e["to"] for e in edges.get(cur.get("page_key"), [])
-                            if e.get("action") in values or e.get("rid") in values), None)
+                            if _edge_matches(e, values, cur)), None)
                 after = by_key.get(nxt) if nxt else None
             cur = after
         out.append((before, after))
@@ -341,11 +427,21 @@ def _ambiguous_text_issues(case: TestCase, index_dir: Path, pkg: str) -> list[st
             # 而每一步都报"成功"。这类错误比文案歧义更隐蔽（res-id 看起来"最精确"）。
             hits = max((_rid_match_count(pg, value) for pg in _equiv_group(before, pages)),
                        default=0)
-            if hits > 1:
+            # ⚠️ **带显式 `index` 的不算歧义**（2026-10-28）：`index` 就是"第 N 个"的语义，
+            # 写 `res-id=channel_bar_item_container, index=5` 恰恰是唯一能精确点到某个 tab
+            # 的写法。实测 `gen-183555-3` 这么写、R21 仍报"建议改用 text" ⇒ 又把
+            # **唯一可行写法**判成缺陷（与 R13 同族）。只报越界。
+            explicit = getattr(st.target, "index", None)
+            if hits > 1 and explicit is None:
                 warns.append(fmt_issue(
                     "R21", f"步骤 {st.id}：res-id「{value}」在**本步所在页**有 {hits} 个控件共用"
                            "——运行期会命中第一个，点到的不是想要的那个（每一步都报成功）；"
-                           "建议改用 text 或把范围缩到具体控件"))
+                           "建议加 `index`（若候选集给了 `index→文案`）或用更精确的文案"))
+            elif explicit is not None and explicit >= hits:
+                warns.append(fmt_issue(
+                    "R21", f"步骤 {st.id}：`index={explicit}` 越界——res-id「{value}」在"
+                           f"**本步所在页**只有 {hits} 个实例（合法范围 0–{max(hits - 1, 0)}），"
+                           "运行期会定位失败或退化成第一个"))
             continue
         if strategy not in text_like:
             continue
@@ -427,6 +523,7 @@ def nondiscriminating_assertions(case: TestCase, index_dir: Path | str,
 
     第一条依赖**沿图谱走链**（`_walk_expected_pages`）。走链断了就**弃权**（不猜），
     所以"没报 R24"不等于"断言没问题"——要看 `page_guard_coverage` 的可判率。
+    走链弃权的那一段由 **R26** 兜（见 `_fallback_issues`）。
     """
     index = load_index(Path(index_dir) / f"{pkg}.json")
     pages = [p for p in (index or {}).get("pages", []) if isinstance(p, dict) and p.get("page_key")]
@@ -437,24 +534,66 @@ def nondiscriminating_assertions(case: TestCase, index_dir: Path | str,
     pre_nav: dict | None = None
     pre_hits: list[tuple[str, str, str]] = []
     containers: list[tuple[str, str, int]] = []
-    for st, (before, _after) in zip(case.steps, walk, strict=False):
+    #: R26 兜底用：本用例**此前已确定**的页面（按步序累积；断链后不再增长）
+    seen: list[dict] = []
+    seen_keys: set[str] = set()
+    fallback_hits: list[tuple[str, str, str]] = []
+    #: R27：状态断言的目标在**动作前就已选中**（图谱 ★ 可证）⇒ 动作 no-op 时照样绿
+    already_selected: list[tuple[str, str, str, str]] = []
+    #: 走链是否已经**断过**（断过才允许 R26 兜底——否则 launch 之后那一步会把
+    #: "第一页自己的断言"误报成"动作前就成立"）
+    broken = False
+    for st, (before, after) in zip(case.steps, walk, strict=False):
         if st.action == Action.LAUNCH:
             pre_nav = None
+            seen, seen_keys = [], set()
+            broken = False
         elif st.action in _FORWARD_ACTIONS or st.action in _UNKNOWN_ACTIONS \
                 or st.action == Action.SWIPE:
             pre_nav = before if before is not None else None
+            if before is not None and after is None:
+                broken = True
+        if before is not None:
+            key = str(before.get("page_key") or "")
+            if key not in seen_keys:
+                seen_keys.add(key)
+                seen.append(before)
         for a in st.assertions:
             if a.target is None:
                 continue
             value = (a.target.value or "").strip()
             if not value:
                 continue
+            # R27（2026-10-28）：**独立判据**，故意放在下面这条分支链之前。
+            # 为什么不能并进 `elif a.type in _STATE_ASSERTIONS`：容器 rid 会在链的第一支
+            # 被 R24 吃掉（`groups.get(value)` 命中）⇒ `selected <容器> index=N` 永远走不到
+            # 状态分支，而"带 index 的容器断言"恰恰是**唯一能精确断某个 tab**的写法。
+            # ⚠️ 页面用 `before or pre_nav`：**tab 切换在图谱里没有自环边**，`tap 要闻` 之后
+            # `_walk_expected_pages` 找不到边 ⇒ `after=None` ⇒ 紧随其后的 wait 步 `before`
+            # 也是 None。而 `pre_nav`（本步之前最后一次导航前的页）跨过断链仍在 ——
+            # 不用它，本规则对"切 tab"这一类**恰好全部静默**（那正是它要抓的）。
+            # ⚠️ **只判启动落点页（无 parent_key）**：其余页面的 ★ 是**采集路径造成的状态**
+            # （爬虫点了 7x24 才拍到那个碎片，碎片快照里 7x24 当然已选中）。实测：
+            # 不设这条限制会把 `首页-7x24标签页` 判成假绿（2/2 轮）——它是真的切了 tab，
+            # 断言有区分度。根页的 ★ 才等于"App 默认态"。
+            pre_page = before if before is not None else pre_nav
+            if a.type in _STATE_ASSERTIONS and pre_page is not None \
+                    and not pre_page.get("parent_key") \
+                    and _selected_instance(pre_page, a.target) is not None:
+                already_selected.append(
+                    (st.id, value, a.type.value, _page_label(pre_page)))
             labels = groups.get(value)
             if labels and len(labels) > 1:
                 containers.append((st.id, value, len(labels)))
-            elif pre_nav is not None and a.type not in _STATE_ASSERTIONS \
-                    and _page_has(pre_nav, a.target):
-                pre_hits.append((st.id, value, str(pre_nav.get("title") or pre_nav.get("page_key"))))
+            elif a.type in _STATE_ASSERTIONS:
+                continue
+            elif pre_nav is not None:
+                if _page_has(pre_nav, a.target):
+                    pre_hits.append((st.id, value, str(pre_nav.get("title") or pre_nav.get("page_key"))))
+            elif broken:
+                hit = next((p for p in reversed(seen) if _page_has(p, a.target)), None)
+                if hit is not None:
+                    fallback_hits.append((st.id, value, _page_label(hit)))
     warns: list[str] = []
     if pre_hits:
         shown = "、".join(f"`{v}`（{page}）" for _, v, page in pre_hits[:4])
@@ -469,6 +608,18 @@ def nondiscriminating_assertions(case: TestCase, index_dir: Path | str,
                    "断言它的状态只反映组里**第一个**，与被操作的那一个无关"
                    "（实测：`selected channelbar_text` 因为 7x24 本来就选中而恒为真）。"
                    "建议改成该控件的**文案**再断状态，或断目标页独有控件"))
+    if fallback_hits:
+        shown = "、".join(f"`{v}`（{page}）" for _, v, page in fallback_hits[:4])
+        warns.append(fmt_issue(
+            "R26", f"断言在**已知前序页**上就成立：{shown}——这一步之后的落点页不在图谱里，"
+                   "走链到此弃权（R24 判不了），但这些目标在**本用例此前已经到过的页面**上就有，"
+                   "⇒ 它同样证明不了页面变了。建议改断**状态**或**落点页独有**的业务控件"))
+    if already_selected:
+        shown = "、".join(f"`{v}`（{atype}，{page}）" for _, v, atype, page in already_selected[:4])
+        warns.append(fmt_issue(
+            "R27", f"状态断言的目标**在动作前就已经是选中态**：{shown}——按图谱采集时的快照，"
+                   "它本来就是选中的 ⇒ 动作没生效（点的是已选中的 tab）也照样绿。"
+                   "请改断**切换后的那一个**，或换一个本来未选中的目标"))
     return warns
 
 

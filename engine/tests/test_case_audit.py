@@ -184,6 +184,41 @@ def test_r21_silent_for_unique_text(tmp_path):
                 if "[R21]" in i]
 
 
+def _rid_index_case(rid: str, index: int | None) -> TestCase:
+    target: dict = {"strategy": "res-id", "value": rid}
+    if index is not None:
+        target["index"] = index
+    return TestCase.model_validate({
+        "caseId": "c", "name": "切频道", "target": {"package": PKG},
+        "steps": [{"id": "s1", "action": "launch"},
+                  {"id": "s2", "action": "tap", "target": target}]})
+
+
+def test_r21_silent_for_rid_with_explicit_index(tmp_path):
+    """带显式 `index` 的 res-id **不是歧义**——它恰恰是唯一能精确点到某个 tab 的写法。
+
+    来源（2026-10-28）：`gen-183555-3` 按候选集的 `index→文案` 映射写了
+    `res-id=channel_bar_item_container, index=5`（5=国际，完全正确），R21 仍报
+    "建议改用 text" ⇒ 又把**唯一可行写法**判成缺陷（与 R13 同族）。
+    """
+    from insta_engine.case_audit import audit_case
+
+    idx = _r20_index(tmp_path, _shared_rid_pages())
+    issues = [i for i in audit_case(_rid_index_case(f"{PKG}:id/channelbar_text", 3), idx)
+              if "[R21]" in i]
+    assert issues == [], issues
+
+
+def test_r21_flags_out_of_range_index(tmp_path):
+    """`index` 越界要报：7 个实例里写 99 ⇒ 运行期定位失败或退化成第一个。"""
+    from insta_engine.case_audit import audit_case
+
+    idx = _r20_index(tmp_path, _shared_rid_pages())
+    issues = [i for i in audit_case(_rid_index_case(f"{PKG}:id/channelbar_text", 99), idx)
+              if "[R21]" in i]
+    assert len(issues) == 1 and "越界" in issues[0], issues
+
+
 # -- 2026-10-21 补：共用 res-id 的确定性改正 + 走链忽略启动噪声 -------------------------------
 
 
@@ -379,6 +414,94 @@ def test_r24_abstains_without_a_page_index(tmp_path):
     assert nondiscriminating_assertions(case, tmp_path, PKG) == []
 
 
+# -- 2026-10-28 补：R26 走链弃权后的兜底（R12）------------------------------------------
+#
+# 来源：R24 的**覆盖边界**。落点页不在图谱里时走链断在动作那一步，`pre_nav` 变 None
+# ⇒ R24 全程弃权、一条不报。实测两种形态：
+#   · `exists res-id=c_list_view_container`（tx 图谱 5/24 页，**首页就有**）在 `tap 搜索`
+#     之后不再有区分度，但搜索结果页不在图谱 ⇒ 静默；
+#   · `exists imgLogo` 只在「人民网主页」1 页出现，「我的」页不在图谱 24 页里 ⇒ 也静默。
+# 兜底判据 = 「目标在**本用例任一已知前序页**上就有」（不引入新阈值，语义与 R24 第一条一致）。
+# ⚠️ **否掉**「按 rid 出现页数兜底」：反例 `action_bar_comment` 13/24 页**全是详情页**，
+#    断它仍能证明"进了详情页"（与某内容社区 App `搜索,` 62 页误报同构）。
+
+
+def _broken_walk_index(tmp_path, home_controls: list[dict]):
+    """只有首页（`tap 搜索` 在图谱里**没有边** ⇒ 走链从 s2 起弃权）。"""
+    from insta_engine.page_index import save_index
+
+    save_index(tmp_path / f"{PKG}.json",
+               {"package": PKG, "generated_at": "t", "sources": ["explore"],
+                "pages": [_page("home", depth=0, controls=home_controls)],
+                "edges": []})
+    return tmp_path
+
+
+def _search_case(assertion: dict) -> TestCase:
+    """launch → tap 搜索 → input → tap 搜索按钮 → wait 断言（模拟真实搜索类用例）。"""
+    return TestCase.model_validate({
+        "caseId": "c", "name": "搜索后校验", "target": {"package": PKG},
+        "steps": [{"id": "s1", "action": "launch"},
+                  {"id": "s2", "action": "tap",
+                   "target": {"strategy": "text", "value": "搜索"}},
+                  {"id": "s3", "action": "input",
+                   "target": {"strategy": "res-id", "value": f"{PKG}:id/search_box"},
+                   "value": "新闻"},
+                  {"id": "s4", "action": "tap",
+                   "target": {"strategy": "text", "value": "搜索"}},
+                  {"id": "s5", "action": "wait", "assertions": [assertion]}]})
+
+
+def test_r26_flags_assertion_that_held_on_a_known_earlier_page(tmp_path):
+    """走链弃权后，断言目标在**首页**（已知前序页）就有 ⇒ 证明不了到了搜索结果页。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    rid = f"{PKG}:id/c_list_view_container"
+    idx = _broken_walk_index(tmp_path, [
+        {"text": "搜索", "clickable": True},
+        {"res-id": rid, "clickable": True},
+    ])
+    case = _search_case({"type": "exists",
+                         "target": {"strategy": "res-id", "value": rid}})
+    warns = nondiscriminating_assertions(case, idx, PKG)
+    assert any("[R26]" in w and "已知前序页" in w for w in warns), warns
+
+
+def test_r26_is_silent_for_a_control_absent_from_all_earlier_pages(tmp_path):
+    """反向：目标在前序页里**没有** ⇒ 它可能就是落点页独有的，不许报（宁可漏报）。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _broken_walk_index(tmp_path, [{"text": "搜索", "clickable": True}])
+    case = _search_case({"type": "exists",
+                         "target": {"strategy": "text", "value": "历史记录"}})
+    assert nondiscriminating_assertions(case, idx, PKG) == []
+
+
+def test_r26_does_not_fire_without_a_broken_walk(tmp_path):
+    """**没断过链就不许兜底**：否则 launch 之后那一步会把"第一页自己的断言"误报成
+    "动作前就成立"（元素清单类用例全中）。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _broken_walk_index(tmp_path, [{"text": "搜索", "clickable": True}])
+    case = TestCase.model_validate({
+        "caseId": "c", "name": "首页关键元素", "target": {"package": PKG},
+        "steps": [{"id": "s1", "action": "launch"},
+                  {"id": "s2", "action": "wait",
+                   "assertions": [{"type": "exists",
+                                   "target": {"strategy": "text", "value": "搜索"}}]}]})
+    assert nondiscriminating_assertions(case, idx, PKG) == []
+
+
+def test_r26_is_silent_for_state_assertions(tmp_path):
+    """状态断言与 R24 同一条豁免（选中态会变 ⇒ 有区分度）。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _broken_walk_index(tmp_path, [{"text": "我的", "clickable": True}])
+    case = _search_case({"type": "selected",
+                         "target": {"strategy": "text", "value": "我的"}})
+    assert nondiscriminating_assertions(case, idx, PKG) == []
+
+
 # -- 2026-10-26 补：R18 不得用「展示用截断」的控件清单做存在性判定 -----------------------------
 
 
@@ -424,3 +547,140 @@ def test_controls_list_for_none_means_unlimited(tmp_path):
     })
     assert len(controls_list_for(PKG, tmp_path)) == 300, "默认仍是 300（下拉候选的展示上限）"
     assert len(controls_list_for(PKG, tmp_path, max_controls=None)) == 400
+
+
+# -- 2026-10-28 补：R27「状态断言的目标在动作前就已选中」 ------------------------------------
+#
+# 判据依赖图谱里的 `selected`（清单里的 ★）。语料里的典型假绿：`tap 要闻` + `selected 要闻`，
+# 而首页**本来就停在要闻** ⇒ 动作 no-op、断言恒真。
+# ⚠️ 与 R24 分开编号：R24 的口径是"目标在动作前那页存在"（对**存在类**断言），
+#    R27 的口径是"状态断言的目标**已经是选中态**"。混号会让一个计数指向两个修复方向。
+
+_TABS = ["7x24", "要闻", "关注", "视频", "天津", "国际", "娱乐"]
+
+
+def _tabs_controls(selected_idx: int | None) -> list[dict]:
+    """频道栏：容器 + 文案两套 rid，与真机 tx-news 一致（同 bounds 对齐）。"""
+    out: list[dict] = []
+    for i, label in enumerate(_TABS):
+        bounds = f"[{i * 138},221][{(i + 1) * 138},318]"
+        sel = (i == selected_idx)
+        out.append({"res-id": f"{PKG}:id/channel_bar_item_container", "text": "",
+                    "desc": "", "clickable": True, "bounds": bounds,
+                    **({"selected": True} if sel else {})})
+        out.append({"res-id": f"{PKG}:id/channelbar_text", "text": label,
+                    "desc": "", "clickable": False, "bounds": bounds,
+                    **({"selected": True} if sel else {})})
+    return out
+
+
+def _tabs_index(tmp_path, selected_idx: int | None):
+    """只有首页、**没有边**（tab 切换不换页 ⇒ 图谱里本来就没有自环边）。"""
+    from insta_engine.page_index import save_index
+
+    save_index(tmp_path / f"{PKG}.json",
+               {"package": PKG, "generated_at": "t", "sources": ["explore"],
+                "pages": [_page("home", depth=0, controls=_tabs_controls(selected_idx))],
+                "edges": []})
+    return tmp_path
+
+
+def _tab_case(assertion: dict) -> TestCase:
+    return TestCase.model_validate({
+        "caseId": "c", "name": "切频道", "target": {"package": PKG},
+        "steps": [{"id": "s1", "action": "launch"},
+                  {"id": "s2", "action": "tap",
+                   "target": {"strategy": "text", "value": "要闻"}},
+                  {"id": "s3", "action": "wait", "assertions": [assertion]}]})
+
+
+def _codes(warns: list[str]) -> set[str]:
+    return {w.split("]")[0].lstrip("[") for w in warns}
+
+
+def test_r27_flags_state_assertion_on_an_already_selected_tab(tmp_path):
+    """`tap 要闻` + `selected 要闻`，而首页本来就停在要闻 ⇒ 假绿。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _tabs_index(tmp_path, selected_idx=1)
+    case = _tab_case({"type": "selected",
+                      "target": {"strategy": "text", "value": "要闻"}})
+    warns = nondiscriminating_assertions(case, idx, PKG)
+    assert "R27" in _codes(warns), warns
+    assert any("动作前就已经是选中态" in w for w in warns)
+
+
+def test_r27_is_silent_for_a_tab_that_is_not_selected_yet(tmp_path):
+    """断「国际」——它不是当前选中项 ⇒ 有区分度，不报。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _tabs_index(tmp_path, selected_idx=1)
+    case = _tab_case({"type": "selected",
+                      "target": {"strategy": "text", "value": "国际"}})
+    assert "R27" not in _codes(nondiscriminating_assertions(case, idx, PKG))
+
+
+def test_r27_respects_explicit_index_on_a_container(tmp_path):
+    """容器 rid 必须按 `index` 取实例：index=5（国际）不报，index=1（要闻）报。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _tabs_index(tmp_path, selected_idx=1)
+    ok = _tab_case({"type": "selected",
+                    "target": {"strategy": "res-id",
+                               "value": f"{PKG}:id/channel_bar_item_container", "index": 5}})
+    assert "R27" not in _codes(nondiscriminating_assertions(ok, idx, PKG))
+
+    bad = _tab_case({"type": "selected",
+                     "target": {"strategy": "res-id",
+                                "value": f"{PKG}:id/channel_bar_item_container", "index": 1}})
+    assert "R27" in _codes(nondiscriminating_assertions(bad, idx, PKG))
+
+
+def test_r27_is_silent_without_selected_data(tmp_path):
+    """老图谱没采 `selected` ⇒ 判不了 ⇒ 静默（"没报"≠"没问题"）。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _tabs_index(tmp_path, selected_idx=None)
+    case = _tab_case({"type": "selected",
+                      "target": {"strategy": "text", "value": "要闻"}})
+    assert "R27" not in _codes(nondiscriminating_assertions(case, idx, PKG))
+
+
+def test_r27_is_silent_when_the_target_is_absent_from_the_page(tmp_path):
+    """目标不在动作前那页（走链断了、pre_nav 也没了）⇒ 不猜。"""
+    from insta_engine.case_audit import nondiscriminating_assertions
+
+    idx = _tabs_index(tmp_path, selected_idx=1)
+    case = TestCase.model_validate({
+        "caseId": "c", "name": "x", "target": {"package": PKG},
+        "steps": [{"id": "s1", "action": "launch"},
+                  {"id": "s2", "action": "wait",
+                   "assertions": [{"type": "selected",
+                                   "target": {"strategy": "text", "value": "不存在的tab"}}]}]})
+    assert "R27" not in _codes(nondiscriminating_assertions(case, idx, PKG))
+
+
+def test_r27_is_silent_on_a_non_root_page(tmp_path):
+    """非启动落点页的 ★ 是**采集路径造成的状态**，不能当"App 默认态" ⇒ 不判。
+
+    实测来源：新图谱里 `首页-7x24标签页` 被判成假绿，但它是真的切了 tab——碎片
+    `7b664fd2a93a`（parent=根页）的快照里 7x24 已选中，因为爬虫点了它才拍到的。
+    """
+    from insta_engine.case_audit import nondiscriminating_assertions
+    from insta_engine.page_index import save_index
+
+    save_index(tmp_path / f"{PKG}.json",
+               {"package": PKG, "generated_at": "t", "sources": ["explore"],
+                "pages": [_page("home", depth=0, controls=_tabs_controls(1)),
+                          _page("frag", depth=1, parent_key="home",
+                                parent_action="7x24", controls=_tabs_controls(0))],
+                "edges": [{"from": "home", "to": "frag", "action": "7x24"}]})
+    case = TestCase.model_validate({
+        "caseId": "c", "name": "7x24", "target": {"package": PKG},
+        "steps": [{"id": "s1", "action": "launch"},
+                  {"id": "s2", "action": "tap",
+                   "target": {"strategy": "text", "value": "7x24"}},
+                  {"id": "s3", "action": "wait",
+                   "assertions": [{"type": "selected",
+                                   "target": {"strategy": "text", "value": "7x24"}}]}]})
+    assert "R27" not in _codes(nondiscriminating_assertions(case, tmp_path, PKG))

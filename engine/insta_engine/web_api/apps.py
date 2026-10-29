@@ -71,6 +71,8 @@ def api_apps_install(root: Path, host: str, body: dict) -> tuple[int, dict]:
         return 404, {"error": f"文件不存在: {p}"}
     if platform == "android" and p.suffix.lower() != ".apk":
         return 400, {"error": f"Android 安装包须为 .apk（收到 {p.suffix or '无后缀'}）"}
+    if platform == "harmony" and p.suffix.lower() != ".hap":
+        return 400, {"error": f"鸿蒙安装包须为 .hap（收到 {p.suffix or '无后缀'}）"}
     if platform == "ios" and p.suffix.lower() != ".app":
         # .ipa 是「zip 包了一层 .app」——simctl 与 devicectl 都不接受，必须先解压；
         # 此前放行 .ipa 只会在 job 里失败（验收判据前移，报错说清怎么办）。
@@ -86,6 +88,15 @@ def api_apps_install(root: Path, host: str, body: dict) -> tuple[int, dict]:
             rc, out = _run(_adb(serial, "install", "-r", "-t", str(p)), timeout=600)
             if rc != 0 or "Success" not in out:
                 raise RuntimeError(f"安装失败: {out[-300:]}")
+        elif platform == "harmony":
+            from .. import harmony_hdc as hdc
+
+            emit("install", "running", f"hdc install {p.name} → {serial}")
+            proc = hdc._run(["install", str(p)], serial=serial, timeout=600)
+            out = proc.stdout or ""
+            # hdc 的安装结果在文本里(返回码纪律宽松):成功含 "Successfully"/"install bundle successfully"
+            if proc.returncode != 0 or ("fail" in out.lower() and "success" not in out.lower()):
+                raise RuntimeError(f"安装失败: {(proc.stderr or out)[-300:]}")
         elif real_ios:
             from ..ios_device import install_app as ios_install
 

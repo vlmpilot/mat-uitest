@@ -448,6 +448,14 @@ def collapse_activity_variants(pages_by_key: dict,
     （P0-3 ①：折叠前 tx-news 27/52 条边悬空）；**折叠留痕落盘由调用方写进
     index["folds"]**（P0-3 ②：每条 fold 记录含 merged_into，可审计可回溯）；
     最后全图 depth 重算。
+
+    留痕字段（P0-6，2026-10-26）：每条 fold 记录除 `merged_into` 外还有
+    `folded[]`（每个被折叠页的 `page_key/title/hits/controls` **+ `identities`
+    与 `similarity`**）、`min_similarity`（簇内最勉强的那一刀）、
+    `children_relinked`（**本簇**改挂的子页数）。加这三样的理由：实测
+    「112 页并成 1 页」这种大合并原先**无法事后复核**——只有 page_key 列表，
+    看不出是"同一逻辑页的变体"还是"把不同页型并掉了"；而 `children_relinked`
+    在多簇时恒为 0，"改挂成功"与"根本没改挂"长得一模一样。
     """
     import collections
     import datetime as _dt
@@ -461,6 +469,9 @@ def collapse_activity_variants(pages_by_key: dict,
     folded_keys: set[str] = set()
     keeper_of: dict[str, str] = {}
     report: list[dict] = []
+    #: 被折叠页 → 它所属的 fold 记录。用于把 `children_relinked` 归到**具体那一条**
+    #: fold 上（原先 `len(report)==1` 才写值、多条一律写 0，等于多条簇时字段恒 0）。
+    fold_owner: dict[str, dict] = {}
 
     def _fold_cluster(act: str, members: list[dict]) -> None:
         anchors = [p for p in members if int(p.get("hits") or 0) >= 2
@@ -480,7 +491,22 @@ def collapse_activity_variants(pages_by_key: dict,
             "at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
             "folded": [],
         }
+        # ⚠️ 必须在并集**之前**快照 keeper 的 identities：循环里 keeper["identities"]
+        # 会被逐个变体撑大，拿撑大后的集合算 Jaccard 会让后面的变体得到**虚高**的
+        # 相似度（分母与交集同时变），而 similarity 正是事后复核分簇的唯一依据。
+        keeper_ids = {str(s) for s in (keeper.get("identities") or [])}
+
+        def _sim(v: dict) -> float:
+            """与 `page_index._ident_jaccard` 同算法，但用上面的快照。"""
+            vids = {str(s) for s in (v.get("identities") or [])}
+            if not keeper_ids or not vids:
+                return 0.0
+            return len(keeper_ids & vids) / len(keeper_ids | vids)
+
+        sims: list[float] = []
         for v in variants:
+            sim = _sim(v)
+            sims.append(sim)
             keeper["controls"] = _union_controls(keeper.get("controls") or [],
                                                  v.get("controls") or [])
             keeper["tried"] = sorted(set(keeper.get("tried") or [])
@@ -497,10 +523,21 @@ def collapse_activity_variants(pages_by_key: dict,
             keeper["node_count"] = len(keeper["controls"])
             folded_keys.add(v["page_key"])
             keeper_of[v["page_key"]] = keeper["page_key"]
+            fold_owner[v["page_key"]] = fold_entry
             fold_entry["folded"].append({
                 "page_key": v["page_key"], "title": v.get("title") or "",
                 "hits": v.get("hits", 1), "controls": len(v.get("controls") or []),
+                # P0-6（2026-10-26）：留痕要能**事后复核分簇**。原先只有
+                # page_key/title/hits/controls，「112 页并成 1 页」这类大合并
+                # 无法验证是"同一逻辑页的变体"还是"把不同页型并掉了"。
+                # identities 存完整集合（不截断）——它是复核的原始证据；
+                # 规模由「被折叠页数」决定，folds 本身每个簇只有一条。
+                "identities": list(v.get("identities") or []),
+                "similarity": round(sim, 3),
             })
+        # 簇内最小相似度：一次看尽"这批折叠最勉强的那一刀"，不必逐条翻
+        fold_entry["min_similarity"] = round(min(sims), 3) if sims else None
+        fold_entry["children_relinked"] = 0
         # keeper 不能挂在被折叠的变体上（否则自指）
         if keeper.get("parent_key") in folded_keys:
             keeper["parent_key"] = None
@@ -518,15 +555,19 @@ def collapse_activity_variants(pages_by_key: dict,
             _fold_cluster(act, members)
 
     if folded_keys:
-        relinked = 0
+        # P0-6：`children_relinked` 按 fold **分别**统计。原实现是
+        # `relinked if len(report) == 1 else 0` —— 多条簇时字段恒为 0，
+        # 于是"改挂成功"和"根本没改挂"在留痕里长得一模一样（比不记更坏）。
         for p in pages_by_key.values():
-            if p.get("parent_key") in folded_keys and p["page_key"] not in folded_keys:
-                new_parent = keeper_of.get(p["parent_key"])
+            old_parent = p.get("parent_key")
+            if old_parent in folded_keys and p["page_key"] not in folded_keys:
+                new_parent = keeper_of.get(old_parent)
                 if new_parent and new_parent != p["page_key"]:
                     p["parent_key"] = new_parent
-                    relinked += 1
-        for r in report:
-            r["children_relinked"] = relinked if len(report) == 1 else 0
+                    owner = fold_owner.get(old_parent)
+                    if owner is not None:
+                        owner["children_relinked"] = int(
+                            owner.get("children_relinked") or 0) + 1
         # P0-3 ①：edges 的 from/to 随折叠重映射 + 去重（同 from+to+action 合并 count）
         if edges is not None:
             seen: dict[tuple, dict] = {}

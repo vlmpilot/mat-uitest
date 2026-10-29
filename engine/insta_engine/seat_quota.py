@@ -67,9 +67,9 @@ BASE_SEATS = BASE_SEATS_PRO
 #: ⚠️ 2026-10-24 评审 P1-5：**服务端的 vision 字段至今未实现**——`/seat/status`
 #: 不下发 `vision_base`，`seat_grants` 表也没有 vision 列。下面这套读取逻辑是为
 #: 该规划预留的**前向兼容接收端**（测试用合成缓存钉住行为）；当前实际效果是
-#: 「同步过 ⇒ 回落默认 300」，`.env` 的 `MAT_VISION_LIMIT` 只在**从未同步**时生效。
+#: 「同步过 ⇒ 回落默认 100」，`.env` 的 `MAT_VISION_LIMIT` 只在**从未同步**时生效。
 #: 宣称按此口径讲，别对外说"服务端可配"。
-DEFAULT_VISION_LIMIT = 300
+DEFAULT_VISION_LIMIT = 100
 
 
 def vision_limit(now: int | None = None) -> int:
@@ -81,9 +81,9 @@ def vision_limit(now: int | None = None) -> int:
        `vision_base` 与**当前有效批次**的 `vision` 取**最大**——月上限是限制
        不是福利，多批并存（如过渡期临时加倍）取宽的那个，批次过期自动回落。
        ⚠️ 服务端 vision 字段未上线（见 DEFAULT_VISION_LIMIT 的注释）——此分支
-       当前实际回落默认 300，读取逻辑保留给规划中的服务端下发；
+       当前实际回落默认 100，读取逻辑保留给规划中的服务端下发；
     2. **从没同步过** ⇒ 回落 `.env` 的 `MAT_VISION_LIMIT`（过渡期的人工口子），
-       再否则默认 300。
+       再否则默认 100。
     """
     cache = read_cache()
     now = int(now if now is not None else time.time())

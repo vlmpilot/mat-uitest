@@ -75,6 +75,25 @@ def test_state_and_unknown_route(server):
     assert requests.get(f"{base}/api/nope", timeout=3).status_code == 404
 
 
+def test_metrics_route_is_same_implementation_as_cli(server):
+    """概览页的质量指标卡消费 `/api/metrics`：必须与 `mat metrics` 同一实现。"""
+    base, root = server
+    (root / "artifacts" / "eval").mkdir(parents=True)
+    (root / "artifacts" / "eval" / "baseline-demo.json").write_text(json.dumps({
+        "schema": "mat.eval/1", "suite": "demo.json", "repeat": 1,
+        "overall": {"median": 1.0, "min": 1.0, "max": 1.0, "spread_pp": 0.0},
+        "per_task": [{"id": "t1"}], "unstable": [], "app_fingerprints": ["fp1"],
+    }), encoding="utf-8")
+    r = requests.get(f"{base}/api/metrics", timeout=3)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schema"] == "mat.metrics/1"
+    item = next(i for i in body["products"] if "步骤成功率" in i["name"])
+    assert item["value"] == "100%", "端点必须直接返回指标卡，不在前端重算"
+    assert item["met"] is True and item["target"] == "≥ 95%"
+
+
+
 def test_console_index_and_spa_fallback(server):
     base, _ = server
     assert requests.get(f"{base}/", timeout=3).status_code == 200
@@ -469,7 +488,7 @@ def test_api_devices_annotates_platform(server):
     r = requests.get(f"{base}/api/devices", timeout=3)
     assert r.status_code == 200
     for d in r.json()["devices"]:
-        assert d["platform"] in ("android", "ios"), "每台设备都必须标注 platform"
+        assert d["platform"] in ("android", "ios", "harmony"), "每台设备都必须标注 platform"
         if d["platform"] == "ios":
             assert d["serial"], "iOS 真机条目必须带 udid 作 serial"
 

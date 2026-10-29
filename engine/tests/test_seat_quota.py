@@ -377,10 +377,10 @@ def test_describe_marks_each_batch():
 
 # -- 视觉兜底额度（2026-10-14：与成员名额同一套主机配额，vision_base + 批次 vision）--
 
-def test_vision_limit_defaults_to_300_without_sync(monkeypatch):
-    """服务端没配过 ⇒ 默认 300（发起人 2026-10-14 定）；`.env` 只在从没同步过时兜底。"""
+def test_vision_limit_defaults_to_plan_value_without_sync(monkeypatch):
+    """服务端没配过 ⇒ 默认 100（与标准版 300/100 的额度口径一致）；`.env` 只在从没同步过时兜底。"""
     monkeypatch.delenv("MAT_VISION_LIMIT", raising=False)
-    assert seat_quota.vision_limit() == 300
+    assert seat_quota.vision_limit() == 100
 
     monkeypatch.setenv("MAT_VISION_LIMIT", "500")
     assert seat_quota.vision_limit() == 500

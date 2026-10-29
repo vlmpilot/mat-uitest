@@ -22,6 +22,10 @@ def connect_driver(serial: str | None, platform: str = "android") -> BaseDriver:
         from .wda_driver import WdaDriver  # 延迟导入：无 facebook-wda 也能跑 Android
 
         return WdaDriver(serial)
+    if platform == "harmony":
+        from .harmony_driver import HarmonyDriver  # 延迟导入：无 hdc 也能跑 Android/iOS
+
+        return HarmonyDriver(serial)
     from .driver import DeviceDriver
 
     return DeviceDriver(serial)

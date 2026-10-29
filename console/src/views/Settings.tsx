@@ -1,12 +1,13 @@
 import {
-  Alert, Button, Descriptions, Input, Modal, Space, Tag, Tooltip, Typography, Tabs, message,
+  Alert, Button, Card, Descriptions, Input, Modal, Space, Tag, Tooltip, Typography, Tabs, message,
 } from "antd";
 import {
   CloudDownloadOutlined, InfoCircleOutlined, KeyOutlined, SafetyOutlined, TeamOutlined,
 } from "@ant-design/icons";
 import { useEffect, useState } from "react";
 import {
-  getCreds, getJob, getSeats, SeatsResp, seatRemove, startExport, StateResp, writeCred,
+  exportFinetune, FinetuneStats, getCreds, getFinetuneStats, getJob, getSeats, SeatsResp,
+  seatRemove, startExport, StateResp, writeCred,
 } from "../api";
 import PageHeader from "../components/PageHeader";
 
@@ -80,6 +81,9 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
       {/* 团队成员并入使用方式 tab（2026-10-12 发起人）：商业化只控额度+人数，看套餐就该看到成员名额 */}
       <div style={{ marginTop: 16 }}>
         <SeatsCard />
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <FinetuneCard />
       </div>
     </>
   );
@@ -186,6 +190,50 @@ function usageModeLabel(plan?: string): string {
 
 function WxContact() {
   return <a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">联系客服</a>;
+}
+
+// 微调数据(L2 工具链,2026-10-28):nl 回溯对数与门槛进度——数据积累是后台自动的,
+// 用户看不见就会忘;export 一键落 dataset/(训练本体走 CLI:mat finetune train,长任务+mlx 环境
+// 不进控制台)。仅 local 模式生效(server 官方代理加载不了用户 adapter)。
+function FinetuneCard() {
+  const [data, setData] = useState<FinetuneStats | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const load = () => getFinetuneStats().then(setData).catch(() => setData(null));
+  useEffect(() => { load(); }, []);
+  const doExport = async () => {
+    setExporting(true);
+    try {
+      await exportFinetune();
+      message.success("已导出 dataset/train.jsonl——训练:mat finetune train --data dataset --base <基座>");
+      load();
+    } catch (e) { message.error(String(e)); }
+    finally { setExporting(false); }
+  };
+  const apps = Object.entries(data?.per_app || {}).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const pct = data ? Math.min(100, Math.round(data.pairs / data.min_pairs * 100)) : 0;
+  return (
+    <Card size="small" title="微调数据(L2 工具链)">
+      {data && (
+        <Space direction="vertical" size={4} style={{ width: "100%" }}>
+          <span>
+            可回溯训练对 <b>{data.pairs}</b>/{data.min_pairs}（进度 {pct}%）
+            {data.enough && <Tag color="green">够训</Tag>}
+          </span>
+          {apps.length > 0 && (
+            <span style={{ color: "#697080", fontSize: 12 }}>
+              {apps.map(([a, n]) => `${a.split(".").pop()} ${n}`).join(" · ")}
+            </span>
+          )}
+          <div style={{ color: "#8a919f", fontSize: 12 }}>
+            正常使用 MAT（生成+通过）即自动积累;训练:mat finetune train(数据不出本机;
+            adapter 仅 local 模式生效)。完整操作手册:使用手册 §4.15。
+          </div>
+          <Button size="small" loading={exporting} onClick={doExport}>导出 dataset/</Button>
+        </Space>
+      )}
+      {!data && <span style={{ color: "#999", fontSize: 12 }}>统计不可用（工作区未初始化?）</span>}
+    </Card>
+  );
 }
 
 function SeatsCard() {

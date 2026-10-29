@@ -193,6 +193,73 @@ def substitute(prompt: str, variables: dict) -> str:
     return text
 
 
+def gen_variables(nl: str, app_info: dict | None) -> dict:
+    """gen 的模板变量：nl / app_info / 可选的 few-shot 示例。
+
+    示例按 `app_info.package` 检索同 App 的**已通过**用例（见 `fewshot.py`）；
+    没有 package 或开关未开时为空，行为与之前完全一致。
+
+    做成模块级函数而不是 `GenClient` 方法：测试桩是鸭子类型对象，没有实例方法。
+    """
+    variables: dict = {"nl": nl, "app_info": app_info or {}}
+    from . import fewshot
+
+    examples = fewshot.build(str((app_info or {}).get("package") or ""), nl)
+    if examples:
+        variables["examples"] = examples
+    return variables
+
+
+def _coverage_rounds(case, missing: list[str]) -> list[dict]:
+    """把缺失动作回喂：带上已有用例，要求只补不删。
+
+    整条重生成的代价是把已经对的步骤也可能改坏；带上原产物做增量修正更稳。
+    """
+    return [
+        {"role": "assistant", "content": case.model_dump_json(by_alias=True)},
+        {"role": "user", "content": (
+            "上面的用例缺少需求里的这些动作：\n- " + "\n- ".join(missing) +
+            "\n请在**保持已有步骤不变**的前提下补齐，输出完整的用例 JSON（同一 schema）。")},
+    ]
+
+
+def _finalize_gen(client, nl: str, app_info: dict | None, index_dir, validator,
+                  case, allow_retry: bool = True):
+    """质量闸 →（可选）缺步骤补一次 → 覆盖标记。"""
+    from . import step_coverage
+
+    gated = apply_quality_gate(case, index_dir)
+    if allow_retry and step_coverage.retry_enabled():
+        missing = step_coverage.missing(nl, gated)
+        if missing:
+            try:
+                retried = complete_task_raw(
+                    client, "gen", gen_variables(nl, app_info), "生成(补步骤)",
+                    validator=validator, rounds=_coverage_rounds(gated, missing))
+                gated = apply_quality_gate(retried, index_dir)
+            except GenError:
+                # 补步骤失败不该让整次生成失败——保留原产物，由 R28 如实报出来
+                pass
+    _attach_coverage(gated, nl)
+    # nl 回溯（2026-10-28，微调工具链 L2 的数据地基）：生成时的原始需求随用例落盘，
+    # 此前的 2,300+ 条 run.json 全部没有 nl ⇒ 历史数据无法构成 (nl → DSL) 训练对。
+    # 只存不用于执行链路；`mat finetune export` 消费。
+    if nl and not gated.meta.get("nl"):
+        gated.meta["nl"] = nl[:2000]
+    return gated
+
+
+def _attach_coverage(case, nl: str) -> None:
+    """把「需求有动作、步骤没承载」写进 `meta.quality_issues`（只报不改）。"""
+    from . import step_coverage
+
+    issues = step_coverage.missing(nl, case)
+    if not issues:
+        return
+    bucket = case.meta.setdefault("quality_issues", [])
+    bucket.extend(issues)
+
+
 def _assemble_local(task: str, variables: dict) -> str:
     from . import promptstore
 
@@ -206,7 +273,14 @@ def _assemble_local(task: str, variables: dict) -> str:
     appended = promptstore.read_append(task)
     if appended:
         prompt = f"{prompt}\n\n{appended}"
-    return substitute(prompt, variables)
+    text = substitute(prompt, variables)
+    # few-shot 示例：模板有 `{examples}` 时已随 substitute 注入；没有就追加到末尾。
+    # 追加而不是改模板，是为了不打断已有三处 prompt 的同步纪律（改模板要同时改
+    # prompts/*.example 与 engine/insta_engine/prompts/*.example，漂移有测试守着）。
+    examples = variables.get("examples")
+    if examples and "{examples}" not in prompt:
+        text = f"{text}\n\n{examples}"
+    return text
 
 
 def _messages_from(text: str, images: list[bytes] | None = None,
@@ -279,6 +353,15 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
     from . import ai_metrics
     _mode = task_mode(client)
     _round = 0
+    # 端到端计时（2026-10-26，P1-4）：task 行此前只有 rounds、没有耗时，导致
+    # `ai-stats` 只能报 **call 级** p50/p95。用户感知的是「一条用例要多久」= 逻辑任务
+    # 端到端（含内容级重试），一次重试就把答案从 1 次调用拉到 2 次。用 monotonic
+    # 而非累加 call 行 latency：call 行按秒取 ts，重试跨秒时无法可靠归组。
+    _t0 = time.monotonic()
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - _t0) * 1000)
+
     for _ in range(_content_repairs() + 1):
         _round += 1
         if task_mode(client) == "server":
@@ -321,7 +404,8 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
             repair = _JSON_REPAIR_NOTE.format(err=str(exc)[:400])
             continue
         if validator is None:
-            ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round)
+            ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round,
+                              latency_ms=_elapsed_ms())
             return data
         try:
             out = validator(data)
@@ -333,10 +417,12 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
             last = GenError(f"{context}输出不符合 schema: {exc}", content=text)
             repair = _SCHEMA_REPAIR_NOTE.format(err=str(exc)[:400])
             continue
-        ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round)
+        ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round,
+                          latency_ms=_elapsed_ms())
         return out
     ai_metrics.record(task=task, mode=_mode, ok=False, scope="task",
-                      rounds=_round, error=(str(last) or "")[:160])
+                      rounds=_round, error=(str(last) or "")[:160],
+                      latency_ms=_elapsed_ms())
     raise GenError(f"{context}：内容级重试 {_content_repairs()} 次后仍不合法（JSON 或 schema）。"
                    f"{last}", content=getattr(last, "content", None))
 
@@ -612,9 +698,11 @@ class GenClient:
         # （实测失败率 39%）。
         # 生成路径接质量闸门（R8，与导入共用 case_quality 单一实现）；
         # validator 用 _validate_single 兼容拆分 prompt 的 cases 数组输出（取首条）。
-        case = complete_task_raw(self, "gen", {"nl": nl, "app_info": app_info or {}}, "生成",
+        case = complete_task_raw(self, "gen", gen_variables(nl, app_info), "生成",
                                  validator=_page_checked(_validate_single, index_dir, app_info))
-        return apply_quality_gate(case, index_dir)
+        return _finalize_gen(
+            self, nl, app_info, index_dir,
+            _page_checked(_validate_single, index_dir, app_info), case)
 
     def generate_cases(self, nl: str, app_info: dict | None = None,
                        index_dir: Path | None = None) -> tuple[list[TestCase], list[str]]:
@@ -626,11 +714,18 @@ class GenClient:
         每条产物过 apply_quality_gate（R8：与导入路径共用同一闸门），
         issues 落各自 meta.quality_issues。
         """
-        items, warns = complete_task_raw(self, "gen", {"nl": nl, "app_info": app_info or {}},
+        items, warns = complete_task_raw(self, "gen", gen_variables(nl, app_info),
                                          "生成",
                                          validator=_page_checked(_validate_multi, index_dir,
                                                                  app_info))
-        return [apply_quality_gate(c, index_dir) for c in items], warns
+        validator = _page_checked(_validate_multi, index_dir, app_info)
+        out = []
+        for case in items:
+            # 批量场景只给第一条补步骤：每条都补会让一次生成变成 N 次调用
+            allow = not out
+            out.append(_finalize_gen(self, nl, app_info, index_dir, validator, case,
+                                     allow_retry=allow))
+        return out, warns
 
     def polish(self, nl: str, app_info: dict | None = None) -> str:
         """场景描述润色（P1.5）：模糊描述对齐控件清单真实文案 + 并列入口显性化。
@@ -773,6 +868,13 @@ class GenClient:
         """
         payload: dict = {"model": self._model_for(task), "messages": messages,
                          "temperature": _env_float("GEN_TEMPERATURE", 0.2)}
+        # 本地 Qwen3/3.5 全系默认开 thinking：思维链吃满输出预算，正文落在 `reasoning`
+        # 字段而 `content` 为 null（2026-10-28 实测 Qwen3-14B：16 token 全在思考，
+        # content=null）。MAT 解析的是 content ⇒ 必然失败。
+        # 只在显式开启时才加：非 Qwen 端点不认识这个字段，贸然带上会 400。
+        if os.environ.get("GEN_DISABLE_THINKING", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
         # 结构化输出约束：让服务端强制返回 JSON 对象，从源头减少非法输出。
         # 不是所有 OpenAI 兼容端点都支持 → 遇到 400 就**记下来并降级**（不静默失败）。
         # polish 例外：输出是自然语言（生成环节的输入），json_object 强约束毫无意义
@@ -801,7 +903,8 @@ class GenClient:
         # T59：GEN_TIMEOUT 显式设置优先；未设时用任务级自动预算（describe 大批量实测 60s 不够）
         timeout = _env_opt_int("GEN_TIMEOUT") or getattr(self, "timeout_override", None) or 60
         from .offline import require_online
-        require_online(f"{context}（BYOK 端点）")
+        # 带上端点：本机端点（127.0.0.1 / localhost）不出网，离线模式放行
+        require_online(f"{context}（BYOK 端点）", endpoint=self.base_url)
         min_interval = _env_float("MAT_REQUEST_MIN_INTERVAL", 0.0)
         last_error: Exception | None = None
         for attempt in range(3):

@@ -147,7 +147,7 @@ function DoctorCard({ title, loading, checks, resp, conclusion, onRerun, busy, o
   onGoSettings?: () => void; onManage?: () => void }) {
   const age = resp ? Math.max(0, Math.round((Date.now() - Date.parse(resp.ran_at)) / 1000)) : 0;
   return (
-    <Card size="small" loading={loading}
+    <Card size="small" loading={loading} style={{ height: "100%" }}
       title={<span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
         {/* 标题可省略、结论 Tag 不可被挤掉（发起人 2026-10-12：窄列下 Android 卡的结论图标容易缺省） */}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
@@ -174,9 +174,13 @@ export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
   const [err, setErr] = useState<string | null>(null);
   const [manageOpen, setManageOpen] = useState(false);
 
-  const runOne = useCallback((key: "android" | "ios") => {
+  const runOne = useCallback((key: "android" | "ios" | "harmony") => {
     setBusyKey(key); setErr(null);
-    getDoctor(key).then((r) => { (key === "android" ? setAndroid : setIos)(r); })
+    getDoctor(key).then((r) => {
+      if (key === "android") setAndroid(r);
+      else if (key === "ios") setIos(r);
+      else setHarmony(r);
+    })
       .catch((e) => setErr(String(e)))
       .finally(() => setBusyKey(null));
   }, []);
@@ -184,7 +188,10 @@ export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
     runOne("android");
     // 非 macOS 没有 iOS 工具链：不发起这次检测，也不渲染 iOS 卡
     if (iosSupported) runOne("ios");
+    // 鸿蒙卡恒渲染（hdc 未装时卡里给出可选指引—— hdc 缺失只是 warn 不是 critical）
+    runOne("harmony");
   }, [runOne, iosSupported]);
+  const [harmony, setHarmony] = useState<DoctorResp | null>(null);
 
   const androidChecks = android?.checks ?? [];
   const envChecks = androidChecks.filter((c) => !isAi(c));
@@ -193,20 +200,27 @@ export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
   const genOk = aiChecks.some((c) => c.id === "gen" && c.ok);
 
   return (
-    <Row gutter={16} style={{ marginTop: 16 }}>
-      <Col span={iosSupported ? 8 : 12}>
+    <Row gutter={16} style={{ marginTop: 16 }} align="stretch">
+      <Col span={12}>
         <DoctorCard title="Android 环境" loading={!android && !err} checks={envChecks} resp={android}
           conclusion={androidConclusion(envChecks)} onRerun={() => runOne("android")}
           busy={busyKey === "android"} />
       </Col>
       {iosSupported && (
-        <Col span={8}>
+        <Col span={12}>
           <DoctorCard title="iOS 环境" loading={!ios && !err} checks={iosChecks} resp={ios}
             conclusion={iosConclusion(iosChecks)} onRerun={() => runOne("ios")}
             busy={busyKey === "ios"} />
         </Col>
       )}
-      <Col span={iosSupported ? 8 : 12}>
+      <Col span={12}>
+        <DoctorCard title="鸿蒙环境" loading={!harmony && !err} checks={harmony?.checks ?? []} resp={harmony}
+          conclusion={harmony?.checks?.some((c) => c.id === "harmony-devices" && c.ok)
+            ? { color: "green", text: "可以开测(鸿蒙)" }
+            : { color: "orange", text: "hdc/设备未就绪(可选能力)" }} onRerun={() => runOne("harmony")}
+          busy={busyKey === "harmony"} />
+      </Col>
+      <Col span={12}>
         <DoctorCard title="AI 生成" loading={!android && !err} checks={aiChecks} resp={android}
           conclusion={genOk
             ? { color: "green", text: `已配置 · ${state.prompt_mode === "server" ? "server" : "自部署"}` }

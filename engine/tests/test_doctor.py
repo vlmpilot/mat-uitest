@@ -76,9 +76,12 @@ def test_ios_checks_structure_on_non_macos(monkeypatch):
 
 
 def test_run_merges_groups():
-    assert len(doctor.run("all")) == len(doctor.android_checks()) + len(doctor.ios_checks())
+    assert len(doctor.run("all")) == (len(doctor.android_checks())
+                                      + len(doctor.ios_checks())
+                                      + len(doctor.harmony_checks()))
     assert len(doctor.run("android")) == len(doctor.android_checks())
     assert len(doctor.run("ios")) == len(doctor.ios_checks())
+    assert len(doctor.run("harmony")) == len(doctor.harmony_checks())
 
 
 def test_wda_server_downgrades_without_lib(monkeypatch):

@@ -5,7 +5,11 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .tmp_pytest*/
-artifacts/
+artifacts/*
+# 评测基线必须版本化(守门依据);逐遍产物仍不进
+!artifacts/eval
+artifacts/eval/*
+!artifacts/eval/baseline-*.json
 .insta/
 
 # 人工复核结论（mat review 写入）。默认不入库：它记的是**你这台机器上被测 App 的页面标识**，

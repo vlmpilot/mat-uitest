@@ -184,16 +184,18 @@ def run_api(params: dict, variables: dict[str, str]) -> dict:
     evidence: dict = {"method": "GET", "url": "", "status": None,
                       "duration_ms": 0, "passed": False, "error": None,
                       "request": {}, "expect": [], "body_snippet": "", "saved": {}}
+    p = substitute_deep(params or {}, variables)
+    method = str(p.get("method", "GET")).upper()
+    url = str(p.get("url", "")).strip()
     try:
-        require_online("api 步骤（HTTP 业务断言）")
+        # 带 URL 判定：本机 mock 服务（127.0.0.1/localhost）不出网，离线模式放行。
+        # 必须先替换变量再判定——`{base_url}/health` 这种写法的 host 只在替换后才可见。
+        require_online("api 步骤（HTTP 业务断言）", endpoint=url)
     except Exception as exc:
         evidence["error"] = f"{type(exc).__name__}: {exc}"
         evidence["duration_ms"] = int((time.monotonic() - started) * 1000)
         return evidence
 
-    p = substitute_deep(params or {}, variables)
-    method = str(p.get("method", "GET")).upper()
-    url = str(p.get("url", "")).strip()
     evidence["method"] = method
     evidence["url"] = _redact_url(url)  # query 里凭据形态的键打码（P1-5③）
 

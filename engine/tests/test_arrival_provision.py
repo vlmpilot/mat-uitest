@@ -24,6 +24,7 @@ class FakeNavDriver:
         self.stack = [start]
         self.navigate = navigate
         self.starts = 0
+        self.stops = 0
         self.clicks: list[tuple[str, int, int]] = []
 
     def dump(self):
@@ -39,6 +40,9 @@ class FakeNavDriver:
     def app_start(self, package, activity=None):
         self.starts += 1
         self.stack = ["A"]
+
+    def app_stop(self, package):
+        self.stops += 1
 
     def screenshot(self, path):
         Path(path).write_bytes(b"\x89PNG fake")
@@ -109,6 +113,40 @@ def test_infer_fragmented_pages_pick_representative():
     ]
     page = infer_target_page(_case(("text", "去C")), pages)
     assert page is not None and page["page_key"] == "p_frag3"  # stable 优先于 hits
+
+
+def test_infer_prefers_shallower_page_on_tie():
+    """stable/hits 都打平时**按 depth 浅的优先**，不许落到 `page_key` 字母序。
+
+    现场来源（2026-10-29，xhs 图谱重建后 3/3 复现）：根页 `bad6f75c`（depth=0）与
+    「运动」频道页 `00848095`（depth=1）都含 `text=我`、hits 都是 1 ⇒ 字母序把
+    `00848095` 排前面 ⇒ 置备去点「运动」、落到笔记详情页 ⇒ 用例 `tap 我` 必失败。
+    这里刻意让**深层页的 key 字母序更靠前**，锁住"不能靠字母序"。
+    """
+    from insta_engine.arrival_provision import infer_target_page
+
+    pages = [
+        {"page_key": "00848095aaa", "activity": "com.x/.A", "depth": 1, "hits": 1,
+         "parent_key": "bad6f75cbbb", "controls": [{"desc": "我"}]},
+        {"page_key": "bad6f75cbbb", "activity": "com.x/.A", "depth": 0, "hits": 1,
+         "controls": [{"desc": "我"}]},
+    ]
+    page = infer_target_page(_case(("text", "我")), pages)
+    assert page is not None and page["page_key"] == "bad6f75cbbb", page
+
+
+def test_infer_still_prefers_stable_over_depth():
+    """depth 只是**同分时的次序**：arrival 已验证 stable 的仍然优先（判据不变）。"""
+    from insta_engine.arrival_provision import infer_target_page
+
+    pages = [
+        {"page_key": "p_root", "activity": "com.x/.A", "depth": 0, "hits": 1,
+         "controls": [{"text": "去C"}]},
+        {"page_key": "p_deep", "activity": "com.x/.A", "depth": 2, "hits": 1,
+         "arrival": {"status": "stable"}, "controls": [{"text": "去C"}]},
+    ]
+    page = infer_target_page(_case(("text", "去C")), pages)
+    assert page is not None and page["page_key"] == "p_deep", page
 
 
 def test_infer_no_match_or_no_target_returns_none():
@@ -184,6 +222,30 @@ def test_provision_landing_mismatch_reports_not_ok(tmp_path):
     ev = provision(_case(), drv, "com.x", _build_graph(tmp_path), sleep_scale=0.01)
     assert ev["needed"] is True and ev["ok"] is False, ev
     assert "落点不符" in ev["reason"]
+
+
+def test_provision_failure_restores_launch_state(tmp_path):
+    """置备失败后**必须把 App 送回 launch 后的状态**，不能把用例丢在错页上。
+
+    现场来源（2026-10-29，xhs-5/xhs-6 3/3）：置备点了「运动」、落到笔记详情页后
+    只打印"用例按原样继续"，而"原样"已经不是首页 ⇒ 用例的 `tap 我` 在详情页上
+    必然失败，报成 `locate-fail`。这里锁住：失败 ⇒ 先停再起 + 证据留痕。
+    """
+    from insta_engine.arrival_provision import provision
+
+    class _Foreground(FakeNavDriver):
+        """前台就是被测包（真实情形）⇒ 置备开始时**不需要**冷启动，
+        这样 `stops/starts` 的计数只反映"失败后的恢复"，不会被开头那次冷启动污染。"""
+
+        def foreground_app(self):
+            return {"package": "com.x"}
+
+    drv = _Foreground(start="A", navigate=False)
+    ev = provision(_case(), drv, "com.x", _build_graph(tmp_path), sleep_scale=0.01)
+    assert ev["ok"] is False
+    assert ev["restored"] is True, ev
+    assert drv.stops == 1 and drv.starts == 1, (drv.stops, drv.starts)
+    assert drv.stack == ["A"], "恢复后应回到 launch 落点"
 
 
 def test_provision_never_raises_on_driver_errors(tmp_path):

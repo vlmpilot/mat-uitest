@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from .. import ios_wda
 from ..device import list_adb_devices
@@ -48,13 +49,71 @@ def ios_state_devices() -> list[dict]:
     return out
 
 
+def _emulator_instances() -> list[dict]:
+    """DevEco 模拟器实例注册表(`~/.Huawei/Emulator/deployed/lists.json`)。
+
+    每实例含 name(=机型名,如 "Mate 90 Pro2")/model/showVersion/lastStartTime——
+    设备侧 `param get const.product.model` 在模拟器上恒为 "emulator",
+    **机型名只能从这份本机文件拿**。文件缺失/坏档返回空(回落设备侧 param)。"""
+    p = Path.home() / ".Huawei" / "Emulator" / "deployed" / "lists.json"
+    try:
+        entries = json.loads(p.read_text(encoding="utf-8"))
+        return entries if isinstance(entries, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def harmony_state_devices() -> list[dict]:
+    """鸿蒙设备并入设备清单（2026-10-26；10-29 显示增强）。
+
+    字段与 adb 设备同构（serial=hdc target key、platform="harmony"）。
+    hdc 缺失/无设备 ⇒ 空列表（鸿蒙链路整体可选，不阻塞 Android/iOS）。
+    model 显示口径：模拟器(单台,127.0.0.1)用**最近启动实例的机型名**（
+    lists.json——param 的 model 恒为 "emulator" 没有信息量）；真机/多台回落
+    设备侧 param 或 serial。os 取实例的 showVersion（如 "HarmonyOS 7.0.0(26.0.0)"）。
+    """
+    from .. import harmony_hdc as hdc
+
+    if not hdc.hdc_available():
+        return []
+    try:
+        targets = hdc.list_targets()
+    except Exception:  # noqa: BLE001 —— hdc 异常按无设备(与 adb 缺失同口径)
+        return []
+
+    instances = sorted(_emulator_instances(),
+                       key=lambda e: e.get("lastStartTime") or 0, reverse=True)
+    out: list[dict] = []
+    for key in targets:
+        model, os_ver = "", ""
+        try:
+            model = hdc.shell("param get const.product.model", serial=key,
+                              timeout=10).strip()
+            os_ver = hdc.shell("param get const.ohos.apiversion", serial=key,
+                               timeout=10).strip()
+        except Exception:  # noqa: BLE001 —— param 取不到回落 serial
+            pass
+        # 本机模拟器(127.0.0.1)且实例注册表可用:单台在线 ⇒ 用最近启动实例的
+        # 机型名/showVersion;多台在线不做端口猜测(没法可靠对应,退回 param)
+        if key.startswith("127.0.0.1") and len(targets) == 1 and instances:
+            latest = instances[0]
+            if latest.get("name"):
+                model = str(latest["name"])
+                if latest.get("showVersion"):
+                    os_ver = str(latest["showVersion"])
+        out.append({"serial": key, "state": "device",
+                    "model": model or key, "os": os_ver, "platform": "harmony"})
+    return out
+
+
 def api_devices() -> tuple[int, dict]:
-    """GET /api/devices：adb 枚举 + iOS USB 真机（2026-10-19 起真机也在此列），
+    """GET /api/devices：adb 枚举 + iOS USB 真机 + 鸿蒙设备（2026-10-26 起三方同列），
     逐项标注 platform 供上层按平台路由（评审 I4）。iOS 模拟器不可枚举
     （WDA 常驻 localhost:8100），可达性在首次连接时校验。
     """
     devices = [{**d, "platform": "android"} for d in list_adb_devices()]
     devices.extend(ios_state_devices())
+    devices.extend(harmony_state_devices())
     return 200, {"devices": devices}
 
 

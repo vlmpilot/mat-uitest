@@ -10,7 +10,8 @@ import {
 } from "@ant-design/icons";
 import { ReactNode, useEffect, useRef, useState } from "react";
 import {
-  getJobs, getSeats, getState, getOperator, getVersionCheck, cancelJob, JobInfo, openWorkspace, seatCheck, setOperator,
+  getJobs, getSeats, getState, getOperator, getVersionCheck, cancelJob, getMetrics, JobInfo,
+  MetricItem, MetricsResp, openWorkspace, seatCheck, setOperator,
   StateResp, submitAuthKey, VersionCheck,
 } from "./api";
 import Audit from "./views/Audit";
@@ -36,7 +37,7 @@ import { VIEWS, VIEW_BY_HASH, VIEW_BY_KEY, ViewKey, VIEW_GROUPS } from "./views"
 function StatCard({ icon, tint, color, title, value, sub }: {
   icon: ReactNode; tint: string; color: string; title: string; value: ReactNode; sub?: ReactNode }) {
   return (
-    <Card>
+    <Card style={{ height: "100%" }}>
       <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
         <div style={{ width: 44, height: 44, borderRadius: 10, background: tint, color,
           display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flex: "none" }}>
@@ -107,6 +108,50 @@ function NextStepCard({ state, onNav }: { state: StateResp; onNav: (nav: Nav) =>
       title={<span>{step.icon}<span style={{ color: "#4F5BFF", margin: "0 8px" }}>{step.title}</span></span>}
       extra={<Button type="primary" size="small" onClick={() => onNav({ view: step.view })}>{step.action}</Button>}>
       <Typography.Text type="secondary">{step.desc}</Typography.Text>
+    </Card>
+  );
+}
+
+// 质量指标卡（2026-10-27，发起人：「指标卡只有 CLI，GUI 概览页看不到」）：
+// 直接消费 `/api/metrics`（与 `mat metrics --json` 同一实现）——缺产出项后端已标「未建立」，
+// 前端只负责呈现达标 ✓/✗ 与口径 caveat，不在这里重算任何数字。
+function QualityMetricsCard() {
+  const [data, setData] = useState<MetricsResp | null>(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    getMetrics().then(setData).catch((e) => setErr(String(e)));
+  }, []);
+  const groups: [string, MetricItem[] | undefined][] = [
+    ["产品质量", data?.products], ["工具能力", data?.tool], ["成本效率", data?.cost],
+  ];
+  return (
+    <Card size="small" title="质量指标" style={{ marginTop: 16 }}
+      extra={<Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        与 mat metrics 同源 · 缺产出的项标「未建立」</Typography.Text>}>
+      {err
+        ? <Typography.Text type="danger" style={{ fontSize: 12 }}>指标读取失败：{err}</Typography.Text>
+        : <Row gutter={16}>
+          {groups.map(([title, items]) => (
+            <Col span={8} key={title}>
+              <div style={{ fontSize: 12, color: "#8a919f", marginBottom: 8 }}>{title}</div>
+              {(items || []).map((it) => (
+                <div key={it.name} style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 13 }}>
+                    {it.name}: <b>{it.value}</b>
+                    {it.met === true && <Tag color="green" bordered={false}
+                      style={{ marginInlineStart: 6 }}>✓ 达标</Tag>}
+                    {it.met === false && <Tag color="red" bordered={false}
+                      style={{ marginInlineStart: 6 }}>✗ 未达标</Tag>}
+                  </div>
+                  {it.caveat && <div style={{ fontSize: 12, color: "#8a919f" }}>{it.caveat}</div>}
+                  {it.target && <div style={{ fontSize: 12, color: "#8a919f" }}>目标 {it.target}</div>}
+                </div>
+              ))}
+              {!items?.length && <div style={{ fontSize: 12, color: "#8a919f" }}>—</div>}
+            </Col>
+          ))}
+        </Row>}
+      {!data && !err && <Typography.Text type="secondary" style={{ fontSize: 12 }}>加载中…</Typography.Text>}
     </Card>
   );
 }
@@ -219,6 +264,7 @@ function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => voi
           sub={state.runs.length ? `通过 ${passed} · 失败 ${state.runs.length - passed}` : "暂无执行"} /></Col>
       </Row>
       <NextStepCard state={state} onNav={onNav} />
+      <QualityMetricsCard />
       <EnvDoctor state={state} onGoSettings={() => onNav({ view: "settings" })} />
     </>
   );

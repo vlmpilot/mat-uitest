@@ -492,7 +492,7 @@ export default function Reports({ state, onLaunched }: {
                   <Button size="small" onClick={() => setCalibRun(r.dir)}>校准</Button>
                   <a href={`/artifacts/${r.dir}/report.html`} target="_blank" rel="noreferrer">报告 ↗</a>
                   {/* 单条重跑：重放产物自带的用例数据（不受源文件变动影响），按原平台发起 */}
-                  <Tooltip title={`重放这次执行的用例（${r.platform === "ios" ? "iOS" : "安卓"}）——验证修复/回归`}>
+                  <Tooltip title={`重放这次执行的用例（${r.platform === "ios" ? "iOS" : r.platform === "harmony" ? "鸿蒙" : "安卓"}）——验证修复/回归`}>
                     <Button size="small" loading={rerunning === r.dir}
                       onClick={() => rerun(r)}>重跑</Button>
                   </Tooltip>

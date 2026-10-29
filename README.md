@@ -58,6 +58,8 @@ GEN_BASE_URL=<你的 OpenAI 兼容端点>
 GEN_API_KEY=<你的 Key>
 GEN_MODEL=<语言模型名>
 GEN_VL_MODEL=<视觉模型名>   # 可选：视觉兜底，不配则关闭
+GEN_VL_BASE_URL=<视觉端点>  # 可选：兜底单独走一个端点（如本机模型）
+MAT_VL_MAX_EDGE=1280        # 可选：送模型前把长边压到这个值（默认不缩）
 ```
 
 prompt 在你本机拼装（`GEN_PROMPT_MODE` 默认 `local`），请求直连你的端点：控件文本与截图**不经过 MAT 服务器**。模型可自选（DashScope / 智谱 / DeepSeek / OpenAI / 企业内网网关）。
@@ -74,7 +76,9 @@ GEN_PROMPT_MODE=server
 
 > 数据流向是两条路最大的区别：要「内容不出本机」，用方式一；只有方式二会把请求交给我们中转。代理的 prompt 档与本地档同源（gen v1.2），差异只在是否需要自己配 API Key。
 
-`GEN_MODEL` 是生成类命令（gen / describe / diagnose 等）的**主模型，必需**；`GEN_VL_MODEL` 仅用于视觉兜底（发送截图，默认关闭、需显式开启）——只配 VL 不能替代主模型。`mat export` 可一键导出全部本地数据。
+`GEN_MODEL` 是生成类命令（gen / describe / diagnose 等）的**主模型，必需**；`GEN_VL_MODEL` 仅用于视觉兜底（发送截图，默认关闭、需显式开启）——只配 VL 不能替代主模型。`GEN_VL_BASE_URL` 让兜底单独走另一个端点，最常见用法是**生成留在云端、兜底换成本机模型**（截图不出本机）；端点填 `127.0.0.1` 时若系统开了 `http_proxy`，记得 `NO_PROXY=127.0.0.1,localhost`，否则请求会被代理转走（表现是 502）。`MAT_VL_MAX_EDGE` 只缩**发给模型的那份**截图（坐标仍按原图换算，精度不受影响）——本机小模型嫌慢时设 1280，单次可从 7~8 秒降到 3~4 秒；不设则原样发送。**端点在本机时请求自动走 OpenAI 兼容协议**（`/v1/chat/completions`，与 `GEN_PROMPT_MODE` 无关——本机模型服务普遍只提供这一种接口，走官方代理的私有协议会 404），这类调用也**不占官方视觉额度**（平台没出 token 钱）。`mat export` 可一键导出全部本地数据。
+
+> `MAT_OFFLINE=1`（离线模式）只拒绝**出网**请求；端点在本机（`127.0.0.1` / `localhost`）时照常放行——「私有化部署 + 本机小模型」因此可以同时成立。
 
 ## 使用方式与获取
 

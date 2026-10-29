@@ -34,7 +34,7 @@ const TEMPLATE = JSON.stringify({
 
 function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial,
                      record, setRecord }: {
-  state: StateResp; runPlatform: "android" | "ios"; setRunPlatform: (v: "android" | "ios") => void;
+  state: StateResp; runPlatform: "android" | "ios" | "harmony"; setRunPlatform: (v: "android" | "ios" | "harmony") => void;
   runSerial: string | null; setRunSerial: (v: string | null) => void;
   record: boolean; setRecord: (v: boolean) => void }) {
   // 显式 flex（替代 antd Space）：筛选栏各控件高度不一（Select 32 / Checkbox 24），
@@ -52,7 +52,8 @@ function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial
         <Select style={{ width: 120 }} value={runPlatform}
           onChange={(v) => { setRunPlatform(v); setRunSerial(null); }}
           options={[{ value: "android", label: "Android" },
-                    ...(iosSupported ? [{ value: "ios", label: "iOS" }] : [])]} />
+                    ...(iosSupported ? [{ value: "ios", label: "iOS" }] : []),
+                    { value: "harmony", label: "鸿蒙" }]} />
       </Tooltip>
       <Tooltip title={runPlatform === "ios"
         ? "选 USB 真机；留空 = 模拟器（WDA 常驻 localhost:8100）"
@@ -73,7 +74,7 @@ function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial
   );
 }
 
-function useRunTarget(state: StateResp, runPlatform: "android" | "ios", runSerial: string | null) {
+function useRunTarget(state: StateResp, runPlatform: "android" | "ios" | "harmony", runSerial: string | null) {
   const online = state.devices.filter((d) => d.state === "device");
   const androidOnline = online.filter((d) => (d.platform || "android") === "android");
   const runDisabled = runPlatform === "android" && androidOnline.length === 0;
@@ -91,7 +92,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
                     record, setRecord, reset, setReset, focusStep, appLabels }: {
   state: StateResp; onLaunched: (id: string) => void; openCaseName?: string;
   onOpenCase?: (name: string) => void; onNav?: (nav: Nav) => void; onCasesChanged: () => void;
-  runPlatform: "android" | "ios"; setRunPlatform: (v: "android" | "ios") => void;
+  runPlatform: "android" | "ios" | "harmony"; setRunPlatform: (v: "android" | "ios" | "harmony") => void;
   runSerial: string | null; setRunSerial: (v: string | null) => void;
   record: boolean; setRecord: (v: boolean) => void;
   reset: "off" | "cold"; setReset: (v: "off" | "cold") => void;
@@ -346,7 +347,7 @@ type SuiteEditing = { file: string | null; title: string; cases: string[] };
 function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, setRunSerial,
                      record, setRecord, reset, setReset, appLabels }: {
   state: StateResp; onLaunched: (id: string) => void;
-  runPlatform: "android" | "ios"; setRunPlatform: (v: "android" | "ios") => void;
+  runPlatform: "android" | "ios" | "harmony"; setRunPlatform: (v: "android" | "ios" | "harmony") => void;
   runSerial: string | null; setRunSerial: (v: string | null) => void;
   record: boolean; setRecord: (v: boolean) => void;
   reset: "off" | "cold"; setReset: (v: "off" | "cold") => void;
@@ -615,7 +616,7 @@ export default function Cases({ state, onLaunched, openCaseName, onOpenCase, onN
   state: StateResp; onLaunched: (id: string) => void; openCaseName?: string;
   onOpenCase?: (name: string) => void; onNav?: (nav: Nav) => void; onCasesChanged: () => void;
   focusStep?: string | null }) {
-  const [runPlatform, setRunPlatform] = useState<"android" | "ios">("android");
+  const [runPlatform, setRunPlatform] = useState<"android" | "ios" | "harmony">("android");
   const [runSerial, setRunSerial] = useState<string | null>(null);
   const [record, setRecord] = useState(true); // 全程录 + 只留失败（发起人拍板）
   const [reset, setReset] = useState<"off" | "cold">("cold"); // 批量默认冷启动重置（跨用例状态隔离）

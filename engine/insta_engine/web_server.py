@@ -62,6 +62,7 @@ from .web_api.device import (
 )
 from .web_api.diagnose import api_diagnose
 from .web_api.export import api_export
+from .web_api.finetune import api_finetune_export, api_finetune_stats
 from .web_api.heals import api_heal_apply, api_heal_list
 from .web_api.indexing import api_index
 from .web_api.invite import api_invite_action, api_invite_status
@@ -97,7 +98,13 @@ from .web_api.runtime import (  # noqa: F401
 from .web_api.seats import api_seat_check, api_seat_remove, api_seats
 from .web_api.seats import enforce as seat_enforce
 from .web_api.share import api_share
-from .web_api.state import api_activate, api_doctor, api_doctor_fix, api_state  # noqa: F401
+from .web_api.state import (  # noqa: F401
+    api_activate,
+    api_doctor,
+    api_doctor_fix,
+    api_metrics,
+    api_state,
+)
 from .web_api.version_check import api_version_check, start_background_check
 from .web_api.workspace import (  # noqa: F401
     api_fs_browse,
@@ -183,6 +190,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _get_json_routes(self):
         return {
             "/api/state": lambda: api_state(self.root),
+            # 质量指标卡（概览页消费；与 `mat metrics --json` 同一实现）
+            "/api/metrics": lambda: api_metrics(self.root),
             "/api/version/check": lambda: (200, api_version_check()),
             "/api/devices": lambda: api_devices(),
             "/api/elements": lambda: api_elements(
@@ -194,6 +203,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.root, (self.query.get("package") or [""])[0]),
             "/api/review": lambda: api_review_list(self.root, (self.query.get("package") or [""])[0]),
             "/api/controls": lambda: api_controls(self.root, (self.query.get("package") or [""])[0]),
+            "/api/finetune/stats": lambda: api_finetune_stats(self.root),
             "/api/app/labels": lambda: api_app_labels(
                 self.root, (self.query.get("packages") or [""])[0]),
             # 按应用的测试说明（黑/白名单等，gen/polish 自动注入 prompt）
@@ -456,6 +466,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/case": lambda: api_case_save(self.root, self.body),
             "/api/case/delete": lambda: api_case_delete(self.root, self.body),
             "/api/case/rename": lambda: api_case_rename(self.root, self.body),
+            "/api/finetune/export": lambda: api_finetune_export(self.root, self.body),
             "/api/gen": lambda: api_gen(self.root, self.body),
             "/api/polish": lambda: api_polish(self.root, self.body),
             "/api/import/preview": lambda: api_import_preview(self.root, self.body),

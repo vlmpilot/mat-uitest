@@ -1,10 +1,10 @@
 // platform 缺省 android（历史字段无它）；iOS USB 真机由 /api/state 下发
 // （serial=udid，state="device"），前端按它分流到 WDA 真机链路（2026-10-19）。
 export type Device = { serial: string; state: string; model?: string; os?: string;
-  platform?: "android" | "ios" };
+  platform?: "android" | "ios" | "harmony" };
 export type RunInfo = { dir: string; case_id?: string; case_name?: string; package?: string;
   status?: string; rate?: number; finished_at?: string; operator?: string;
-  platform?: "android" | "ios";
+  platform?: "android" | "ios" | "harmony";
   failed_categories?: Record<string, number>;
   batch?: { id: string; suite: string; index: number; total: number };
   diagnosed?: boolean; calibrated?: boolean; human_marked?: boolean };
@@ -105,6 +105,14 @@ export const seatRemove = (name: string) =>
 
 export const getState = () => j<StateResp>("/api/state");
 
+// 质量指标卡（与 `mat metrics --json` 同源）：概览页消费，缺产出时 value="未建立"。
+export type MetricItem = { name: string; value: string; caveat?: string;
+  target?: string | null; met?: boolean | null };
+export type MetricsResp = {
+  schema: string; products: MetricItem[]; tool: MetricItem[]; cost: MetricItem[];
+};
+export const getMetrics = () => j<MetricsResp>("/api/metrics");
+
 // 新版本检查（发起人 2026-10-14）：服务启动时后端查过一次 PyPI（失败 latest=null 静默），
 // 前端只读结果；has_update ⇒ 左上角版本旁亮「新」badge，点击给对应渠道的升级命令
 export type VersionCheck = {
@@ -169,7 +177,7 @@ export type DoctorCheck = { id: string; label: string; ok: boolean; critical: bo
   // 一键修复（发起人 2026-10-11）：只带 action id，命令在后端 FIX_ACTIONS 白名单
   fix?: { action: string; kind: "run" | "open" | "wda"; label: string } };
 export type DoctorResp = { checks: DoctorCheck[]; ran_at: string; duration_ms: number };
-export const getDoctor = (platform: "android" | "ios") =>
+export const getDoctor = (platform: "android" | "ios" | "harmony") =>
   j<DoctorResp>(`/api/doctor?platform=${platform}`);
 // iOS 模拟器枚举与单活切换（发起人 2026-10-12）：booted 可直接投屏（WDA 常驻 localhost:8100），
 // 未启动的一键启动（boot 目标 + shutdown 其余，保证 8100 服务对象唯一）
@@ -375,3 +383,10 @@ export const renameCase = (payload: { from: string; to: string }) =>
   j<{ ok: boolean; file: string; suites_updated: string[] }>("/api/case/rename",
     { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload) });
+
+// -- 微调数据(L2 工具链):nl 回溯对数 + 一键 export;训练本体走 CLI(mat finetune train) --
+export type FinetuneStats = { pairs: number; no_nl: number;
+  per_app: Record<string, number>; min_pairs: number; enough: boolean; note: string };
+export const getFinetuneStats = () => j<FinetuneStats>("/api/finetune/stats");
+export const exportFinetune = (app?: string) =>
+  postJson<{ ok: boolean } & FinetuneStats>("/api/finetune/export", app ? { app } : {});

@@ -1,7 +1,9 @@
 import { Alert, Button, Card, Empty, Input, Modal, Select, Space, Spin, Table, Tag, Tooltip, message } from "antd";
-import { CameraOutlined, CloudUploadOutlined, DeleteOutlined, HomeOutlined } from "@ant-design/icons";
+import {
+  CameraOutlined, CloudUploadOutlined, DeleteOutlined, HomeOutlined, LinkOutlined, SelectOutlined,
+} from "@ant-design/icons";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { bootIosSim, captureScreenshot, deviceKey, getJobs, IosSim, JobInfo, listIosSims, StateResp, uninstallApp } from "../api";
+import { bootIosSim, captureScreenshot, deviceKey, getJobs, IosSim, JobInfo, listIosSims, postJson, StateResp, uninstallApp } from "../api";
 import DeviceScreen from "../components/DeviceScreen";
 import InstallModal from "../components/InstallModal";
 import LogPanel from "../components/LogPanel";
@@ -12,7 +14,7 @@ import PageHeader from "../components/PageHeader";
 // 日志区只显示所选设备的任务(任务记录带 serial/platform)。
 // 2026-10-11:各入口下发任务后自动跳转本页,深链 #/screens/<jobId> ——按任务选设备、
 // 执行日志定位到该任务(执行用例/套件/探索统一走 App.onLaunched)。
-type Sel = { serial: string | null; platform: "android" | "ios"; label: string;
+type Sel = { serial: string | null; platform: "android" | "ios" | "harmony"; label: string;
   sub?: string; udid?: string; booted?: boolean };
 // 候选身份键：安卓=serial、iOS 模拟器=udid、退化 WDA 入口=wda（同为 ios/serial=null
 // 的多条模拟器候选必须能区分选中态）
@@ -53,11 +55,13 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
     return () => clearInterval(t);
   }, []);
 
-  // 真机 = Android(adb) + iOS USB 真机；iOS 模拟器来自 simctl 清单，不在 state.devices 里
-  // iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 不拉模拟器清单、不进入设备候选
+  // 真机 = Android(adb) + iOS USB 真机 + 鸿蒙(hdc target)；iOS 模拟器来自 simctl 清单，
+  // 不在 state.devices 里。iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 不拉模拟器清单。
   const iosSupported = state.ios_supported !== false;
   const androidOnline = state.devices.filter(
     (d) => d.state === "device" && (d.platform || "android") === "android");
+  const harmonyOnline = state.devices.filter(
+    (d) => d.state === "device" && d.platform === "harmony");
   const iosOnline = iosSupported ? state.devices.filter(
     (d) => d.state === "device" && d.platform === "ios") : [];
   const notReady = state.devices.filter(
@@ -86,12 +90,15 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
     return () => clearInterval(t);
   }, [loadSims, iosSupported]);
 
-  // 候选设备:在线 Android(带系统版本) + iOS USB 真机(serial=udid，直接透传驱动层)
-  // + iOS 模拟器(booted 直接投屏,未启动点击即启动)
+  // 候选设备:在线 Android(带系统版本) + 鸿蒙(hdc target) + iOS USB 真机(serial=udid，
+  // 直接透传驱动层) + iOS 模拟器(booted 直接投屏,未启动点击即启动)
   const candidates: Sel[] = [
     ...androidOnline.map((d) => ({ serial: d.serial, platform: "android" as const,
       label: d.model || d.serial,
       sub: d.os ? `Android ${d.os} · ${d.serial}` : d.serial })),
+    ...harmonyOnline.map((d) => ({ serial: d.serial, platform: "harmony" as const,
+      label: d.model || d.serial,
+      sub: `鸿蒙 · hdc · ${d.serial}` })),
     ...iosOnline.map((d) => ({ serial: d.serial, platform: "ios" as const,
       label: d.model || d.serial,
       sub: `iOS ${d.os || "?"} · USB · ${d.serial}` })),
@@ -148,6 +155,19 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
     try { await deviceKey({ action: "home", serial: selected.serial, platform: selected.platform }); }
     catch (e) { message.error(String(e)); }
   };
+  // scrcpy 窗口（反向操作的正确入口：真视频+鼠标键盘原生控制；浏览器投屏是只读轮询）
+  const [scrcpying, setScrcpying] = useState(false);
+  const openScrcpy = async () => {
+    if (!selected) return;
+    setScrcpying(true);
+    try {
+      await postJson("/api/device/scrcpy", { serial: selected.serial });
+      message.success("已在服务所在机器拉起 scrcpy 窗口——到那台机器的屏幕上操作设备");
+    } catch (e) {
+      message.error(String(e).replace(/^Error:\s*/, "").replace("Error: ", "") +
+        (String(e).includes("未安装") ? "（brew install scrcpy）" : ""));
+    } finally { setScrcpying(false); }
+  };
 
   const [installOpen, setInstallOpen] = useState(false);
   const [uninstallOpen, setUninstallOpen] = useState(false);
@@ -194,8 +214,10 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
           : { serial: null, platform: "ios", label: "iOS 模拟器 (WDA)" });
       }
     } else if (j.serial) {
-      const d = state.devices.find((x) => x.serial === j.serial);
-      setSel({ serial: j.serial, platform: "android", label: `${d?.model || j.serial} · ${j.serial}` });
+      // 平台取自任务本身（此前鸿蒙任务一律被当成 android 选中）
+      const platform: Sel["platform"] = j.platform === "harmony" ? "harmony" : "android";
+      const d = state.devices.find((x) => x.serial === j.serial && (x.platform || "android") === platform);
+      setSel({ serial: j.serial, platform, label: `${d?.model || j.serial} · ${j.serial}` });
     }
     // 直接定位日志:设备若本来就是选中态,下面「设备切换」effect 不会重跑
     setLogJob(focusJob);
@@ -217,8 +239,9 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
           sub: `${b.os} · 已启动`, udid: b.udid, booted: true });
       }
     } else if (j.serial) {
-      const d = state.devices.find((x) => x.serial === j.serial);
-      setSel({ serial: j.serial, platform: "android", label: `${d?.model || j.serial} · ${j.serial}` });
+      const platform: Sel["platform"] = j.platform === "harmony" ? "harmony" : "android";
+      const d = state.devices.find((x) => x.serial === j.serial && (x.platform || "android") === platform);
+      setSel({ serial: j.serial, platform, label: `${d?.model || j.serial} · ${j.serial}` });
     }
     setLogJob(j.id);
   };
@@ -237,11 +260,16 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
           message="任务执行中，手动操作可能干扰用例（操控不抢设备锁，救场通道保持畅通）" />
       )}
       <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
-        {/* ① 设备列表（发起人 2026-10-12：真机/模拟器分组展示） */}
+        {/* ① 设备列表（发起人 2026-10-12：真机/模拟器分组展示）。
+            鸿蒙：serial=127.0.0.1:port 是模拟器（hdc 本机 TCP），
+            其他 target key 是真机——不能沿用 iOS 的「serial 非 null=真机」判据。 */}
         <Card size="small" title="设备列表" style={{ width: 210, flex: "none" }}>
           {candidates.length === 0 && <span style={{ color: "#999" }}>无在线设备——手机开启 USB 调试并插上</span>}
-          {([["真机", candidates.filter((c) => c.platform === "android" || c.serial != null)],
-             ["模拟器", candidates.filter((c) => c.platform === "ios" && c.serial == null)]] as const)
+          {([["真机", candidates.filter((c) => c.platform === "android"
+                || (c.platform === "ios" && c.serial != null)
+                || (c.platform === "harmony" && !(c.serial || "").startsWith("127.0.0.1")))],
+             ["模拟器", candidates.filter((c) => (c.platform === "ios" && c.serial == null)
+                || (c.platform === "harmony" && (c.serial || "").startsWith("127.0.0.1")))]] as const)
             .filter(([, list]) => list.length > 0)
             .map(([title, list]) => (
               <div key={title} style={{ marginBottom: 8 }}>
@@ -259,7 +287,8 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
                         disabled={isNotReady} loading={booting != null && booting.udid === c.udid}
                         onClick={() => pick(c)}>
                         <span style={{ display: "block", minWidth: 0 }}>
-                          {c.platform === "ios" ? "📱 " : "🤖 "}{c.label}
+                          {c.platform === "ios" ? "📱 " : c.platform === "android" ? "🤖 " : ""}{c.label}
+                          {c.platform === "harmony" && <Tag style={{ marginLeft: 6 }}>鸿蒙</Tag>}
                           {c.sub && <span style={{ display: "block", fontSize: 11,
                             /* ghost 选中态是白底蓝字，白色副文本会隐形（发起人 2026-10-12） */
                             color: isSel ? "rgba(79,91,255,0.75)" : "#8a919f" }}>{c.sub}</span>}
@@ -295,6 +324,9 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
                 <Tooltip title="回到桌面">
                   <Button size="small" icon={<HomeOutlined />} onClick={goHome} />
                 </Tooltip>
+                <Tooltip title="打开 scrcpy 窗口（真视频+鼠标键盘控制；在服务所在机器弹窗）">
+                  <Button size="small" icon={<SelectOutlined />} loading={scrcpying} onClick={openScrcpy} />
+                </Tooltip>
                 <Tooltip title="截屏（保存到 screenshots/）">
                   <Button size="small" icon={<CameraOutlined />} loading={capturing} onClick={capture} />
                 </Tooltip>
@@ -312,6 +344,12 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
             近期任务日志在下，不再单独占整行） */}
         <div style={{ flex: 1, minWidth: 380, display: "flex", flexDirection: "column", gap: 16 }}>
           <Card size="small" title="所选设备执行日志">
+            {devJobs.filter((j) => j.status === "running").map((j) => (
+              <a key={j.id} href={`/live/${j.id}`} target="_blank" rel="noreferrer"
+                style={{ fontSize: 12, marginRight: 8 }}>
+                <LinkOutlined /> 任务视角投屏（{j.id}）↗
+              </a>
+            ))}
             {devJobs.length === 0 ? (
               <Empty description="该设备暂无任务——从「用例管理/执行」或「遍历探索」启动" />
             ) : (
@@ -369,10 +407,11 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
       </div>
       <InstallModal open={installOpen} onClose={() => setInstallOpen(false)}
         serial={selected?.serial ?? null} platform={selected?.platform ?? "android"} />
-      {/* 卸载包（发起人 2026-10-12）：独立入口，双平台（Android=adb uninstall /
-          iOS 模拟器=simctl uninstall booted），清数据语义——重装即全新状态 */}
+      {/* 卸载包（发起人 2026-10-12）：独立入口，三平台（Android=adb uninstall /
+          iOS 模拟器=simctl uninstall booted / 鸿蒙=hdc uninstall），清数据语义——重装即全新状态 */}
       <Modal title={`卸载应用（${selected?.platform === "ios"
-        ? "iOS 模拟器 · simctl uninstall" : "Android · adb uninstall"}）`}
+        ? "iOS 模拟器 · simctl uninstall"
+        : selected?.platform === "harmony" ? "鸿蒙 · hdc uninstall" : "Android · adb uninstall"}）`}
         open={uninstallOpen} onCancel={() => setUninstallOpen(false)} width={460}
         footer={<Space>
           <Button onClick={() => setUninstallOpen(false)}>取消</Button>
@@ -381,8 +420,8 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
         </Space>}>
         <Input value={uninstallPkg} onChange={(e) => setUninstallPkg(e.target.value)}
           onPressEnter={doUninstall}
-          placeholder={selected?.platform === "ios"
-            ? "bundleId，如 com.example.app" : "包名，如 com.example.app"} />
+          placeholder={selected?.platform === "ios" || selected?.platform === "harmony"
+            ? "bundleName，如 com.example.app" : "包名，如 com.example.app"} />
         <div style={{ marginTop: 8, color: "#8a919f", fontSize: 12 }}>
           卸载会清除该应用的全部数据，不可恢复；iOS 真机卸载请用 mat run --fresh-install（配置台暂不支持）。
         </div>

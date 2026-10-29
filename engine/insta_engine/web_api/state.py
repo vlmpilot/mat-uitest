@@ -11,7 +11,7 @@ from .. import __version__, promptstore
 from ..device import list_adb_devices
 from ..quota import UsageStore
 from ..readiness import EXPLORE_TIP
-from .device import ios_state_devices
+from .device import harmony_state_devices, ios_state_devices
 from .runtime import CONSOLE_DIST, _now, source_staleness
 from .workspace import case_meta, list_explores, list_imports, list_indexes, list_runs
 
@@ -54,13 +54,24 @@ def api_state(root: Path, usage: dict | None = None) -> tuple[int, dict]:
         # 遍历探索建议（判据本体保留；2026-10-26 去掉「甜点判据」术语）：单一来源下发
         "explore_tip": EXPLORE_TIP,
         # Android(adb) + iOS USB 真机（2026-10-19：控制台真机入口；iOS 侧带 TTL 缓存）
-        "devices": list_adb_devices() + ios_state_devices(),
+        "devices": list_adb_devices() + ios_state_devices() + harmony_state_devices(),
         # iOS 工具链（Xcode / simctl / devicectl / xcodebuild）只在 macOS 存在：
         # Windows/Linux 前端据此隐藏 iOS 环境卡、iOS 运行平台与模拟器入口（2026-10-22）
         "ios_supported": sys.platform == "darwin",
         "console": "pro" if (CONSOLE_DIST / "index.html").exists() else "legacy",
         "prompt_mode": "server" if promptstore.is_server() else "local",
     }
+
+
+def api_metrics(root: Path) -> tuple[int, dict]:
+    """质量指标卡（与 `mat metrics --json` 同一实现）：概览页消费，缺产出如实「未建立」。
+
+    单独成端点而不并进 `/api/state`：`/api/state` 是 5s 轮询，而指标要扫最近 50 次
+    run.json + 基线 + 图谱文件——放进轮询会把读盘成本乘上轮询次数。
+    """
+    from ..quality_metrics import build_metrics
+
+    return 200, build_metrics(root)
 
 
 def api_doctor(platform: str, root: Path) -> tuple[int, dict]:

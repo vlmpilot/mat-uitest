@@ -121,9 +121,11 @@ def test_api_gen_splits_bills_once_and_dedups(tmp_path, monkeypatch):
     job = _wait_job(obj["job_id"])
     assert job["status"] == "done", job
 
-    files = sorted((root / "cases").glob("gen-*.json"))
+    # 文件名 = 用例标题（2026-10-25 起不再用 gen-<stamp>-<i>）；同批内同名才加 -2/-3，
+    # 批次溯源看 meta.split_batch 而不是文件名
+    files = sorted((root / "cases").glob("*.json"))
     assert len(files) == 3, f"每个拆分用例独立落盘: {files}"
-    assert files[0].name.endswith("-1.json") and files[2].name.endswith("-3.json"), files
+    assert {f.stem for f in files} == {"入口-c1", "入口-c2", "入口-c1-2"}, [f.name for f in files]
     docs = [json.loads(f.read_text(encoding="utf-8")) for f in files]
     ids = [d["caseId"] for d in docs]
     assert len(set(ids)) == 3, f"重复 caseId 必须去重: {ids}"
@@ -148,7 +150,7 @@ def test_api_gen_truncates_over_max_split(tmp_path, monkeypatch):
     assert code == 200
     job = _wait_job(obj["job_id"])
     assert job["status"] == "done", job
-    assert len(list((root / "cases").glob("gen-*.json"))) == 8, "MAX_SPLIT=8 兜底截断"
+    assert len(list((root / "cases").glob("*.json"))) == 8, "MAX_SPLIT=8 兜底截断"
     assert "截断 2 条" in job["summary"], job["summary"]
 
 

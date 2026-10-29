@@ -120,6 +120,10 @@ border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.06);min-width
 .detail{flex:1;color:#666;word-break:break-all}
 .dur{flex:none;color:#bbb;width:64px;text-align:right}
 footer{flex:none;padding:6px 16px;font-size:12px;color:#999;background:#fff;border-top:1px solid #eee}
+.opbar{flex:none;display:none;align-items:center;gap:10px;padding:6px 16px;font-size:12px;
+  background:#fff7e6;border-bottom:1px solid #ffe7ba;color:#874d00}
+.opbar.running{display:flex}
+.opbar button{font-size:12px;padding:2px 10px;cursor:pointer}
 /* 窄窗（侧栏形态）：上下堆叠，投屏贴合图片并**水平居中**（竖屏截图在窄栏里
    不可能既满宽又不超高——高度封顶后居中，留空对称化而不是堆在一侧），
    日志吃满剩余高度并内部滚动，整页不滚动 */
@@ -136,6 +140,12 @@ main{flex-direction:column;overflow:hidden}
 <div id="screenhint">设备画面加载中…</div></div>
 <div id="logwrap"><h3>步骤事件</h3><div id="log"></div></div>
 </main>
+<div id="opbar" class="opbar{' running' if not boot.get("terminal") else ' '}">
+  <span>⚠️ 任务执行中——请勿物理操作设备或投屏内点击（会污染执行结果与归因）</span>
+  <span style="margin-left:auto;color:#666">需要手动操作设备？</span>
+  <button onclick="openScrcpy()">打开 scrcpy 窗口</button>
+  <span style="color:#bbb">在服务所在机器弹窗；任务结束后自动停止轮询</span>
+</div>
 <footer>只读旁路视图：投屏与事件均来自本机服务 · 任务结束后自动停止轮询</footer>
 <script>
 const BOOT = __BOOT__;
@@ -148,6 +158,10 @@ let seq = 0, terminal = BOOT.terminal, screenTimer = null;
 
 function setStatus(s){
   badge.textContent = s; badge.className = s;
+  const opbar = document.getElementById("opbar");
+  if (opbar){ opbar.classList.toggle("running",
+    !["done","error","cancelled"].includes(s)); }
+
   if (["done","error","cancelled"].includes(s)){
     terminal = true;
     if (screenTimer){clearInterval(screenTimer); screenTimer = null;}
@@ -173,6 +187,18 @@ function addRow(e){
   log.appendChild(row);
   while (log.children.length > 300) log.removeChild(log.firstChild);
   log.scrollTop = log.scrollHeight;
+}
+
+async function openScrcpy(){
+  try{
+    const r = await fetch("/api/device/scrcpy", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({serial: BOOT.serial})});
+    const v = await r.json();
+    if (!r.ok){ alert(v.error || "scrcpy 拉起失败"); return; }
+    alert("已在服务所在机器拉起 scrcpy 窗口——到那台机器的屏幕上操作设备" +
+          (BOOT.platform === "ios" ? "（iOS 走 WDA/DevEco，scrcpy 仅 Android）" : ""));
+  }catch(e){ alert("scrcpy 拉起失败：" + e); }
 }
 
 async function poll(){

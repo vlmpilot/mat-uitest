@@ -7,6 +7,7 @@ spike 实现 res-id / text / description / textContains / xpath / point / image-
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -35,6 +36,10 @@ class Element:
     #: 命中所用的「第 N 个匹配」（`None` = 未指定）。只用于**证据**：失败/成功记录里
     #: 能区分「第 0 个卡片没找到」与「文案没找到」，否则位置型定位的失败现场无从复核。
     index: int | None = None
+    #: 动作的**可复核结论**（如「清空后回读仍为 X」）。`None` = 无可报。
+    #: 由 runner 在动作后拼进 `result.warning` —— 不拼就等于没测（与 C17 同类：
+    #: 采到了但没落盘，等于没采）。
+    note: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -88,44 +93,95 @@ class Element:
             self.drv.click(*self.point)
             self.drv.send_keys(text)
             return
+        before, before_known = self._read_text()
         self.node.click()
         self.node.set_text(text)
+        if self._input_landed(text):
+            return
         # 厂商安全键盘会拦截无障碍文本注入（华为实测：set_text 静默失败、字段全空、
-        # 后续登录必报错）。回读校验，仍空则走驱动的**二级输入通道**
+        # 后续登录必报错）。回读校验未通过则走驱动的**二级输入通道**
         # `fallback_input`：Android=华为回退（adb input text，只对 ASCII 可靠，CJK 无效
         # 但失败会如实暴露）；iOS 无二级通道 ⇒ 如实报「输入未生效」（评审 I1）。
-        if self._read_back_empty():
-            self.node.click()
-            time.sleep(0.3)
-            if self.drv is None or not self.drv.fallback_input(text):
-                platform = self.drv.platform if self.drv is not None else "unknown"
-                raise RuntimeError(
-                    f"输入未生效（回读为空，策略 {self.strategy}）：{platform} 无二级输入通道")
+        self.node.click()
+        time.sleep(0.3)
+        if self.drv is None or not self.drv.fallback_input(text):
+            platform = self.drv.platform if self.drv is not None else "unknown"
+            raise RuntimeError(
+                f"输入未生效（回读为空，策略 {self.strategy}）：{platform} 无二级输入通道")
+        # 二级通道之后**必须再验一次**：`fallback_input` 返回 True 只说明命令发出去了
+        # （`adb input text` 的退出码），不说明字符真进了输入框。
+        if self._input_landed(text):
+            return
+        self._judge_unlanded_input(text, before, before_known)
 
-    def _read_back_empty(self) -> bool:
-        """回读为空才走二级通道；**读不到（抛异常）不算空**，否则会重复输入。"""
+    def _judge_unlanded_input(self, text: str, before: str | None, before_known: bool) -> None:
+        """两级通道后仍不含目标文本：区分「确定没生效」与「无法判定」。
+
+        **只有"回读与动作前逐字相同"才判死**。这条判据是唯一无歧义的：字段一点没变，
+        说明动作确实没落到它身上。其余情形（回读变了但不含目标）可能只是**格式转换**
+        （手机号「138 0013 8000」、金额「1,000」、日期）⇒ 记 `note` 交给人，不制造假红。
+        """
+        readback, known = self._read_text()
+        if not known or not readback or not readback.strip():
+            return  # 读不到/读成空：与旧行为一致，不判死（厂商键盘下"可能成功"）
+        if self._is_password():
+            return  # 密码框回读是掩码或空，判不了
+        if before_known and readback == before:
+            raise RuntimeError(
+                f"输入未生效（两级通道后回读仍为动作前的 {before!r}，不含 {text!r}，"
+                f"策略 {self.strategy}）")
+        self.note = (f"输入后回读为 {readback!r}，不含目标 {text!r}——可能是格式转换或掩码，"
+                     f"请人工确认这一步真的输入了")
+
+    def _is_password(self) -> bool:
+        info = getattr(self.node, "info", None)
+        return isinstance(info, dict) and bool(info.get("password"))
+
+    def _read_text(self) -> tuple[str | None, bool]:
+        """回读文本：`(text, known)`。**`known=False` 表示读不到**，不是空。
+
+        ⚠️ 读不到不能当"空"：定位命中 **hint** 后输入新值，提示文案消失 ⇒ 同一选择器
+        不再匹配，u2 的 `get_text()` 直接抛 `UiObjectNotFoundError`。这是**正常时序**
+        （输入本来就会改掉 hint），当成"空"会让 `set_text` 再走一遍二级通道，
+        文本被打两遍（InstaDemo 登录用例实测）。
+        """
         try:
-            text = self.get_text()
-        except Exception:  # noqa: BLE001 —— 节点已失效，视作"未知"（见 get_text 注释）
-            return False
-        if text is not None and text.strip():
-            return False
-        time.sleep(0.2)
-        try:
-            text = self.get_text()
-        except Exception:  # noqa: BLE001
-            return False
-        return text is None or not text.strip()
+            return self.get_text(), True
+        except Exception:  # noqa: BLE001 —— 节点已失效，视作"未知"
+            return None, False
+
+    def _input_landed(self, text: str) -> bool:
+        """输入是否真进了框：回读**包含**目标文本才算。
+
+        ⚠️ 这里原来判的是「回读是否为空」——**判据本身是错的**。内容型 App 的搜索框
+        把占位/前缀写在 `text` 里（xhs「搜索, 」、tx「网友捕捉绝美"火箭云"！」），
+        回读**永远非空** ⇒ 判据恒成立，"输入没进去"与"输入成功"长得一模一样。
+        2026-10-27 真机复现（`/tmp/probe_clear.py`）：框里是「搜索, 卤牛肉腱子的做法」，
+        `set_text("咖啡")` 后回读仍是「搜索, 卤牛肉腱子的做法」，步骤照样 passed，
+        断言再断在结果页排序栏 ⇒ 假绿（实测两条假绿的共同根因）。
+
+        判「包含」而不是「相等」：xhs 的回读是「搜索, 咖啡」，前缀是 App 自绘的、
+        不是被污染的查询词（实测提交后的查询词就是「咖啡」）。比较前做归一化
+        （去分隔符、统一大小写），覆盖手机号/金额这类**自动格式化**字段。
+        """
+        if not text:
+            return True
+        readback, known = self._read_text()
+        if not known:
+            return True  # 读不到不判死，见 `_read_text`
+        if self._is_password():
+            return True
+        return bool(readback) and _norm(text) in _norm(readback)
 
     def clear_text(self) -> None:
-        """清空输入框：`clear_text()` → `set_text("")` → 都不行才抛。
+        """清空输入框：`clear_text()` → `set_text("")` → 按键通道，都无效则记 `note`。
 
         为什么非要能清空：内容型 App 的搜索框把**占位/热词写在 text 里**
         （tx「网友捕捉绝美"火箭云"！」、xhs「搜索, 」），`set_text` 会**拼在后面**
         ⇒ 输入「世界杯」实际得到「火箭世界杯」，搜出来的结果与意图无关，
         而用例侧完全看不出来（引擎的回读校验也认为"有内容"）。
 
-        **两级兜底都是真机逼出来的**（2026-10-25/26 实测）：
+        **三级兜底都是真机逼出来的**（2026-10-25/26/27 实测）：
 
         1. u2 的 **`XPathSelector` 根本没有 `clear_text`** —— 直接
            `AttributeError: ('Invalid attr', 'clear_text')`；
@@ -133,18 +189,49 @@ class Element:
            （`am broadcast -a ADB_KEYBOARD_CLEAR_TEXT`）—— 输入框不是
            `ExtractEditText` 时抛 `AdbBroadcastError`。**「有这个方法」不等于「调得通」**，
            所以调用本身也要包 try（实测一个输入框不是 `ExtractEditText` 的用例就
-           栽在这：广播抛错、引擎虽标了 `false_red`，步骤照样是红的）。
+           栽在这：广播抛错、引擎虽标了 `false_red`，步骤照样是红的）；
+        3. **两级都"成功"、文本一点没变**（xhs 实测：`clearTextField` RPC 不抛异常，
+           文本原样）⇒ 走按键通道（`MOVE_END` + N×`DEL`，与无障碍动作是两条路）。
+
+        ⚠️ **不抛异常**：判「回读是否为空」是错的（xhs 占位「搜索, 」不是可编辑内容，
+        清不掉），判「是否变化」对「本来就没什么可清」的框也分不出来。三级都不变时
+        把结论记进 `note`（占位由 App 自绘，不是引擎能改的），由 runner 落到
+        `result.warning` —— 让复核的人知道"这一步的清空不可信"。
         """
         if self.node is None:
             raise RuntimeError("坐标定位不支持清空输入")
+        before, before_known = self._read_text()
         clear = getattr(self.node, "clear_text", None)
         if callable(clear):
             try:
                 clear()
-                return
             except Exception:  # noqa: BLE001 —— ADB 广播失败/属性不支持，降级覆写空串
                 pass
+            else:
+                if self._clear_landed(before, before_known):
+                    return
         self.node.set_text("")
+        if self._clear_landed(before, before_known):
+            return
+        # 两级都"成功"却一点没变：再试按键通道（确定性，一次 shell 下发）
+        size = len(before or "")
+        escalator = getattr(self.drv, "clear_by_keyevents", None) if self.drv is not None else None
+        if size and callable(escalator) and escalator(size):
+            after, after_known = self._read_text()
+            if after_known and after != before:
+                return
+        if before_known and (before or "").strip():
+            self.note = (f"清空后回读仍为 {before!r}（三级手段都试过）——该输入框的占位/前缀"
+                         f"由 App 自绘，不是可编辑内容；若后续输入被拼接，请改断结果态")
+
+    def _clear_landed(self, before: str | None, before_known: bool) -> bool:
+        """清空是否生效：回读与清空前**不同**才算。读不到一律放过（不判死）。"""
+        if not before_known:
+            return True
+        after, after_known = self._read_text()
+        if not after_known:
+            return True
+        return after != before
 
     def get_text(self) -> str | None:
         if self.node is None:
@@ -153,13 +240,13 @@ class Element:
             return self.node.get_text()
         return getattr(self.node, "text", None)
 
-    # ⚠️ 为什么 `_read_back_empty` 必须吞掉 get_text 的异常（2026-10-25 真机评测）：
+    # ⚠️ `get_text()` 会抛，**调用方必须经 `_read_text()`**（2026-10-25 真机评测）：
     # 定位命中 **hint** 后输入新值，提示文案消失 ⇒ 同一选择器不再匹配，u2 的
     # `get_text()` 直接抛 UiObjectNotFoundError（method=wait）。这是**正常时序**
     # （输入本来就会改掉 hint），不是执行失败；不吞就会把成功输入记成 `unknown`
     # 失败（InstaDemo 登录用例实测）。注意这里**不能**把 None 一并当"未知"：
     # iOS 的空输入框 `get_text()` 正常返回 None（WdaNode 的 value/text 都为空），
-    # 那恰恰是"要回读为空"的证据，需继续走二级通道。
+    # 那恰恰是"回读为空"的证据，需继续走二级通道。
 
     def get_state(self, state: str) -> bool:
         """读控件状态（enabled/checked/selected，u2 info 同名键）。
@@ -190,6 +277,19 @@ def _label(loc: Locator) -> str:
     """定位的**可读标识**（报错/证据用）：带 index 时必须显示，否则两种失败长得一样。"""
     return (f"{loc.strategy.value}={loc.value}" if loc.index is None
             else f"{loc.strategy.value}={loc.value}#{loc.index}")
+
+
+_NON_WORD = re.compile(r"[\W_]+")
+
+
+def _norm(text: str) -> str:
+    """回读比较用的归一化：去分隔符（空格/逗号/连字符）、统一大小写。
+
+    为什么需要：输入框会**自动格式化**，`13800138000` 回读成「138 0013 8000」、
+    `1000` 回读成「1,000」。按原样比较会把"输入成功"判成"未生效"——那是假红，
+    比不校验更坏（会让人不再信这个校验）。
+    """
+    return _NON_WORD.sub("", text).lower()
 
 
 def _find(drv: BaseDriver, by: str, value: str, timeout_s: float,

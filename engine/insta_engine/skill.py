@@ -17,13 +17,42 @@ from pathlib import Path
 SKILL_NAME = "mobileapp-testing"
 
 # AI 编码助手的**用户级 skill 目录**，键即 `mat skill install --target` 的取值。
-# 只列约定明确的两个：Claude Code / CodeBuddy 系走 ~/.claude/skills，WorkBuddy AI 走
-# ~/.workbuddy/skills。其余（Cursor 的项目级规则等）用 `--dir` 显式指定——
-# **不猜路径**：猜错会把文件写到用户根本不会去读的地方，比不装更糟。
+#
+# 只收「有据可查」的落点 + 一个通用落点；**不猜路径**：猜错会把文件写到用户根本不会去读的
+# 地方，比不装更糟（用户以为装好了，助手其实看不见）。所以每个键的来历都写在下面：
+#   claude     ~/.claude/skills        Claude Code 官方；CodeBuddy 等 fork 也读这里
+#   workbuddy  ~/.workbuddy/skills     WorkBuddy AI 官方
+#   codebuddy  ~/.codebuddy/skills     CodeBuddy 自有配置根（插件缓存在 ~/.codebuddy/plugins），
+#                                      技能目录未见官方文档 ⇒ 标「待实测」
+#   agents     ~/.agents/skills        Agent Skills 开放标准落点；魔搭（ModelScope）与
+#                                      npx skills add 生态默认装这里 ⇒ **最大公约数，跨平台首选**
+#   trae       ~/.trae-cn/skills       Trae 国内版官方文档明确（Windows 同相对路径）
+#   qoderwork  ~/.qoderwork/skills     QoderWork CN 阿里云官方文档明确
+#   qwen       ~/.qwen/skills          Qwen Code（第三方整理，官方文档未核）⇒ 标「待实测」
 KNOWN_TARGETS = {
     "claude": "~/.claude/skills",
     "workbuddy": "~/.workbuddy/skills",
+    "codebuddy": "~/.codebuddy/skills",
+    "agents": "~/.agents/skills",
+    "trae": "~/.trae-cn/skills",
+    "qoderwork": "~/.qoderwork/skills",
+    "qwen": "~/.qwen/skills",
 }
+
+# 落点说明（`mat skill targets` 表格 + `install` 成功后的落点提示）。
+TARGET_NOTES = {
+    "claude": "Claude Code / CodeBuddy 系",
+    "workbuddy": "WorkBuddy AI",
+    "codebuddy": "CodeBuddy 自有目录",
+    "agents": "通用（跨平台首选）",
+    "trae": "Trae 国内版",
+    "qoderwork": "QoderWork CN",
+    "qwen": "Qwen Code",
+}
+
+# **未实测**的落点：装完要用户自己确认助手能看见，输出里必须提示这一点（别让人以为装完就一定生效）。
+UNVERIFIED_TARGETS = frozenset({"codebuddy", "qwen"})
+
 
 
 def bundled_skill_dir() -> Path:
@@ -49,6 +78,20 @@ def resolve_target(target: str | None = None, directory: str | None = None) -> P
             f"未知 --target：{key}。可选：{'、'.join(sorted(KNOWN_TARGETS))}；"
             "或用 --dir <路径> 指定")
     return Path(KNOWN_TARGETS[key]).expanduser()
+
+
+def targets_table() -> list[dict]:
+    """已知落点的清单（供 `mat skill targets` 打印；排序稳定便于测试）。"""
+    return [
+        {
+            "target": key,
+            "label": TARGET_NOTES.get(key, ""),
+            "path": str(Path(path).expanduser()),
+            "verified": key not in UNVERIFIED_TARGETS,
+        }
+        for key, path in sorted(KNOWN_TARGETS.items())
+    ]
+
 
 
 def install(target_root: Path, force: bool = False) -> dict:

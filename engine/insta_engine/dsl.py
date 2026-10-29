@@ -40,6 +40,35 @@ _INDEXABLE = frozenset({
 })
 
 
+#: 策略别名 → 合法枚举值（2026-10-28 本地小模型实测：Qwen3-VL-8B 输出
+#: `strategy="desc"`，schema 校验直接失败，内容级重试两次仍改不回来 ⇒ 整条生成作废）。
+#: 归一化放在校验**之前**，把「模型手滑一次 = 一条用例废掉」降成「静默纠正」；
+#: 表里没有的未知值仍然报错（不猜）。
+_STRATEGY_ALIASES = {
+    "resource-id": "res-id",
+    "resourceid": "res-id",
+    "res_id": "res-id",
+    "resid": "res-id",
+    "desc": "description",
+    "content-desc": "description",
+    "content_desc": "description",
+    "desc-contains": "description",
+    "textcontains": "textContains",
+    "text_contains": "textContains",
+    "contains": "textContains",
+    "imagetemplate": "image-template",
+    "image_template": "image-template",
+    "template": "image-template",
+    "visionllm": "vision-llm",
+    "vision_llm": "vision-llm",
+    "vision": "vision-llm",
+    "coordinate": "point",
+    "coordinates": "point",
+    "coord": "point",
+    "x_path": "xpath",
+}
+
+
 class Locator(BaseModel):
     """元素定位；fallback 链按成本递增逐级降级（02 §3.2 策略链）。"""
 
@@ -60,6 +89,24 @@ class Locator(BaseModel):
     #: 否则每次保存用例都会给全仓定位块加一行噪声（存量用例文件会被批量改写）。
     index: int | None = Field(default=None, exclude_if=lambda v: v is None)
     fallback: Locator | None = None
+
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def _normalize_strategy(cls, v: object) -> object:
+        """把常见别名（desc / resource-id / text_contains…）归一成枚举值。
+
+        只做「同义纠正 + 大小写不敏感」，不认识的值原样返回交给 Pydantic 报错——
+        静默猜测会把「模型写错」变成「引擎点错」，比直接失败更危险。
+        """
+        if not isinstance(v, str):
+            return v
+        key = v.strip().replace(" ", "").lower()
+        if key in _STRATEGY_ALIASES:
+            return _STRATEGY_ALIASES[key]
+        for strategy in LocatorStrategy:
+            if key == strategy.value.lower():
+                return strategy.value
+        return v
 
     @field_validator("index")
     @classmethod

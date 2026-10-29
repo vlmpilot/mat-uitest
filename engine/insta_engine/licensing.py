@@ -71,6 +71,11 @@ def plan_features(plan: str) -> frozenset:
 #: MAT_LICENSE_PUBKEY_B64 或 ~/.mat/license_pubkey.b64 覆盖并全量重签。
 DEV_LICENSE_PUBKEY_B64 = "+CKXLUS5MfcUKD+n3p4nMi/HXncKLHH67LGQ2YzfXZM="
 
+#: 激活码（`MAT2-`）验签公钥：**只用来验，签不了**。对应私钥只存在服务端
+#: （`MAT_LICENSE_CODE_KEY`）。v1 的 HMAC 码靠内置对称密钥验签，密钥在源码里
+#: 等于公开——这就是必须迁到 v2 的原因（2026-10-28）。
+CODE_PUBKEY_B64 = "7l1yrs4BJuxEbzG1HOfPK1jxH3ea51ntTDtDje9kLOk="
+
 _V2_REQUIRED = ("license_id", "customer", "plan", "features", "seats",
                 "issued_at", "expires_at", "sig")
 
@@ -87,6 +92,34 @@ def _license_pubkey_b64() -> str:
     except OSError:
         pass
     return DEV_LICENSE_PUBKEY_B64
+
+
+def _code_pubkey_b64() -> str:
+    """激活码验签公钥：env 覆盖 → 内置（私有部署换码时用）。"""
+    return (os.environ.get("MAT_CODE_PUBKEY_B64", "").strip() or CODE_PUBKEY_B64)
+
+
+def _verify_code_v2(code: str) -> tuple[dict | None, str | None]:
+    """验 `MAT2-` 码（Ed25519）。结构与 v1 分支对齐：形态 → 签名 → 过期。"""
+    try:
+        raw = str(code or "").strip()[len("MAT2-"):]
+        body, _, sig = raw.rpartition(".")
+        plan, expires, nonce = body.split(".")
+        exp = int(expires)
+        sig_bytes = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+    except (ValueError, AttributeError, TypeError):
+        return None, REASON_MALFORMED
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        Ed25519PublicKey.from_public_bytes(base64.b64decode(_code_pubkey_b64())) \
+            .verify(sig_bytes, body.encode())
+    except Exception:  # noqa: BLE001 - 坏公钥/签名不符一律按签名失败（fail closed）
+        return None, REASON_SIGNATURE
+    if exp < time.time():
+        return None, REASON_EXPIRED
+    base, months = parse_plan_segment(plan)
+    return {"plan": base, "expires_at": exp, "months": months}, None
 
 
 def _v2_payload_bytes(data: dict) -> bytes:
@@ -243,8 +276,11 @@ def verify_code_detailed(code: str) -> tuple[dict | None, str | None]:
     校验顺序与 `verify_code` 原实现**逐条一致**（形态 → 签名 → 过期），
     所以 `verify_code(x) is None` ⇔ `verify_code_detailed(x)[0] is None`（两者不会分叉）。
     """
+    text = str(code or "").strip()
+    if text.startswith("MAT2-"):
+        return _verify_code_v2(text)
     try:
-        raw = str(code or "").strip().removeprefix("MAT-").replace("-", "")
+        raw = text.removeprefix("MAT-").replace("-", "")
         body, _, sig = raw.rpartition(".")  # 签名段在最后一个点之后（generate 用 body+"."+sig）
         if not body or len(sig) != 16:
             return None, REASON_MALFORMED

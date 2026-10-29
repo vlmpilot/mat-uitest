@@ -277,3 +277,54 @@ def test_total_calls_excludes_task_rows(home):
     assert s["task_outcomes"]["gen"]["tasks"] == 2, "task 行仍要在首穿口径里"
     # 渲染首行与明细加总必须一致
     assert s["total_calls"] == sum(t["calls"] for t in s["by_task"].values())
+
+
+# -- 端到端耗时（2026-10-26，P1-4） ---------------------------------
+
+def test_task_latency_reports_end_to_end_percentiles(home):
+    """task 行自带 latency_ms 时，报**端到端** p50/p95（含内容级重试）。
+
+    为什么不能拿 call 级 p50 顶替：用户感知的是「一条用例要多久」。一次内容级重试
+    就把答案从 1 次调用拉到 2 次，而 call 级 p50 只描述**单次**调用。
+    """
+    for ms in (8000, 9000, 10000, 12000):
+        ai_metrics.record(task="gen", ok=True, scope="task", rounds=1, latency_ms=ms)
+
+    s = ai_metrics.summarize(hours=1)
+    fp = s["task_outcomes"]["gen"]
+    assert fp["latency_n"] == 4, "4 条都有耗时"
+    assert fp["p50_ms"] == 10000 and fp["p95_ms"] == 12000, fp
+    text = ai_metrics.render(s)
+    assert "端到端耗时 p50 10000ms" in text and "含内容级重试" in text
+
+
+def test_task_latency_absent_does_not_render_zero(home):
+    """老数据（task 行无 latency_ms）**不渲染**耗时行。
+
+    否则 `_percentile([])` 返回 0.0，会把「没有样本」渲染成「0ms」—— 这是最坏的一种
+    假数：看起来有值、实际没测。
+    """
+    ai_metrics.record(task="gen", ok=True, scope="task", rounds=1)
+    s = ai_metrics.summarize(hours=1)
+    fp = s["task_outcomes"]["gen"]
+    assert fp["latency_n"] == 0 and fp["tasks"] == 1
+    assert "端到端耗时" not in ai_metrics.render(s)
+
+
+def test_complete_task_writes_end_to_end_latency(home):
+    """`complete_task_raw` 必须把端到端耗时落进 task 行——含重试的那一次。
+
+    病灶：task 行原先只有 rounds，没有耗时，`ai-stats` 只能报 call 级。
+    """
+    from insta_engine.ai_client import complete_task_raw
+
+    good = json.dumps({"ok": 1})
+    stub = _ScriptedClient(["不是JSON", good])   # 修一轮后成功
+    out = complete_task_raw(stub, "convert", {}, context="修复:")
+    assert out == {"ok": 1}
+
+    task_rows = [r for r in _rows() if r.get("scope") == "task"]
+    assert len(task_rows) == 1
+    assert task_rows[0]["rounds"] == 2, "修了一轮"
+    assert task_rows[0]["latency_ms"] is not None, "端到端耗时必须落盘"
+    assert task_rows[0]["latency_ms"] >= 0

@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from .dsl import Action, AssertionType, Locator, LocatorStrategy, OnFailure, TestCase, dump_dsl
 from .locator import Element, LocateFailed, heal_by_hints, heal_fuzzy, resolve, try_resolve
+from .off_page import off_page_kind
 from .perf import am_start_w, mem_pss_mb
 from .state import state_home as _state_home
 from .ui_tree import Node, parse_nodes, rect
@@ -49,6 +50,54 @@ def _cold_start_enabled(params: dict) -> bool:
 
 def _pause(seconds: float) -> None:
     time.sleep(seconds)
+
+# 自愈动作后的观察窗口。先等 0.3s（快界面够用），若控件树纹丝不动再多等这一段复测——
+# 0.3s 对慢界面偏短，直接判死会把"只是没来得及变"误判成"点空了"。
+SELF_HEAL_SETTLE_EXTRA_SECONDS = 0.7
+
+# 画面指纹的采样尺寸（宽×高）。**为什么除了控件树还要看画面**：自绘界面（canvas /
+# WebView / Flutter / 游戏引擎）的内容变化不进入 accessibility 树，于是"树哈希没变"
+# 在视觉兜底最该起作用的场景里恰好不成立。2026-10-27 真机复现：canvas 按钮点完后
+# 画面明显变绿、文字变成「已点击」，控件树却纹丝不动 ⇒ 只按树判就把成功判成点空。
+FRAME_SAMPLE = (36, 80)
+# 判定「画面变了」的像素差异比例阈值。指纹 36×80=2880 格，0.5% ≈ 14 格；单格雷差 >8
+# 才算数（避开 PNG 压缩噪声与抗锯齿），阈值取低了会让状态栏时钟抖动冒充"画面变了"。
+FRAME_DIFF_RATIO = 0.005
+FRAME_DIFF_GRAY = 8
+
+
+def _frame_signature(drv) -> bytes | None:
+    """内容区的粗粒度灰度指纹；失败返回 None（调用方按"无法判断"处理）。
+
+    裁掉顶部 5% 与底部 7%：状态栏时钟、电量、系统导航栏的变化与页面内容无关，
+    留在指纹里会把"什么都没发生"读成"画面动过"。
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # Pillow 是主依赖；缺了就退回只看控件树
+        return None
+    try:
+        image = drv.screenshot_pil()
+        if image is None:
+            return None
+        width, height = image.size
+        top, bottom = int(height * 0.05), int(height * 0.93)
+        if bottom <= top:
+            return None
+        return image.crop((0, top, width, bottom)).convert("L").resize(
+            FRAME_SAMPLE, Image.BILINEAR).tobytes()
+    except Exception:  # 截图失败不能影响判定，交给调用方按 None 处理
+        return None
+
+
+def _frame_changed(before: bytes | None, after: bytes | None) -> bool | None:
+    """画面是否真的变了：True=变了 / False=没变 / None=无法判断（截图不可用）。"""
+    if not before or not after or len(before) != len(after):
+        return None
+    # strict=True：长度在上面已校验相等，静默截断会让"半张图变了"被读成整体比例，
+    # 反而更容易误判；宁可让它抛，也不要悄悄对齐。
+    changed = sum(1 for a, b in zip(before, after, strict=True) if abs(a - b) > FRAME_DIFF_GRAY)
+    return (changed / len(before)) > FRAME_DIFF_RATIO
 
 _VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
@@ -204,6 +253,12 @@ class StepResult(BaseModel):
     #: 假红标记：分类为 env-failure 但 **App 实际在前台** ⇒
     #: 这条"环境失败"多半是传输层断连的误诊。统计时单独计，不再当环境噪声整轮作废。
     false_red: bool = False
+    #: R16（2026-10-29）**这一屏还是不是用例假设的那一页**：`"left-app"`（前台已不是被测
+    #: 包，如插屏广告把微信小程序拉起来）/ `"webview-page"`（App 内被换成全屏 WebView
+    #: 落地页）/ `None`（看着还是被测 App 自己的页面）。
+    #: ⚠️ **只打标，不改 `status` / `category`**：改类别会让历史基线不可比。判据在
+    #: `off_page.py`（一处实现，判读工具也调它，所以能对旧产物回溯判定）。
+    off_page: str | None = None
     # 分类来源：None/"rules"=内置规则判定；"human"=**人工校准改判过**（见 calibration.py）。
     # 报告要能标出来 —— 否则人看不出这条结论是自己判的、还是机器判的。
     category_source: str | None = None
@@ -615,7 +670,8 @@ class Runner:
     # -- 内部 ---------------------------------------------------------------
 
     def _write_screen_evidence(self, idx: int, step, result: StepResult, before_xml: str,
-                               after_xml: str, digest_after: dict, pkg: str, attempt: int) -> None:
+                               after_xml: str, digest_after: dict, pkg: str, attempt: int,
+                               foreground: str | None = None) -> None:
         """把失败步**动作前后**的控件摘要落盘（`screens/step_XX_<id>_aN.json`）。
 
         ## 为什么必须落盘（2026-10-24）
@@ -662,7 +718,9 @@ class Runner:
                 # 诊断用：节点总数 / 出现过的包 / 前台是谁（"0 个控件"要能解释，不许让人猜）
                 "after_nodes": len(after_nodes),
                 "after_packages": sorted({n.package for n in after_nodes if n.package})[:5],
-                "foreground": self._foreground_package(),
+                # 调用方已经取过一次就复用（少一次 adb 往返，也避免两处取值不一致：
+                # 同一屏的"前台是谁"与"是否已换页"必须是同一个答案）
+                "foreground": foreground if foreground is not None else self._foreground_package(),
             }
             path = self.artifacts / "screens" / f"step_{idx:02d}_{step.id}_a{attempt}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -808,6 +866,13 @@ class Runner:
             before = hashlib.md5(xml_before.encode()).hexdigest()  # 复用空闲判定的最后一次 dump
             self._act(step, case, element, variables)
             _pause(0.3)
+            # 动作自身带回的可复核结论（如「清空后回读仍为 X」）。**必须落盘**：
+            # `Element.clear_text` 采到了却没人拼进 warning，等于没采（与 C17 同类）。
+            # 单独成一段而不是塞进下面「控件树无变化」分支：清空失败时树**会**变
+            # （键盘/联想词变了），走不到那个分支。
+            if element is not None and getattr(element, "note", None):
+                result.warning = (f"{result.warning}；{element.note}"
+                                  if result.warning else element.note)
 
             # post-verify（外部评审 P1-3）：动作后的稳定树由 wait_stable_xml 一次性给出，
             # 两处 _tree_hash() 的独立 dump 已消除——交互步 dump 6→4，非交互步保持 2
@@ -833,8 +898,12 @@ class Runner:
                     else:
                         # 输入类不重放（文本重复输入/覆盖的风险大于重放收益），
                         # 只提示可能未生效，后续断言自会暴露脏数据。
-                        result.warning = ("输入类动作后控件树无变化——**不自动重放**（避免重复输入/覆盖字段）；"
-                                          "若文本未生效请检查输入框焦点与软键盘状态")
+                        _no_replay = ("输入类动作后控件树无变化——**不自动重放**（避免重复输入/覆盖字段）；"
+                                      "若文本未生效请检查输入框焦点与软键盘状态")
+                        # 追加而不是覆盖：上面可能已有「清空后回读仍为 X」这类结论，
+                        # 覆盖掉就等于把更具体的那条证据丢了。
+                        result.warning = (f"{result.warning}；{_no_replay}"
+                                          if result.warning else _no_replay)
 
             self._check_assertions(step, variables, step.timeout_ms)
             result.status = "passed"
@@ -852,13 +921,19 @@ class Runner:
                 pkg = (case.target or {}).get("package", "")
                 after_xml = self.drv.dump()          # 一次 dump 供"可见控件提示"与证据复用
                 digest_after = digest_page(after_xml, pkg)
+                # R16（2026-10-29）：先判"这一屏还是不是用例假设的那一页"，再落证据——
+                # 它是**纯函数**（不抛异常），放在证据写入之前，免得证据 IO 失败把它一起吞掉。
+                # 为什么要这条：插屏广告把微信小程序拉起来时，`text=我的` 的报错和
+                # "定位值写错"一模一样，首跑通过率判读会把它算成用例问题（详见 `off_page.py`）。
+                foreground = self._foreground_package()
+                result.off_page = off_page_kind(pkg, digest_after.get("controls") or [], foreground)
                 # 控件树证据落盘（2026-10-24）：断言写错（A2/A3）时，**正确的断言只能从
                 # 真机那一屏推出来**，而 run.json 此前只留截图 —— 截图里没有 res-id，
                 # 人得肉眼抄文案，机器更没法用；图谱也补不上（内容型 App 的入口常常没被探索到）。
                 # ⚠️ 顺序（2026-10-26）：**先落盘再拼提示**——提示里要引用 `result.screen`，
                 # 否则读提示的人会以为"可见控件只有这 8 个"（实测就是这样误判的）。
                 self._write_screen_evidence(idx, step, result, xml_before, after_xml,
-                                            digest_after, pkg, attempt)
+                                            digest_after, pkg, attempt, foreground)
                 all_labels = [str(c.get("text") or c.get("desc") or "")[:20]
                               for c in digest_after["controls"]]
                 all_labels = [x for x in all_labels if x]
@@ -914,16 +989,52 @@ class Runner:
                             "via": via,
                         }
                         before_heal = self._tree_hash()
+                        # 视觉兜底是**按坐标点击**，落点可能在 canvas / WebView / 自绘控件上
+                        # ——那里内容变了也不进控件树。所以这一类额外留一张画面指纹，
+                        # 只在树哈希判定"没变"时才拿来做第二判据（纯树内自愈不需要）。
+                        before_frame = (_frame_signature(self.drv) if via == "vision-llm"
+                                        else None)
                         self._act(step, case, healed, variables)
                         _pause(0.3)
                         after_heal = self._tree_hash()  # 自愈动作同样做 post-verify
-                        self._check_assertions(step, variables)
-                        result.status = "passed"
-                        result.error = None
-                        result.used_strategy = healed.strategy
-                        result.warning = f"定位失败已由 {via} 兜底命中，提案待人工确认回写"
                         if after_heal == before_heal:
-                            result.warning += "；注意：自愈动作后控件树无变化"
+                            # 界面没动：再给一次观察窗口复测。0.3s 对慢界面偏短，
+                            # 立刻判死会把"只是没来得及变"误判成"点空了"。
+                            _pause(SELF_HEAL_SETTLE_EXTRA_SECONDS)
+                            after_heal = self._tree_hash()
+                        self._check_assertions(step, variables)
+                        result.used_strategy = healed.strategy
+                        # 树没变 ⇒ 再用画面指纹区分「自绘界面点中了」与「真点空了」。
+                        frame_state: bool | None = None
+                        if after_heal == before_heal and via == "vision-llm":
+                            frame_state = _frame_changed(before_frame,
+                                                         _frame_signature(self.drv))
+                        if after_heal == before_heal and frame_state is not True:
+                            # 2026-10-27：点了坐标、界面纹丝不动 ⇒ **不算自愈成功**。
+                            # 此前这里只追加一句 warning、status 照样置 passed，于是生产
+                            # 数据里 35 次「vision-llm 自愈成功」有 7 次（20%）是这种假成功
+                            # ——报告说"已兜底命中"，人以为好了，实际那一步什么都没发生。
+                            # 提案（result.heal）仍然保留：它是有价值的候选，只是没被采纳。
+                            reason = "画面指纹一致" if frame_state is False else "画面指纹不可用"
+                            result.status = "failed"
+                            result.error = (
+                                f"{raw_error} | {via} 兜底点击 {healed.value} 后界面无任何变化"
+                                f"（{0.3 + SELF_HEAL_SETTLE_EXTRA_SECONDS:.1f}s 内控件树哈希未变、"
+                                f"{reason}，坐标未命中可交互元素，不计为自愈成功）"
+                            )
+                            result.warning = f"{via} 提案已保留，待人工确认回写"
+                        else:
+                            result.status = "passed"
+                            result.error = None
+                            if after_heal == before_heal:
+                                # 自绘界面命中：树没动但画面动过，必须写清依据，
+                                # 否则事后看报告会以为是旧版那种"无变化也记成功"。
+                                result.warning = (
+                                    f"定位失败已由 {via} 兜底命中（控件树无变化、画面已改变："
+                                    f"自绘/WebView 界面），提案待人工确认回写"
+                                )
+                            else:
+                                result.warning = f"定位失败已由 {via} 兜底命中，提案待人工确认回写"
                     except Exception as heal_exc:
                         result.error = f"{raw_error} | {via} 兜底后执行失败: {type(heal_exc).__name__}: {heal_exc}"
                 else:
@@ -1009,7 +1120,7 @@ class Runner:
         from .locator import Element as _Element
         from .quota import QuotaExceeded, UsageStore
 
-        self.vision_reason = "未命中或未启用"
+        self.vision_reason = "未启用（检查 GEN_VL_MODEL / GEN_API_KEY）"
         if not (self.vision_client or vision.enabled()):
             return None
         if step.target is None:
@@ -1019,14 +1130,23 @@ class Runner:
         before_call = None
         if self.vision_client is None:
             from . import promptstore
+            from .offline import is_loopback
 
-            usage = UsageStore()
-            # 官方代理是**平台**出的 token 钱 ⇒ 按档位限额；自带 Key 是**用户**付钱
-            # ⇒ 只计数不拦（enforce=False），否则等于拿别人的钱还替别人限额。
-            enforce = promptstore.is_server()
+            # 三种情形，成本归属各不相同：
+            #   · 官方代理（平台出 token）：按档位限额，enforce=True；
+            #   · 自带 Key（用户出 token）：只计数不拦，enforce=False；
+            #   · **端点在本机**（GEN_VL_BASE_URL 指向 127.0.0.1/::1/localhost）：
+            #     平台一分钱不出，就不该占平台额度，连计数也不该记——`mat status`
+            #     的视觉用量只该反映「平台代付」的那部分。
+            # 第三条是 2026-10-26 补的：组合「GEN_PROMPT_MODE=server + 本地兜底端点」
+            # 若不特判，本地兜底会把官方视觉额度吃光，额度满后 QuotaExceeded 连
+            # **本地模型**一起拒掉——恰好废掉了本地化唯一确定的收益（截图不出本机）。
+            if not is_loopback(vision.endpoint()):
+                usage = UsageStore()
+                enforce = promptstore.is_server()
 
-            def before_call():
-                usage.check_vision(enforce=enforce)
+                def before_call():
+                    usage.check_vision(enforce=enforce)
 
         try:
             # P0-iOS 回归修复：此处曾依赖 drv.raw（Android 专属）——
@@ -1053,6 +1173,10 @@ class Runner:
             self.vision_reason = f"调用异常: {type(exc).__name__}: {exc}"
             return None
         if position is None:
+            # 调用过了但没采纳——把**模型侧的原因**带出来。此前这里恒报「未命中或
+            # 未启用」，于是"模型说没找到""置信度不够被拒""压根没调"三件事在报告里
+            # 长得一模一样（2026-10-26：本地 VL 跑完一条用例，无法判断它是否被调用）。
+            self.vision_reason = vision.last_result().get("reason") or "模型未命中"
             return None
         return _Element(strategy="vision-llm", value=f"({position[0]},{position[1]})",
                         point=position, drv=self.drv)
@@ -1080,9 +1204,18 @@ class Runner:
         return hashlib.md5(self.drv.dump().encode()).hexdigest()
 
     def _subst(self, loc: Locator, variables: dict[str, str]) -> Locator:
+        # ⚠️ **`index` 必须搬过来**（2026-10-28 真机实测）：这里曾只重建
+        # `strategy/value/fallback`，把 `index` 静默丢掉 ⇒ 用例写
+        # `res-id=channel_bar_item_container, index=5`，运行期 `loc.index is None`
+        # ⇒ `_find` 不传 `instance` ⇒ u2 命中**第一个**实例。
+        # 症状是"动作没生效但也不报错"：`tap` 返回 passed（元素找得到、点得下去），
+        # 点的是 index=0。tx 频道切换 3/3 全部停在 7x24，只有 `selected 国际` 断言抓到。
+        # 与 `preconditions` 在 DSL 无处安放是同一类**静默丢字段**：新增字段先问
+        # "这条重建路径上有没有人搬它"。
         return Locator(
             strategy=loc.strategy,
             value=substitute_vars(loc.value, variables),
+            index=loc.index,
             fallback=self._subst(loc.fallback, variables) if loc.fallback else None,
         )
 

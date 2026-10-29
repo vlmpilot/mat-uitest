@@ -37,7 +37,9 @@
 - 链长超 `arrivals._MAX_PATH_LEN`（6 跳）或父链缺环 ⇒ 放弃（与 arrival 验证同门槛：
   验证都不敢走的链，置备更不该走）；
 - 点击预算兜底（防长链把设备绑死），超预算即停并留因；
-- 全程吞错降级：置备失败 = 用例照原样跑，**不会比从前更糟**；
+- 全程吞错降级：置备失败 = 用例照原样跑。⚠️ **"原样"必须真的回到 launch 后的那一屏**：
+  置备自己点了两下、落在错页时，光"继续"会把用例丢在详情页上（实测 xhs-5/xhs-6 3/3 复现）
+  ⇒ 失败后**重放一次冷启动**（`evidence["restored"]`），恢复不了才退回旧行为；
 - `MAT_AUTO_ARRIVE=0` 可整体关闭。
 """
 
@@ -139,11 +141,21 @@ def infer_target_page(case, pages: list[dict]) -> dict | None:
             candidates = inter if inter else hits  # 交集空（fallback 对不上表）⇒ 保留主定位
     if not candidates:
         return None
-    # 代表页：arrival 已验证 stable 的优先，其次 hits 最多（同一逻辑页最常走的形态）
+    # 代表页：arrival 已验证 stable 的优先，其次 hits 最多（同一逻辑页最常走的形态），
+    # 再次 **depth 最浅**。
+    #
+    # ⚠️ `depth` 这一档是 2026-10-29 补的，补之前这两档打平就落到 `page_key` 字母序——
+    # 那是个**没有语义的 tiebreaker**。实测现场（xhs 图谱重建后，3/3 稳定复现）：
+    # 根页 `bad6f75c`（depth=0）与「运动」频道页 `00848095`（depth=1）**都含 `text=我`**、
+    # `hits` 都是 1、都没有 arrival 记录 ⇒ 字母序把 depth=1 的那条排前面 ⇒ 置备去点了
+    # 「运动」⇒ 落到笔记详情页 ⇒ 用例的 `tap 我` 在详情页上必然失败，报成 `locate-fail`。
+    # 深度更浅 = 到达更便宜、更不可能走错页，是同分时唯一有意义的次序。
     def _rank(p: dict):
         arrival = (p.get("arrival") or {}) if isinstance(p.get("arrival"), dict) else {}
         stable = 1 if arrival.get("status") == "stable" else 0
-        return (-stable, -(p.get("hits") or 0), str(p.get("page_key") or ""))
+        depth = p.get("depth")
+        return (-stable, -(p.get("hits") or 0), 999 if depth is None else depth,
+                str(p.get("page_key") or ""))
     best = sorted(candidates, key=_rank)[0]
     # **等价碎片里取「到达最便宜」的那条记录**（2026-10-23 实测，tx-news）。
     # 图谱会把同一个逻辑页记成多条（首页有 15 条），其中一条可能挂在
@@ -170,7 +182,9 @@ def provision(case, drv, package: str, index_path: Path,
     `needed=False` 表示无事可做或做不了（reason 说明），行为与从前逐字一致。
     """
     evidence: dict = {"needed": False, "ok": None, "page": "", "hops": 0,
-                      "reason": "", "clicks": 0, "entry": []}
+                      "reason": "", "clicks": 0, "entry": [],
+                      # 置备失败后有没有把 App 送回 launch 后的状态（2026-10-29 起）
+                      "restored": None}
     try:
         index = load_index(Path(index_path))
         pages = [p for p in (index or {}).get("pages", []) if isinstance(p, dict)]
@@ -293,6 +307,24 @@ def provision(case, drv, package: str, index_path: Path,
             evidence["ok"] = ok
             evidence["reason"] = reason
             evidence["clicks"] = state.get("clicks", 0)
+            if not ok:
+                # **走错了就得把人送回去**（2026-10-29）：置备自己点了两下、落到一个
+                # 不是目标页的地方，如果就这么把控制权交还用例，"原样继续"已经不是
+                # launch 后的那一屏了 —— 用例的 `tap 我` 会在详情页上失败，报成
+                # `locate-fail`，人去查定位链。本文件顶部"置备失败不会比从前更糟"
+                # 那句，正是被 xhs-5/xhs-6 这个现场推翻的（3/3 稳定）。
+                # 恢复动作 = 重放 launch 后的状态（先停再起），失败也不抛。
+                try:
+                    try:
+                        drv.app_stop(package)
+                        time.sleep(1.0 * sleep_scale)
+                    except Exception:      # noqa: BLE001 - 桩没实现 app_stop：至少把 App 拉回来
+                        pass
+                    drv.app_start(package)
+                    time.sleep(2.0 * sleep_scale)
+                    evidence["restored"] = True
+                except Exception:          # noqa: BLE001 - 恢复失败也只是回到旧行为
+                    evidence["restored"] = False
         else:
             evidence["ok"] = False
             evidence["reason"] = "点击预算已用尽"

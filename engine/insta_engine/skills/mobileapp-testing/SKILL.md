@@ -1,10 +1,29 @@
 ---
 name: mobileapp-testing
+display_name: 移动端 App UI 自动化测试
+display_name_en: Mobile App UI Testing
 description: Runs AI-assisted mobile UI tests against a connected Android device via the MAT CLI — generates test cases from natural language, executes them with screenshot-backed evidence, heals broken locators after an app update, explores an app into a page graph, and attributes failures with an LLM. Use when testing an Android app on a real device or emulator; when the user mentions UI tests, regression, smoke tests, 真机测试, 冒烟, or 移动端自动化; or when an existing mobile test case broke after a UI change.
+description_zh: 在本机 Android 真机或模拟器上跑 AI 辅助的 UI 测试：一句话生成用例、带截图证据执行、App 改版后自愈定位、遍历探索生成页面图谱，并对失败步骤做归因。
+description_en: AI-assisted UI testing on a real Android device or emulator through the mat CLI — cases from one sentence, runs with screenshot evidence, locator self-healing after an app update, exploration into a page graph, and LLM failure attribution.
+version: "0.7.3"
+author: "vlmpilot"
 license: Complete terms in LICENSE.txt
+examples_zh:
+- 给这台手机上的 App 跑一次冒烟测试，跑完告诉我哪些步骤挂了
+- 这个用例之前能过，App 更新后点不到按钮了，帮我修好
+- 把 App 的主要页面走一遍生成页面图谱，再看哪些控件还没有用例覆盖
+examples_en:
+- Run a smoke test on the app installed on this phone and tell me which steps failed
+- This case used to pass; after the app update the button cannot be found — fix it
+- Walk the app's main screens into a page graph, then list controls no case covers
 ---
 
 # Mobile App UI Testing with MAT
+
+> **Hard prerequisites** — ① an agent that can run shell commands; ② **one Android
+> device attached to this machine** (real device with USB debugging on, or an
+> emulator), reachable via `adb`. Everything else the agent installs itself. With no
+> device the skill installs fine but no test can run. iOS real device is beta (see below).
 
 To test Android apps on a connected device, use the `mat` CLI. Every command is self-documenting: run `mat --help` first, and `<command> --help` before inventing flags. Do not read the engine source — the CLI is the interface.
 
@@ -89,6 +108,10 @@ rename breaks your cases.
 
 - **0 devices** in `mat devices` → run `mat doctor`; check USB debugging.
 - **Multiple devices** → always pass `--serial`; otherwise behavior is undefined.
+- **HarmonyOS NEXT** (`--platform harmony`, MAT ≥0.8.0): needs the `hdc` tool
+  (bundled with DevEco Studio — MAT auto-discovers the macOS standard install path).
+  Supported: `run` / `explore` / `index` / `gen` on real devices or the DevEco
+  emulator. Not yet: screen recording and APK-fingerprint baselines in `mat eval`.
 
 ## Inspect the UI Tree, Then Act
 

@@ -193,8 +193,14 @@ def summarize(hours: int = 24, path: Path | None = None) -> dict:
     for row in rows:
         # 逻辑任务行进首穿口径,不混入传输层统计(成本/延迟只看 call 行)
         if row.get("scope") == "task":
-            fp = first_pass.setdefault(row.get("task") or "?", {"tasks": 0, "ok": 0, "first": 0})
+            fp = first_pass.setdefault(row.get("task") or "?",
+                                       {"tasks": 0, "ok": 0, "first": 0, "latency_ms": []})
             fp["tasks"] += 1
+            # 端到端耗时（2026-10-26 起由 ai_client 直接落盘）。**只统计有值的行**：
+            # 老数据（10-26 之前）task 行没有 latency_ms，若按 0 计入会把 p50 拉到 0。
+            # 因此另报 `latency_n`，让"样本不足"和"真的很快"可区分。
+            if row.get("latency_ms") is not None:
+                fp["latency_ms"].append(float(row["latency_ms"]))
             if row.get("ok"):
                 fp["ok"] += 1
                 if int(row.get("rounds") or 1) == 1:
@@ -229,13 +235,21 @@ def summarize(hours: int = 24, path: Path | None = None) -> dict:
     return {"hours": hours, "total_calls": total_calls, "by_task": by_task,
             "task_outcomes": {
                 k: {"tasks": v["tasks"], "ok_rate": round(v["ok"] / v["tasks"], 3),
-                    "first_pass_rate": round(v["first"] / v["tasks"], 3)}
+                    "first_pass_rate": round(v["first"] / v["tasks"], 3),
+                    # 端到端 P50/P95（含内容级重试）。`latency_n` 是**有效样本数**：
+                    # 小于 tasks 说明部分老数据没有耗时字段，此时分位数不可外推。
+                    "latency_n": len(v["latency_ms"]),
+                    "p50_ms": int(_percentile(v["latency_ms"], 0.5)),
+                    "p95_ms": int(_percentile(v["latency_ms"], 0.95))}
                 for k, v in first_pass.items() if v["tasks"]}}
 
 
 def render(summary: dict) -> str:
     lines = [f"近 {summary['hours']} 小时：{summary['total_calls']} 次调用"]
-    if not summary["by_task"]:
+    # 提前返回只看 call 行是错的：`total_calls` 按设计不含 task 行，于是「只有逻辑任务
+    # 行、没有传输层行」的窗口会渲染成「无记录」，把已采到的首穿率/端到端耗时一起吞掉
+    # （2026-10-26 被新加的单测照出来）。
+    if not summary["by_task"] and not summary.get("task_outcomes"):
         return lines[0] + "（无记录——跑一次生成后再看）"
     lines.append(f"{'任务':10s} {'次数':>5s} {'失败':>4s} {'截断':>4s} "
                  f"{'p50':>7s} {'p95':>7s} {'输入tok':>9s} {'输出tok':>9s}")
@@ -251,6 +265,12 @@ def render(summary: dict) -> str:
         lines.append(f"{task} 逻辑任务 {fp['tasks']} 次:成功 {fp['ok_rate']:.0%} "
                      f"首穿 {fp['first_pass_rate']:.0%}(首穿=0 轮内容修复即合法;"
                      f"端到端跑通率另有口径,勿混引)")
+        # 端到端耗时（含重试）——这才是「生成一条用例要多久」的可引用口径
+        n = fp.get("latency_n", 0)
+        if n:
+            tail = "" if n == fp["tasks"] else f"（仅 {n}/{fp['tasks']} 条有耗时，老数据无此字段）"
+            lines.append(f"{task} 端到端耗时 p50 {fp['p50_ms']}ms / p95 {fp['p95_ms']}ms"
+                         f"（n={n}，含内容级重试）{tail}")
     return "\n".join(lines)
 
 

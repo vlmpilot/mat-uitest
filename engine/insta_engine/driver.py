@@ -213,6 +213,30 @@ class DeviceDriver(BaseDriver):
         self.shell(f"input text {escaped}")
         return True
 
+    #: 按键清空的上限：`count+2` 会再夹到这个值（防一条用例清出 200 个键）。
+    MAX_CLEAR_KEYS = 64
+
+    def clear_by_keyevents(self, count: int) -> bool:
+        """按键清空输入框（Android）：`MOVE_END` + `count+2` 个 `DEL`，一次 shell 下发。
+
+        **为什么需要第三条通道**：`clearTextField` / `setText("")` 走的都是无障碍
+        `ACTION_SET_TEXT`，App 若自绘占位或挂 TextWatcher 就会**静默不生效**
+        （2026-10-27 真机：xhs 搜索框 `clear_text()` 不抛异常、文本一点没变）。
+        按键事件走的是**焦点输入**通道，与无障碍动作是两条独立的路。
+
+        `count+2` 是余量：清空到占位前缀后多按两下是空操作（实测 xhs 停在「搜索, 」），
+        而少按一下就会留一个字符 —— 后者更难发现。
+
+        返回 False 表示"本平台没有这个通道"（iOS 的 WDA 只有元素级 clear），
+        由 `Element.clear_text` 决定是记 `note` 还是不记；**不在这里抛异常**。
+        """
+        if getattr(self, "platform", "android") != "android" or count <= 0:
+            return False
+        presses = min(count + 2, self.MAX_CLEAR_KEYS)
+        keys = " ".join(["KEYCODE_MOVE_END"] + ["KEYCODE_DEL"] * presses)
+        self.shell(f"input keyevent {keys}")
+        return True
+
     def open_settings(self) -> None:
         """系统设置（F3 操控）：显式 Intent——固定串，无用户输入拼接，不经 shell 元字符。"""
         self.shell("am start -a android.settings.SETTINGS")

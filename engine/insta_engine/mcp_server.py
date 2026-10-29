@@ -105,7 +105,7 @@ def build_server(root: Path):
         """在设备上运行一个测试用例（后台任务；每步截图证据、失败自动分类）。
 
         返回 job_id，用 mat_job 查事件流与报告路径。传 serial 指定设备，缺省取唯一在线设备。
-        platform="android"（默认）或 "ios"——iOS：USB 真机传 udid（`mat ios-setup` 可查看），
+        platform="android"（默认）/"ios"/"harmony"（鸿蒙 NEXT,需 hdc）——iOS：USB 真机传 udid（`mat ios-setup` 可查看），
         模拟器不传 serial（WDA 常驻 localhost:8100）。
         """
         code, obj = ws.api_run(root, {"case": case, "serial": serial, "platform": platform})

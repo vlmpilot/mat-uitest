@@ -7,13 +7,14 @@ import { FsListing, getFs, getJob, installApp, probeApp } from "../api";
 // 安装成功可选回显版本+包指纹(T76 准入证据链,需填包名)。
 export default function InstallModal({ open, onClose, serial, platform, onInstalled }: {
   open: boolean; onClose: () => void;
-  serial: string | null; platform: "android" | "ios";
+  serial: string | null; platform: "android" | "ios" | "harmony";
   onInstalled?: (summary: string) => void;
 }) {
   const isAndroid = platform === "android";
+  const isHarmony = platform === "harmony";
   // 真机（2026-10-19）：devicectl 安装，同样只接受 .app 目录（.ipa 需先解压）
   const isRealIos = platform === "ios" && !!serial && serial !== "simulator";
-  const ext = isAndroid ? ".apk" : "";
+  const ext = isAndroid ? ".apk" : isHarmony ? ".hap" : "";
   const [browsePath, setBrowsePath] = useState("");
   const [dirs, setDirs] = useState<string[]>([]);
   const [files, setFiles] = useState<string[]>([]);
@@ -56,6 +57,7 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
     try {
       const { job_id } = await installApp({ serial, platform, path: selected, package: pkg || undefined });
       message.info(isAndroid ? "正在安装（覆盖安装，保留数据）…"
+        : isHarmony ? "正在安装到鸿蒙设备（hdc install）…"
         : isRealIos ? "正在安装到真机（devicectl）…" : "正在安装到模拟器…");
       for (let i = 0; i < 300; i++) {
         const job = await getJob(job_id);
@@ -74,6 +76,7 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
 
   return (
     <Modal title={`安装测试包（${isAndroid ? "Android · adb install -r"
+      : isHarmony ? "鸿蒙 · hdc install"
       : isRealIos ? "iOS 真机 · devicectl" : "iOS 模拟器 · simctl"}）`}
       open={open} onCancel={onClose} width={560}
       footer={<Space>
@@ -83,7 +86,9 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
       <Space direction="vertical" style={{ width: "100%" }} size={10}>
         <div>
           <div style={{ marginBottom: 6, fontSize: 13 }}>
-            {isAndroid ? "选择 .apk 安装包（可直接点选文件）" : "进入 .app 所在目录后，点该目录的「选为安装包」"}
+            {isAndroid ? "选择 .apk 安装包（可直接点选文件）"
+              : isHarmony ? "选择 .hap 安装包（可直接点选文件）"
+              : "进入 .app 所在目录后，点该目录的「选为安装包」"}
           </div>
           <Space.Compact style={{ width: "100%" }}>
             <Input value={selected || browsePath} onChange={(e) => setSelected(e.target.value)}
@@ -98,7 +103,7 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
             <div key={d} style={{ display: "flex", alignItems: "center" }}>
               <Button block size="small" type="text" style={{ justifyContent: "flex-start", flex: 1 }}
                 onClick={() => browse(join(browsePath, d))}>📁 {d}</Button>
-              {!isAndroid && d.endsWith(".app") && (
+              {platform === "ios" && d.endsWith(".app") && (
                 <Button size="small" type="link" onClick={() => selectAndProbe(join(browsePath, d))}>选为安装包</Button>)}
             </div>))}
           {files.map((f) => (
@@ -112,7 +117,7 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
             包名（选中安装包<b>自动识别</b>，可改；填了则在安装后回显<b>版本号+包指纹</b>）
           </div>
           <Input value={pkg} onChange={(e) => setPkg(e.target.value)}
-            placeholder={isAndroid ? "如 com.example.app" : "如 com.example.app（bundleId）"} />
+            placeholder={isAndroid ? "如 com.example.app" : "如 com.example.app（bundleName）"} />
           {probeNote && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               已识别：<Typography.Text code style={{ fontSize: 12 }}>{probeNote}</Typography.Text>
@@ -121,6 +126,8 @@ export default function InstallModal({ open, onClose, serial, platform, onInstal
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
           {isAndroid
             ? "覆盖安装（adb install -r -t）保留应用数据；iOS 模拟器需模拟器架构的 .app 构建。"
+            : isHarmony
+            ? "hdc install 安装 .hap；包需已用 DevEco Studio 签名，设备已开启开发者模式与 USB 调试。"
             : isRealIos
             ? "真机安装要求 .app 已签名且设备已开启开发者模式；App Store 的 .ipa 需先解压成 .app。"
             : "simctl 安装需模拟器架构的 .app 目录（App Store 的 ipa 装不上模拟器）。"}

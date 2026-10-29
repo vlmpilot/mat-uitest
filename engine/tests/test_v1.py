@@ -677,7 +677,7 @@ def test_quota_gen_counts_but_never_blocks(tmp_path, monkeypatch):
 
 
 def test_quota_pro_gen_display_and_no_block(tmp_path, monkeypatch):
-    """Pro 的生成额度只是展示口径（策略 2000）；本地永不拦截。"""
+    """Pro 的生成额度只是展示口径（策略 300）；本地永不拦截。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     monkeypatch.setenv("MAT_LICENSE_SECRET", TEST_LICENSE_KEY)
     from insta_engine.licensing import activate
@@ -687,14 +687,14 @@ def test_quota_pro_gen_display_and_no_block(tmp_path, monkeypatch):
         store.consume()
     snap = store.snapshot()
     assert snap["plan"] == "pro"
-    assert snap["gen_limit"] == plan_limits("pro")["gen"] == 2000
+    assert snap["gen_limit"] == plan_limits("pro")["gen"] == 300
     assert snap["gen_enforced"] is False
 
 
-# -- 视觉兜底配额（体验版 20、标准版 300 次/月） -----------------------
+# -- 视觉兜底配额（体验版 20、标准版 100 次/月） -----------------------
 
 def test_quota_free_vision_limit(tmp_path, monkeypatch):
-    """体验版视觉兜底 50 次/月（policy/quota.json）：用尽后抛 QuotaExceeded（调用方优雅降级）。"""
+    """体验版视觉兜底 20 次/月（policy/quota.json）：用尽后抛 QuotaExceeded（调用方优雅降级）。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     store = UsageStore(tmp_path / "usage.json")
     free_vision = plan_limits("free")["vision"]
@@ -708,20 +708,20 @@ def test_quota_free_vision_limit(tmp_path, monkeypatch):
     assert snap["gen_count"] == 0  # 视觉核销不影响生成计数
 
 
-def test_quota_pro_vision_limit_300(tmp_path, monkeypatch):
-    """标准版视觉兜底 300 次/月（策略文件）：vision_limit 不再是 None，用尽后抛 QuotaExceeded。"""
+def test_quota_pro_vision_limit_100(tmp_path, monkeypatch):
+    """标准版视觉兜底 100 次/月（策略文件）：vision_limit 不再是 None，用尽后抛 QuotaExceeded。"""
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     monkeypatch.setenv("MAT_LICENSE_SECRET", TEST_LICENSE_KEY)
     from insta_engine.licensing import activate
     activate(mint_test_code("pro", months=1))  # 真签名激活
     store = UsageStore(tmp_path / "usage.json")
     pro_vision = plan_limits("pro")["vision"]
-    assert store.snapshot()["vision_limit"] == pro_vision == 300
+    assert store.snapshot()["vision_limit"] == pro_vision == 100
     for _ in range(pro_vision):
         store.check_vision()
     with pytest.raises(QuotaExceeded) as exc:
         store.check_vision()
-    assert "300" in str(exc.value)  # 触顶文案说明标准版月额度
+    assert "100" in str(exc.value)  # 触顶文案说明标准版月额度
     snap = store.snapshot()
     assert snap["vision_count"] == pro_vision
     assert snap["gen_count"] == 0
@@ -1170,9 +1170,19 @@ def test_runner_vision_fallback_rescues_locate_failure(tmp_path):
 
         def __init__(self):
             self.raw = MissingRaw()
+            self.clicked = None
 
         def screenshot_pil(self):  # P0-iOS：视觉兜底改走中立截图方法（不再读 drv.raw）
             return self.raw.screenshot()
+
+        def click(self, x, y):
+            # 真实点击会让界面变化。桩若恒定不变，等价于"点空了"——2026-10-27 起
+            # runner 对"点了界面纹丝不动"判 failed（点空了不算自愈成功，见
+            # test_selfheal_noop.py）。这里必须模拟真实行为，否则测的是一个不存在的场景。
+            self.clicked = (x, y)
+
+        def dump(self):
+            return f"<hierarchy clicked={self.clicked}/>"
 
     case = TestCase.model_validate({
         "caseId": "case_vl",

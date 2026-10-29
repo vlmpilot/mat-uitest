@@ -63,6 +63,35 @@ class Check:
         return d
 
 
+def _local_endpoint_down(endpoint: str) -> bool | None:
+    """本机端点**没在监听**？True=连不上 / False=能连 / None=不在本机或无法解析。
+
+    只给诊断提示用，不参与执行：超时 0.3s，宁可判"未知"也不拖住配置台整页检测
+    （纪律见模块头：进页面自动检测，任何探测挂死都会拖住整页）。
+    """
+    from urllib.parse import urlsplit
+
+    from .offline import is_loopback
+
+    if not is_loopback(endpoint):
+        return None
+    try:
+        parts = urlsplit(endpoint if "://" in endpoint else "//" + endpoint)
+        host = (parts.hostname or "").strip("[]")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if not host:
+        return None
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return False
+    except OSError:
+        return True
+
+
 # -- 一键修复动作白名单（配置台 /api/doctor/fix 的唯一执行入口） --------------------
 # kind=run：本机执行命令（列表参数、不经 shell）；kind=open：用系统默认程序打开文件
 # （.env 不存在则以模板创建）。都只在本机模式下可用（--share 由网关层拒绝）。
@@ -101,6 +130,8 @@ ENV_TEMPLATE = (
     "# GEN_API_KEY=<你的 Key>\n"
     "# GEN_MODEL=<语言模型名>\n"
     "# GEN_VL_MODEL=<视觉模型名>\n"
+    "# GEN_VL_BASE_URL=<视觉端点>（可选：兜底单独走一个端点，如本机小模型）\n"
+    "# MAT_VL_MAX_EDGE=1280（可选：送模型前压缩截图长边，默认不缩）\n"
     "# 方式二：官方代理（零配置试用；关注公众号「Mobile AI Test」获取代理token）\n"
     "GEN_BASE_URL=https://mobileaitest.com\n"
     "GEN_API_KEY=<平台代理token>\n"
@@ -114,8 +145,12 @@ _FIX_TIMEOUT_S = 600
 # 环境检测关注的可配置项：重新检测前先清这组再从工作区 .env 重载——
 # 否则长驻进程读的是启动时的旧环境，用户改完 .env 点「重新检测」永远是旧结论，
 # 「打开配置→改→重新检测」闭环就是假的。配置台场景 .env 是权威来源（UI 引导编辑的就是它）。
+# ⚠️ 新增任何「引擎会读」的配置项都必须登记到这里，否则配置台改了不生效——
+# `GEN_VL_BASE_URL` / `MAT_VL_MAX_EDGE` 就是漏在这里过（2026-10-26 补）。
 _ENV_KEYS = ("GEN_BASE_URL", "GEN_API_KEY", "GEN_MODEL", "GEN_VL_MODEL",
-             "GEN_PROMPT_MODE", "GEN_VL_FALLBACK", "MAT_WEBHOOK_URL")
+             "GEN_VL_BASE_URL", "MAT_VL_MAX_EDGE",
+             "GEN_PROMPT_MODE", "GEN_VL_FALLBACK", "MAT_WEBHOOK_URL",
+             "GEN_DISABLE_THINKING")
 
 _RELOADED: dict = {"mtime": None, "path": ""}  # 上次重载的 .env mtime（节流标记）
 
@@ -369,9 +404,20 @@ def android_checks() -> list[Check]:
     # 步骤级 onFailure: heal 是改用例不是改配置）；全局授权=ok。模型名不上 UI（发起人 2026-10-12）。
     # 提示按模式分类（发起人 2026-10-14）：官方代理模式下视觉模型由服务端决定，
     # 本地不需要 GEN_VL_MODEL——照抄「加 GEN_VL_MODEL」配了也不生效，必须分开说。
+    from .offline import is_loopback
+    from .vision import endpoint
+
     vl = os.environ.get("GEN_VL_MODEL")
-    vl_usable = gen_ok if server_mode else bool(vl and gen_ok)
+    # 端点在本机时模型名必须由本地给（本机服务不会替我们选模型）——对齐
+    # `vision.enabled()`；官方代理的「模型服务端决定」在本机端点上不成立。
+    vl_ep = endpoint()
+    vl_local = is_loopback(vl_ep)
+    vl_usable = bool(vl and gen_ok) if (vl_local or not server_mode) else gen_ok
     vl_authorized = os.environ.get("GEN_VL_FALLBACK") == "1"
+    # 「已启用」只说明配置齐了。端点在本机而服务没起时，每次定位失败都是 ConnectionError
+    # （报告里写「vision-llm 调用异常」），人却在查额度与授权——探一次 TCP 直接说破。
+    vl_local_down = _local_endpoint_down(vl_ep) is True
+    vl_ok = vl_usable and vl_authorized
     if not vl_usable:
         vl_label = "视觉兜底(未配置)"
         vl_hint = (f"官方代理模式下无需 GEN_VL_MODEL：完成上方 AI 模型配置(方式一)后,"
@@ -379,6 +425,11 @@ def android_checks() -> list[Check]:
                    f"开启后仍需显式授权才触发——{VISION_OPT_IN_HINT}"
                    if not local_inclined else
                    f".env 加 GEN_VL_MODEL 开启;开启后仍需显式授权才触发——{VISION_OPT_IN_HINT}")
+    elif vl_authorized and vl_local_down:
+        vl_label = "视觉兜底(已启用,本机端点未监听)"
+        vl_hint = (f"本机视觉服务没在 {vl_ep} 上监听：先启动它，否则每次定位失败都会"
+                   f"ConnectionError（报告显示「vision-llm 调用异常」）")
+        vl_ok = False
     elif vl_authorized:
         vl_label = "视觉兜底(已启用,全局授权 GEN_VL_FALLBACK=1)"
         vl_hint = "定位失败自动走截图定位"
@@ -387,8 +438,8 @@ def android_checks() -> list[Check]:
         vl_hint = (f"触发需显式授权:步骤标 onFailure: heal(逐步骤),"
                    f"或 .env 设 GEN_VL_FALLBACK=1(全局)——{VISION_OPT_IN_HINT}")
     checks.append(Check(
-        id="vl", label=f"{vl_label}(建议配置)", ok=vl_usable and vl_authorized, hint=vl_hint,
-        fix={"action": "open-env"} if not (vl_usable and vl_authorized) else None,
+        id="vl", label=f"{vl_label}(建议配置)", ok=vl_ok, hint=vl_hint,
+        fix={"action": "open-env"} if not vl_ok else None,
     ))
 
     webhook = bool(os.environ.get("MAT_WEBHOOK_URL"))
@@ -605,10 +656,41 @@ def ios_checks() -> list[Check]:
     return checks
 
 
+def harmony_checks() -> list[Check]:
+    """鸿蒙环境检查（2026-10-26）：hdc 可用性 + 在线设备。
+
+    鸿蒙链路整体是**可选能力**——hdc 缺失只是 warn 不是 critical（别让只用
+    Android/iOS 的用户看到满屏红）。检查失败给可行动指引（DevEco 位置/MAT_HDC）。
+    """
+    from .harmony_hdc import hdc_path, list_targets
+
+    checks: list[Check] = []
+    binpath = hdc_path()
+    checks.append(Check(
+        id="hdc", label=f"hdc: {binpath or '未找到'}", ok=bool(binpath),
+        detail="" if binpath else "未安装(可选)",
+        hint="随 DevEco Studio 分发(macOS 标准位置已自动发现);非标准安装可设 MAT_HDC 指向 hdc",
+    ))
+    targets: list[str] = []
+    if binpath:
+        try:
+            targets = list_targets()
+        except Exception:  # noqa: BLE001 —— hdc 存在但 daemon 异常,按无设备
+            targets = []
+    checks.append(Check(
+        id="harmony-devices", label=f"鸿蒙设备/模拟器: {len(targets)} 台", ok=bool(targets),
+        detail="、".join(targets[:3]) if targets else "未连接(可选)",
+        hint="DevEco Studio → Tools → Device Manager 创建并启动模拟器;或 USB 连接鸿蒙 NEXT 真机",
+    ))
+    return checks
+
+
 def run(platform: str = "all") -> list[Check]:
-    """聚合检查。platform ∈ {"android", "ios", "all"}。"""
+    """聚合检查。platform ∈ {"android", "ios", "harmony", "all"}。"""
     if platform == "android":
         return android_checks()
     if platform == "ios":
         return ios_checks()
-    return android_checks() + ios_checks()
+    if platform == "harmony":
+        return harmony_checks()
+    return android_checks() + ios_checks() + harmony_checks()

@@ -88,6 +88,50 @@ def is_dynamic_text(text: str, max_len: int = _MAX_TEXT_LEN) -> bool:
     return any(pattern.match(text) for pattern in _DYNAMIC_PATTERNS)
 
 
+#: 「**部分动态**」文案：固定文案 + 会变的计数（`消息，1条未读`、`3人想买`）。
+#:
+#: ⚠️ **不并入 `is_dynamic_text`**。那条判据是给 `page_key` 用的，注释写明"宁可漏杀不可错杀
+#: ——错杀会让两个不同页面撞 key"；这里如果也按"整串匹配"放宽，`3人成团` 这类稳定文案会被
+#: 误杀。所以只用于**控件清单 / 候选集**两个出口：少一条候选无害，而让模型照抄
+#: `text=消息，1条未读` 有害——未读数一变（1→3）就定位失败，且这类失败会被误归因成"文案过期"。
+#:
+#: 实测来源（2026-10-28）：xhs 底部导航的「消息」tab 只有 `content-desc='消息，1条未读'`
+#: （可点容器）+ `text='消息'`（不可点 TextView）。放开退化 rid 之后前者进了候选集，
+#: 模型立刻照抄 ⇒ 3/3 都写死未读数。
+_DYNAMIC_SEGMENT_RE = re.compile(
+    r"\d+\s*(?:条|个|人|次|天|小时|分钟|秒|元|万|千|亿|w|k|%)", re.IGNORECASE)
+
+
+def has_dynamic_segment(text: str) -> bool:
+    """文案里是否**夹着**会变的计数（见 `_DYNAMIC_SEGMENT_RE`）。只用于候选集过滤。"""
+    return bool(_DYNAMIC_SEGMENT_RE.search(text or ""))
+
+
+def stable_prefix(label: str) -> str:
+    """`消息，1条未读` → `消息`：取动态段**之前**的固定部分（去掉尾部标点）。
+
+    ## 为什么不是"整条丢掉"（2026-10-28 实测踩到）
+
+    第一版把带计数的文案整条过滤掉，结果 xhs「消息页」这条意图**从错法 A 换成错法 B**：
+
+    | 候选集 | 模型写的定位 | 后果 |
+    |---|---|---|
+    | 旧（没有底部导航） | `text=消息` | **对的**，但 R18 报"不在清单" |
+    | 放开退化 rid | `text=消息，1条未读` | 未读数一变就定位失败 |
+    | 再加"整条过滤" | `text=我` | **点错页**（清单里只剩别的 tab） |
+
+    根因：`消息` 这个文案**真机确实存在**（不可点的 TextView，`text='消息'`），
+    只是没有进清单 ⇒ 模型只能在清单里挑，挑了个错的。
+    ⇒ 正确做法是取稳定前缀，并且**要求它在该页真的有 `text`**（见调用方），否则宁可不收。
+    """
+    m = _DYNAMIC_SEGMENT_RE.search(label or "")
+    if not m:
+        return (label or "").strip()
+    # 去尾部标点：**按字符集合**剥（`，`/`,`/`、`/`:`/`·`/`|`/`/`/`-`/破折号/空格 任一）。
+    # 这里就是想要集合语义，不是想要"这一整串"，故显式关掉 B005。
+    return (label or "")[:m.start()].rstrip("，,、:：·|/-—  ")  # noqa: B005
+
+
 def _stable_text(text: str) -> str:
     """动态文本置空（保留控件本身，其 res-id 仍可作稳定标识）。"""
     return "" if is_dynamic_text(text) else text
@@ -510,6 +554,12 @@ def digest_page(xml: str, package: str = "") -> dict:
             entry["res-id"] = node.rid
         if node.bounds:
             entry["bounds"] = node.bounds
+        # `selected` / `checked` **只在 True 时写**（与 `clickable` 同口径）：False 是绝大多数，
+        # 写进去只是让每份图谱膨胀、且"没有这个键"与"值为 False"对消费方语义相同。
+        if node.selected:
+            entry["selected"] = True
+        if node.checked:
+            entry["checked"] = True
         controls.append(entry)
     return {"node_count": len(controls), "controls": controls}
 
@@ -573,6 +623,10 @@ def _round_robin(groups: list[list[str]], limit: int) -> list[str]:
 #: 广度配额占比（2026-10-26 真机标定）。**纯轮转是过冲**——见 `_quota_split`。
 BREADTH_SHARE = 0.5
 
+#: 合并行里最多列几个文案（2026-10-28）。某社区类 App 有 rid 被 30+ 个文案共用，
+#: 全列出来单行就上千字符，把整份清单的预算吃掉——超出的部分折成「… 等 N 个」。
+_LABEL_CAP = 8
+
 
 def _quota_split(groups: list[list[str]], limit: int,
                  breadth_share: float = BREADTH_SHARE) -> list[str]:
@@ -604,6 +658,157 @@ def _quota_split(groups: list[list[str]], limit: int,
                 seen.add(line)
                 if len(out) >= limit:
                     return out
+    return out
+
+
+def _page_rid_lines(page: dict, text_limit: int) -> list[tuple[str, tuple]]:
+    """一页的 res-id 行：**同一 rid 的多个文案合并成一行**（返回 (行, 去重键)）。
+
+    ## 为什么必须合并（2026-10-28 起）
+
+    旧实现按 `(rid, label)` 去重 ⇒ 一个共用 rid 会变成**每个文案一行**。真实清单里
+    某资讯 App 首页的频道栏是这样注入的：
+
+        - res-id: .../channelbar_text  文案: 7x24  页面: .activity.SplashActivity
+        - res-id: .../channelbar_text  文案: 要闻  ...
+        - res-id: .../channelbar_text  文案: 国际  ...        ← 同一 rid 出现 7 行
+
+    读起来像"7 个恰好同 id 的控件"，模型据此认为 `text=国际` 与 `res-id=channelbar_text`
+    是**两个等价选项**，于是写 `text=国际`——而 R21 立刻报"3 个同名控件"。
+    **候选集没告诉它这是个共用容器**，这是注入形态的缺陷，不是模型偷懒。
+
+    合并后：`- res-id: .../channelbar_text  文案: 7x24 | 要闻 | 关注 | ...（共用 rid，7 个文案）`
+    ⇒ 模型能看出"这是一个控件组，要指定其中一个只能用文案"，或按顺序用 `index`。
+
+    ## 顺序 = **首次出现顺序**，不按 bounds 排序
+
+    实测该页频道栏有 **15 个** `channelbar_text` 控件，但只有 7 个不同文案——
+    因为探索时频道栏**滚动过**，同一页里叠了两份快照（第二份里「关注」的 x 从 291 变成 0）。
+    按 x 排序会把两份快照混着排（关注 0 / 7x24 0 / 要闻 153 …）⇒ 顺序全乱；
+    而首次出现顺序恰好就是第一份快照的真实 tab 顺序。**别改成按 bounds 排。**
+
+    ## 数量怎么写
+
+    - 有多个文案：写**文案个数**，不写控件个数（15 是含重复快照的，写出来是误导）。
+    - 无文案的多实例：写控件个数（没有文案可去重，这个数就是真的）。
+
+    ## `index` 映射（2026-10-28 起，同一条规则的第二个半）
+
+    `text=国际` 在这类页面上有 **3 个**同名控件（2 个频道 tab 的两份快照 + 1 个筛选弹窗
+    的标签 `filter_dialog_tag_name`）⇒ R21 会报"改用 res-id"，但 `channelbar_text` 一个 rid
+    管 9 个 tab、**写 res-id 等于点第一个** ⇒ 建议不可执行，模型只能退回 text，循环。
+
+    解法：该页的 `channel_bar_item_container`（**可点**、无文案、15 个实例）与
+    `channelbar_text` 的 15 个实例 **bounds 逐一完全相同** ⇒ 把 `index → 文案` 映射直接
+    写出来，模型才可能写 `res-id=.../channel_bar_item_container, index=5`。
+
+    ⚠️ 映射里的 `index` 是**该 rid 的实例序号**（0 基，含重复快照），不是"去重后第几个文案"。
+    实测 15 个实例里 index 6 与 7 都是「娱乐」（同一 tab 的两种 bounds）——照实例序号列，
+    别按去重文案列，否则模型算出来的 index 会整体偏移。
+    """
+    order: list[str] = []
+    labels: dict[str, list[str]] = {}
+    inst_labels: dict[str, list[str]] = {}
+    count: dict[str, int] = {}
+    bounds: dict[str, list[str]] = {}
+    clickable: dict[str, int] = {}
+    #: rid → **带 selected=true 的实例序号**（0 基，按实例顺序）。
+    #: 用来在清单里标出"这个控件的 selected 是真机上可断言的"，以及"当前选中的是哪个实例"。
+    selected_at: dict[str, list[int]] = {}
+    for control in page.get("controls") or []:
+        rid = str(control.get("res-id") or "").strip()
+        # ⚠️ **退化 rid 不进 rid 行**（2026-10-28）：`0_resource_name_obfuscated` 被同页
+        # 十几个**毫不相干**的控件共用（标题 / 点赞数 / 用户名 / tab …），合并成一行后
+        # 既是 200+ 字符的噪声、又完全无法定位。实测 xhs 有 **48 行**这样的行，约占整份
+        # 清单的 58% 字符；而且它把内容快照（`东胜野生眉安妮`、`点赞 15`）混进候选集，
+        # 模型会误以为这些是可用定位值。⇒ 这些控件交给 `controls_context` 的**文案回落**分支。
+        if not rid or is_degenerate_res_id(rid):
+            continue
+        label = (control.get("text") or control.get("desc") or "").strip()
+        instance = count.get(rid, 0)          # 本控件的实例序号（先取后加）
+        count[rid] = instance + 1
+        bounds.setdefault(rid, []).append(str(control.get("bounds") or "").strip())
+        inst_labels.setdefault(rid, []).append(label)
+        if control.get("clickable"):
+            clickable[rid] = clickable.get(rid, 0) + 1
+        if control.get("selected"):
+            selected_at.setdefault(rid, []).append(instance)
+        if rid not in labels:
+            order.append(rid)
+            labels[rid] = []
+        if label and label not in labels[rid]:
+            labels[rid].append(label)
+    # 有文案的 rid 里，谁能提供「实例序号 → 文案」：bounds 序列完全一致才行（同序同值）。
+    # ⚠️ 值必须是 `inst_labels`（**含重复、按实例顺序**），不是去重后的 `labels`——
+    # 用去重列表会让 index 整体偏移（15 个实例 vs 9 个文案）。
+    by_seq: dict[tuple[str, ...], list[str]] = {}
+    for rid in order:
+        if len(labels[rid]) > 1 and all(bounds[rid]):
+            by_seq.setdefault(tuple(bounds[rid]), inst_labels[rid])
+    # 本页是否存在**可点**的无文案容器能提供 index 映射（决定"多文案行"该给什么建议）。
+    has_clickable_map = any(
+        count[rid] > 1 and not labels[rid] and clickable.get(rid, 0) >= count[rid] // 2
+        and all(bounds[rid]) and tuple(bounds[rid]) in by_seq
+        for rid in order)
+    activity = str(page.get("activity") or "")[:40]
+
+    def _sel_note(rid: str) -> str:
+        """`★真机 selected` 标记（2026-10-28）。
+
+        为什么要写进清单：切 tab 的正确断言是 `{"type":"selected", ...}`，但模型此前
+        **无从判断哪个控件真的带 selected**——图谱全量 0 个 `selected=True`（控件字典原先
+        只有 6 个字段）。猜错就是运行期 `get_state` 抛"节点无 selected 状态"⇒ 断言必红。
+        ⇒ 只标**真机采到过**的，让模型能放心断；没标的就别断。
+
+        多实例时还要给出**当前选中的是哪个实例**——那是"切换前"的基线，也是
+        "到底切没切"的参照。
+        """
+        sel = selected_at.get(rid) or []
+        if not sel:
+            return ""
+        if count[rid] <= 1:
+            return "  ★真机 selected"
+        return "  ★真机 selected: index=" + ",".join(str(i) for i in sel)
+
+    out: list[tuple[str, tuple]] = []
+    for rid in order:
+        labs, n = labels[rid], count[rid]
+        sel = _sel_note(rid)
+        if len(labs) > 1:
+            shown = labs[:_LABEL_CAP]
+            joined = " | ".join(x[:text_limit] for x in shown)
+            if len(labs) > _LABEL_CAP:
+                joined += f" … 等 {len(labs)} 个"
+            # ⚠️ **不要**再写"按此顺序用 index"：这里列的是**去重文案**（9 个），
+            # 而 index 数的是**实例**（15 个，含重复快照）⇒ 两个顺序对不上，照它算必偏移。
+            if has_clickable_map:
+                note = (f"（共用 rid，{len(labs)} 个文案；text 会命中多个同名控件，"
+                        "精确点某一个请用同页**可点容器**那行的 index）")
+            else:
+                note = f"（共用 rid，{len(labs)} 个文案；该 rid 无法单独指定，只能用 text=某文案）"
+            line = f"- res-id: {rid}  文案: {joined}{note}{sel}  页面: {activity}"
+        elif labs:
+            # 单文案不写 index 提示：它不制造歧义，而"同 rid ×N"每行 ~20 字符，
+            # 实测在某资讯 App 上给 120 行里的一大半都加上，字符数 +27% 却换不到任何覆盖增益。
+            line = f"- res-id: {rid}  文案: {labs[0][:text_limit]}{sel}  页面: {activity}"
+        else:
+            note = f"（无文案 ×{n}）" if n > 1 else "（无文案）"
+            line = f"- res-id: {rid}  {note}  页面: {activity}"
+            if n > 1 and clickable.get(rid, 0) >= n // 2:
+                # 只对**可点**的容器给映射：index 指向一个不可点的 View 对点击没用。
+                seq_labels = by_seq.get(tuple(bounds[rid])) if all(bounds[rid]) else None
+                if seq_labels:
+                    shown = [f"{i}={t[:text_limit]}" for i, t in enumerate(seq_labels[:_LABEL_CAP])]
+                    more = f" … 等 {n} 个" if n > _LABEL_CAP else ""
+                    line = (f"- res-id: {rid}  {note} index→文案: {' '.join(shown)}{more}"
+                            f"（index = 该 rid 的**实例序号**，0 基）{sel}"
+                            f"  页面: {activity}")
+            elif sel:
+                line = f"- res-id: {rid}  {note}{sel}  页面: {activity}"
+        # 去重键：多文案用整组（合并后是一行新东西）；单/无文案沿用旧的 (rid, 文案) 口径——
+        # 把实例数 n 也放进键会让同一控件在不同页各留一行，实测字符数虚涨而活动覆盖不变。
+        key = (rid, tuple(labs)) if len(labs) > 1 else (rid, labs[0] if labs else "")
+        out.append((line, key))
     return out
 
 
@@ -641,20 +846,34 @@ def controls_context(pages: list[dict], max_controls: int = 120, text_limit: int
     per_page_text: list[list[str]] = []
     for page in pages:
         activity = page.get("activity", "")
+        page_texts = {str(c.get("text") or "").strip() for c in page.get("controls", [])}
+        page_texts.discard("")
         rids: list[str] = []
         texts: list[str] = []
+        for line, key in _page_rid_lines(page, text_limit):
+            if key in seen_rid:
+                continue
+            seen_rid.add(key)
+            rids.append(line)
         for control in page.get("controls", []):
             rid = control.get("res-id", "")
             label = (control.get("text") or control.get("desc") or "").strip()
-            if rid:
-                if (rid, label) in seen_rid:
+            # 退化 rid 当**没有 rid**：这些控件（xhs 底部导航 `首页`/`我`/`发布` 就在里面）
+            # 的 rid 是占位名、零区分度，但文案和 clickable 都是真的 ⇒ 必须能进文案段。
+            if rid and is_degenerate_res_id(rid):
+                rid = ""
+            if rid or not (control.get("clickable") and label) or is_dynamic_text(label):
+                continue
+            # 部分动态（`消息，1条未读`）取稳定前缀，且**前缀要在本页真有 text**
+            # ——`消息` 确实是同页 TextView 的 text，所以这条能收；`3人成团` 取不到 ⇒ 丢。
+            if has_dynamic_segment(label):
+                label = stable_prefix(label)
+                if not label or label not in page_texts:
                     continue
-                seen_rid.add((rid, label))
-                rids.append(f"- res-id: {rid}  文案: {label[:text_limit]}  页面: {activity[:40]}")
-            elif (control.get("clickable") and label
-                  and not is_dynamic_text(label) and label not in seen_label):
-                seen_label.add(label)
-                texts.append(f"- 文案: {label[:text_limit]}  类型: clickable  页面: {activity[:40]}")
+            if label in seen_label:
+                continue
+            seen_label.add(label)
+            texts.append(f"- 文案: {label[:text_limit]}  类型: clickable  页面: {activity[:40]}")
         if rids:
             per_page_rid.append(rids)
         if texts:
@@ -744,21 +963,40 @@ def controls_list_for(package: str, base_dir: Path | str | None = None,
     seen: set[tuple] = set()
     for page in pages:
         activity = str(page.get("activity", ""))
+        # 该页所有 `text`：用来校验「部分动态文案的稳定前缀」在本页**真的有这个 text**
+        # （`消息，1条未读` → `消息`，而 `消息` 确实是同页 TextView 的 text）。
+        page_texts = {str(c.get("text") or "").strip() for c in page.get("controls", [])}
+        page_texts.discard("")
         for control in page.get("controls", []):
             rid = str(control.get("res-id", "") or "")
             label = str(control.get("text") or control.get("desc") or "").strip()
+            # ⚠️ **退化 rid ≠ 没有控件**（2026-10-28）：`0_resource_name_obfuscated` 只是
+            # 名字零区分度（用它定位会命中第一个），但控件本身和它的文案是真的。
+            # 原先这里 `continue` 把整条控件丢掉 ⇒ **文案也一起丢**。
+            # 实测 xhs：924 个退化 rid 控件里有底部导航 `首页`/`我`/`发布`/`消息，1条未读`
+            # （真机 dump 确认 `clickable=true`），而清单里一条都没有 ⇒ R18 把模型写**对**的
+            # `text=我` 报成"不在控件清单"，生成侧也拿不到这些入口。
+            # ⇒ 退化 rid 当**没有 rid** 处理，让它落到下面的文案分支。
+            if rid and is_degenerate_res_id(rid):
+                rid = ""
             if rid:
-                if is_degenerate_res_id(rid) or ("rid", rid, label) in seen:
+                if ("rid", rid, label) in seen:
                     continue
                 seen.add(("rid", rid, label))
                 items.append({"res_id": rid, "label": label[:30],
-                              "page": activity[:60], "clickable": bool(control.get("clickable"))})
+                              "page": activity[:60], "clickable": bool(control.get("clickable")),
+                              "selected": bool(control.get("selected"))})
             elif control.get("clickable") and label and not is_dynamic_text(label):
+                if has_dynamic_segment(label):
+                    label = stable_prefix(label)
+                    if not label or label not in page_texts:
+                        continue      # 前缀在本页没有对应 text ⇒ 不猜（宁缺毋滥）
                 if ("txt", label) in seen:
                     continue
                 seen.add(("txt", label))
                 items.append({"res_id": "", "label": label[:30],
-                              "page": activity[:60], "clickable": True})
+                              "page": activity[:60], "clickable": True,
+                              "selected": bool(control.get("selected"))})
             if full is not None and len(items) >= full:
                 break
         if full is not None and len(items) >= full:
