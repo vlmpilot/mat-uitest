@@ -50,7 +50,9 @@ def _activate(code: str, activate) -> int:
     if info.get("kept_existing"):
         print(f"ℹ️ 本机已有不更短的授权（至 {_day(info['expires_at'])}），本次未改动。")
     else:
-        print(f"✅ 已激活 {info['plan']}（有效期至 {_day(info['expires_at'])}）")
+        from .licensing import plan_label
+
+        print(f"✅ 已激活 {plan_label(info['plan'])}（有效期至 {_day(info['expires_at'])}）")
     return 0
 
 

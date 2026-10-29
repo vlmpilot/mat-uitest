@@ -1662,7 +1662,7 @@ def cmd_activate(args) -> int:
             return 1
         import time as _t2
         cust = f" · {info['customer']}" if info.get("customer") else ""
-        print(f"✅ 已激活 license v2（{info['plan']}{cust}）")
+        print(f"✅ 已激活 {licensing.plan_label(info['plan'])} 授权（离线验签{cust}）")
         print(f"   功能: {', '.join(sorted(info.get('features') or [])) or '—'}")
         seats = info.get("seats")
         print(f"   席位: {seats if seats is not None else '—'}"
@@ -1700,7 +1700,8 @@ def cmd_activate(args) -> int:
             print(f"ℹ️ 本机已有同等有效期的授权（至 {_day(current)}），这张码不必再用"
                   "——本次未做任何改动。")
     else:
-        print(f"✅ 已激活 {info['plan']}（有效期至 {_day(info['expires_at'])}）")
+        print(f"✅ 已激活 {licensing.plan_label(info['plan'])}（有效期至 "
+              f"{_day(info['expires_at'])}）")
     if info.get("redeemed"):
         # 时长卡：核销已在 activate() 内完成（服务端登记 + 重签普通码写盘），无需再登记
         token = licensing.read_server_token()
@@ -1846,7 +1847,7 @@ def _usage_mode_label(plan: str | None) -> str:
 
 
 def _license_status_lines() -> list[str]:
-    """`mat status` 里的 Pro 服务端授权行（T17）。**只读本地，不联网。**"""
+    """`mat status` 里的服务端授权行（T17）。**只读本地，不联网。**"""
     from . import licensing
 
     if not licensing.read_server_token():
@@ -1856,9 +1857,11 @@ def _license_status_lines() -> list[str]:
     except (OSError, ValueError):
         meta = {}
     if meta.get("machines"):
-        return [f"Pro 服务端授权: 已登记，本码绑定 {meta['machines']}/{meta.get('max_machines', '?')} 台机器"
+        return [f"服务端授权（{licensing.plan_label('pro')}）: 已登记，本码绑定 "
+                f"{meta['machines']}/{meta.get('max_machines', '?')} 台机器"
                 "（`mat activate --machines` 查看，`--unbind` 解绑）"]
-    return ["Pro 服务端授权: 已登记（`mat activate --machines` 查看绑定）"]
+    return [f"服务端授权（{licensing.plan_label('pro')}）: 已登记"
+            "（`mat activate --machines` 查看绑定）"]
 
 
 def _entitlement_status_line() -> str | None:
@@ -2793,7 +2796,8 @@ def main(argv: list[str] | None = None) -> None:
     act.add_argument("--file", metavar="license.json",
                      help="用 license v2 文件激活（Team/Private 签发的 JSON，离线验签）")
     act.set_defaults(func=cmd_activate)
-    upg = sub.add_parser("upgrade", help="购买标准版并自动激活（下单→支付→领码→激活）")
+    upg = sub.add_parser("upgrade",
+                         help="标准版支持卡（3 个月）下单并自动激活（下单→支付→领码→激活）")
     upg.add_argument("plan", nargs="?", default="pro_quarter",
                      choices=("pro_quarter", "pro_year", "pro_month"),
                      help="档位：pro_quarter=3 个月卡（默认）/ 年付 / 月付（后两者缺省未开售）")

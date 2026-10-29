@@ -46,6 +46,14 @@ def __getattr__(name: str):
 # 换言之它是"提高门槛的速度带"，不是安全边界。
 BETA_PUBLIC_SIGNING_KEY = "mat-beta-public-2026"
 
+#: 档位显示名——**用户可见文案的唯一映射**。内部标识（free/pro/team/private）不变，
+#: 只在打印时翻译；否则 CLI 会直接吐 `已激活 pro`，而手册写的是「标准版」。
+PLAN_LABELS = {"free": "体验版", "pro": "标准版", "team": "团队版", "private": "私有化"}
+
+
+def plan_label(plan: str) -> str:
+    return PLAN_LABELS.get(str(plan or "").lower(), str(plan or "未知档位"))
+
 # -- 权益矩阵（P0-3，2026-10-19）----------------------------------------------
 #
 # 本地核心能力对所有档开放（获客根基，永不加锁）；协作/云端/离线交付按档解锁。

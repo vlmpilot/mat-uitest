@@ -28,7 +28,7 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
       });
       const data = await resp.json();
       if (resp.ok) {
-        setMsg({ ok: true, text: `已激活 ${data.plan},有效期至 ${new Date(data.expires_at * 1000).toLocaleDateString()}` });
+        setMsg({ ok: true, text: `已激活 ${planLabel(data.plan)},有效期至 ${new Date(data.expires_at * 1000).toLocaleDateString()}` });
         setCode("");
         onRefresh?.();  // 只重拉 state（套餐/额度随 props 更新），不再整页 reload（发起人 2026-10-12）
       } else {
@@ -68,9 +68,10 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
           </Typography.Text>
         </Descriptions.Item>
         <Descriptions.Item label="激活/续期">
-          公测期在<a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">官网联系</a>获取标准模式激活码（更高的官方代理 AI 额度）。
+          标准模式凭激活码开启（官方代理：生成 300 次/月、视觉 100 次/月）；
+          获取方式见<a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">官网联系</a>。
           <Space.Compact style={{ marginTop: 8, display: "flex" }}>
-            <Input placeholder="MAT-pro.…" value={code}
+            <Input placeholder="MAT2-…" value={code}
                    onChange={(e) => setCode(e.target.value)}
                    onPressEnter={activate} />
             <Button type="primary" onClick={activate}>激活</Button>
@@ -181,6 +182,14 @@ function ExportTab() {
 // 「联系客服」跳官网联系区（发起人 2026-10-15）：二维码素材不随包分发（PyPI/公开仓均不含），
 // 官网 #contact 联系区有公众号二维码，点击跳转扫码即可。
 /** 使用方式（与「AI 接入」是两个维度）：free=体验模式、pro=标准模式、team/private=团队模式 */
+function planLabel(plan?: string): string {
+  const p = (plan || "free").toLowerCase();
+  if (p === "free") return "体验版";
+  if (p === "team") return "团队版";
+  if (p === "private") return "私有化";
+  return "标准版";
+}
+
 function usageModeLabel(plan?: string): string {
   const p = (plan || "free").toLowerCase();
   if (p === "free") return "体验模式";
@@ -210,14 +219,19 @@ function FinetuneCard() {
     finally { setExporting(false); }
   };
   const apps = Object.entries(data?.per_app || {}).sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const pct = data ? Math.min(100, Math.round(data.pairs / data.min_pairs * 100)) : 0;
+  // 进度按「可训练对」算：留出集训练时不可见，不能算进 200 对门槛
+  const trainable = data?.train_pairs ?? 0;
+  const pct = data ? Math.min(100, Math.round(trainable / data.min_pairs * 100)) : 0;
   return (
     <Card size="small" title="微调数据(L2 工具链)">
       {data && (
         <Space direction="vertical" size={4} style={{ width: "100%" }}>
           <span>
-            可回溯训练对 <b>{data.pairs}</b>/{data.min_pairs}（进度 {pct}%）
+            可训练对 <b>{trainable}</b>/{data.min_pairs}（进度 {pct}%）
             {data.enough && <Tag color="green">够训</Tag>}
+          </span>
+          <span style={{ color: "#697080", fontSize: 12 }}>
+            共 {data.pairs} 对可回溯 · 留出 {data.holdout_pairs} 条（训练不可见）
           </span>
           {apps.length > 0 && (
             <span style={{ color: "#697080", fontSize: 12 }}>
