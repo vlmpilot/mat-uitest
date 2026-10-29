@@ -1127,6 +1127,23 @@ def test_api_apps_uninstall_local_only_and_happy(tmp_path, monkeypatch):
     assert any("uninstall" in c and "com.x" in c for c in cmds)
 
 
+def test_api_apps_uninstall_harmony_uses_hdc(tmp_path, monkeypatch):
+    """鸿蒙卸载必须走 hdc uninstall（此前一律落到 simctl，等于装错链路）。"""
+    monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
+    calls: list[tuple[list[str], str | None]] = []
+
+    def fake_run(args, serial=None, timeout=20):
+        calls.append((args, serial))
+        return mock.Mock(returncode=0, stdout="uninstall bundle successfully", stderr="")
+
+    monkeypatch.setattr("insta_engine.harmony_hdc._run", fake_run)
+    code, obj = web_server.api_apps_uninstall(
+        tmp_path, "127.0.0.1",
+        {"serial": "127.0.0.1:5555", "platform": "harmony", "package": "com.example.app"})
+    assert code == 200 and obj["ok"]
+    assert calls == [(["uninstall", "com.example.app"], "127.0.0.1:5555")]
+
+
 def test_api_apps_install_local_only(tmp_path):
     """安装与卸载同为改写设备状态的操作——分享模式下局域网来源禁用（评审 P1-2）。"""
     apk = tmp_path / "test.apk"
@@ -1822,3 +1839,30 @@ def test_live_page_requires_auth_under_share(shared_server):
     assert s.post(f"{base}/api/auth", json={"key": key}, timeout=5).status_code == 200
     r3 = s.get(f"{base}/live/{jid}", timeout=5)
     assert r3.status_code == 200 and "SER_SECRET" in r3.text
+
+
+def test_finetune_stats_and_export(server):
+    """微调数据域：stats 走 GET、export 走 POST；数据不足也如实 200（不 500）。
+
+    回归自 2026-10-29 review（P1-9）：两个端点此前零测试，stats 曾误注册进 POST 表
+    导致 GET 404——注册表问题只有走真 HTTP 才暴露。
+    """
+    base, root = server
+    run_dir = root / "artifacts" / "ft-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "run": {"status": "passed"},
+        "case": {"caseId": "ft1", "name": "微调样本", "target": {"package": "com.x"},
+                 "steps": [{"id": "s1", "action": "wait", "params": {"ms": 1}}],
+                 "meta": {"nl": "打开设置"}},
+    }, ensure_ascii=False), encoding="utf-8")
+    r = requests.get(f"{base}/api/finetune/stats", timeout=10)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["pairs"] == 1 and body["min_pairs"] == 200
+    assert body["train_pairs"] == 0, "唯一一条被切成留出集 ⇒ 可训练对为 0（门槛如实）"
+    p = requests.post(f"{base}/api/finetune/export", timeout=10, json={})
+    assert p.status_code == 200 and p.json()["ok"]
+    row = json.loads((root / "dataset" / "holdout.jsonl").read_text(
+        encoding="utf-8").splitlines()[0])
+    assert row["messages"][0]["role"] == "user", "JSONL 必须是 mlx_lm chat 形状"

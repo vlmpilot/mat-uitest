@@ -5,7 +5,7 @@ display_name_en: Mobile App UI Testing
 description: Runs AI-assisted mobile UI tests against a connected Android device via the MAT CLI — generates test cases from natural language, executes them with screenshot-backed evidence, heals broken locators after an app update, explores an app into a page graph, and attributes failures with an LLM. Use when testing an Android app on a real device or emulator; when the user mentions UI tests, regression, smoke tests, 真机测试, 冒烟, or 移动端自动化; or when an existing mobile test case broke after a UI change.
 description_zh: 在本机 Android 真机或模拟器上跑 AI 辅助的 UI 测试：一句话生成用例、带截图证据执行、App 改版后自愈定位、遍历探索生成页面图谱，并对失败步骤做归因。
 description_en: AI-assisted UI testing on a real Android device or emulator through the mat CLI — cases from one sentence, runs with screenshot evidence, locator self-healing after an app update, exploration into a page graph, and LLM failure attribution.
-version: "0.7.4"
+version: "0.7.5"
 author: "vlmpilot"
 license: Complete terms in LICENSE.txt
 examples_zh:

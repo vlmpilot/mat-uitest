@@ -385,8 +385,10 @@ export const renameCase = (payload: { from: string; to: string }) =>
       body: JSON.stringify(payload) });
 
 // -- 微调数据(L2 工具链):nl 回溯对数 + 一键 export;训练本体走 CLI(mat finetune train) --
-export type FinetuneStats = { pairs: number; no_nl: number;
-  per_app: Record<string, number>; min_pairs: number; enough: boolean; note: string };
+// pairs=全部可回溯对;train_pairs=可训练对(train+valid,不含留出);enough 按 train_pairs 判。
+export type FinetuneStats = { pairs: number; train_pairs: number; holdout_pairs: number;
+  no_nl: number; per_app: Record<string, number>; min_pairs: number; enough: boolean;
+  note: string };
 export const getFinetuneStats = () => j<FinetuneStats>("/api/finetune/stats");
 export const exportFinetune = (app?: string) =>
   postJson<{ ok: boolean } & FinetuneStats>("/api/finetune/export", app ? { app } : {});

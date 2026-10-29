@@ -208,6 +208,13 @@ def api_apps_uninstall(root: Path, host: str, body: dict) -> tuple[int, dict]:
     if platform == "android":
         rc, out = _run(_adb(serial, "uninstall", package), timeout=120)
         ok = rc == 0 and "Success" in out
+    elif platform == "harmony":
+        # 2026-10-28：此前鸿蒙落到 else 分支走 simctl（错误链路）。hdc uninstall 同时清数据。
+        from .. import harmony_hdc as hdc
+
+        proc = hdc._run(["uninstall", package], serial=serial, timeout=120)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        ok = proc.returncode == 0 and "fail" not in out.lower()
     elif real_ios:
         from ..ios_device import uninstall_app as ios_uninstall
 
