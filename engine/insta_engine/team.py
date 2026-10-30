@@ -77,9 +77,14 @@ def push(root: Path, app: str | None = None) -> int:
         if app and pkg != app:
             continue
         name = str(doc.get("name") or path.stem)
+        case_id = str(doc.get("caseId") or "").strip()
+        if not case_id:
+            print(f"  ⚠️ 跳过 {path.name}:没有 caseId——团队库主键是对账口径,缺失无法安全推送")
+            skipped += 1
+            continue
         try:
             out = cloudapi.request("POST", "/team/cases",
-                                   {"app": pkg, "name": name,
+                                   {"app": pkg, "case_id": case_id, "name": name,
                                     "content": json.dumps(doc, ensure_ascii=False)},
                                    bearer=token)
         except cloudapi.CloudError as exc:
@@ -90,6 +95,20 @@ def push(root: Path, app: str | None = None) -> int:
         print(f"  ✅ {pkg} · {_brief(name)} → {out.get('updated_at', '')}")
     print(f"\n推送完成：{ok} 条成功，{skipped} 条跳过，{failed} 条失败。")
     return 0 if failed == 0 else 1
+
+
+def _local_case_id(dest: Path) -> str | None:
+    """读本地文件的 caseId：`""` = 文件不存在，`None` = 存在但读不出来（当成"自己的"）。
+
+    为什么把读不出来当自己的：用户可能手改过、或文件是旧格式（无 caseId）。这种文件
+    默认**不覆盖**（跳过），要覆盖得显式 `--force`——与迁移前行为一致，不突然改写用户文件。
+    """
+    if not dest.exists():
+        return ""
+    try:
+        return str(json.loads(dest.read_text(encoding="utf-8")).get("caseId") or "")
+    except (OSError, ValueError):
+        return None
 
 
 def pull(root: Path, app: str | None = None, force: bool = False) -> int:
@@ -104,22 +123,29 @@ def pull(root: Path, app: str | None = None, force: bool = False) -> int:
     out_dir = root / "cases"
     out_dir.mkdir(parents=True, exist_ok=True)
     written = skipped = failed = 0
+    used: dict[str, str] = {}  # 本批已占用的文件名 → case_id
     for item in meta:
-        pkg, name = item["app"], item["name"]
+        pkg, name, case_id = item["app"], item["name"], item["case_id"]
         try:
             detail = cloudapi.request(
-                "GET", f"/team/cases/{pkg}/{name}", bearer=token)
+                "GET", f"/team/cases/{pkg}/{case_id}", bearer=token)
         except cloudapi.CloudError as exc:
             print(f"  ❌ {pkg} · {_brief(name)}：{exc}")
             failed += 1
             continue
         safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in name)[:60] or "case"
         dest = out_dir / f"{safe}.json"
+        # 同名不同 caseId 不能共用一个文件：团队库现在按 caseId 存，两条同名用例
+        # 都该落地（2026-10-30 实测：按文件名拉取时第二条被判「本地已有」直接丢掉）。
+        owner = _local_case_id(dest)
+        if (owner and owner != case_id) or used.get(dest.name, case_id) != case_id:
+            dest = out_dir / f"{safe}__{case_id}.json"
         if dest.exists() and not force:
             print(f"  ⏭️ 本地已有 {dest.name}（--force 覆盖）")
             skipped += 1
             continue
         dest.write_text(detail["content"], encoding="utf-8")
+        used[dest.name] = case_id
         written += 1
         print(f"  ✅ {pkg} · {_brief(name)} → cases/{dest.name}")
     print(f"\n拉取完成：{written} 条写入，{skipped} 条跳过，{failed} 条失败。")

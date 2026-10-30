@@ -352,6 +352,58 @@ def is_content_label(label: str) -> bool:
     return bool(s) and s != BACK_HOP and len(s) >= CONTENT_LABEL_MIN
 
 
+def chrome_signals(controls: list[dict]) -> frozenset[str]:
+    """页面的**UI 骨架信号**：与内容无关的那部分控件（tab / 底栏 / 搜索 / 菜单）。
+
+    ## 为什么需要它（2026-10-29，某内容社区 App 真机实测）
+
+    `identities_from_controls` 的 rid 优先通道要求**非退化 rid**。某内容社区 App
+    **全图只有一个非退化 rid**，而且是根容器 `index_store`（每个页面都有）——
+    于是 16 个页面（首页 / 市集 / 消息 / 我的）的 rid 集合**完全相同**，
+    任何基于 rid 的相似度都恒为 1.0。`fragment_merge` 在这种图谱上会把
+    「首页 + 消息 + 我的」并成一页（实测 52 页 → 8 页，85% 是错的）。
+
+    骨架信号从**文案**里取，但只取「不会随内容变」的那一类：
+
+    - 有非退化 rid ⇒ 收 `rid:`（与 identities 同口径，骨架里它也是稳定标识）；
+    - 否则看 `desc`/`text`：带计数段的先取稳定前缀（`消息，3条未读` → `消息`）；
+      动态整串（`317`、`12:30`）与 iconfont 私有区字符**丢掉**；
+    - `class` 名含 `Tab` 的一律收（tab 文案是页面的骨架，与长度无关）；
+    - 其余只收 **< `CONTENT_LABEL_MIN`(7) 字**的短文案——推荐流标题/商品名
+      都在 7 字以上，而 `搜索`/`菜单`/`关注`/`返回` 这类导航文案在 2~4 字。
+
+    ## 标定（同一批真机图谱，2026-10-29）
+
+    | App / activity | 同页型碎片对 | 跨页型对 |
+    |---|---|---|
+    | 内容社区 App 首页（3 碎片） | **0.64 ~ 0.74** | ≤ 0.32 |
+    | 内容社区 App 详情页（12 碎片） | 中位 1.00 | — |
+    | 资讯类启动页（27 碎片） | 0.03 ~ 0.98 | — |
+
+    ⇒ 阈值 0.6 落在「首页碎片 0.64」与「跨页型 0.32」之间，两边都有余量。
+    ⚠️ 0.5 会把两个**不同类目**的市集页（运动 / 运动装备，0.55）并掉，故取 0.6。
+
+    纯函数：只看传入的控件摘要，不读盘、不看环境变量。
+    """
+    out: set[str] = set()
+    for c in controls or []:
+        rid = str(c.get("res-id") or "")
+        if rid and not is_degenerate_res_id(rid):
+            out.add(f"rid:{rid}")
+            continue
+        cls = str(c.get("class") or "").rsplit(".", 1)[-1]
+        label = str(c.get("desc") or c.get("text") or "").strip()
+        if has_dynamic_segment(label):
+            label = stable_prefix(label)
+        if not label or is_dynamic_text(label) or is_pua_label(label):
+            continue
+        if "Tab" in cls:
+            out.add(f"tab:{label}")
+        elif len(label) < CONTENT_LABEL_MIN:
+            out.add(f"txt:{label}")
+    return frozenset(out)
+
+
 #: 系统 back 到达链的**专用标记**（explore 记录 / arrivals 重放 / repair 放行三方共用）。
 #:
 #: explore 回退恢复时 `press("back")` 可能落到**没爬过的页**（关弹窗露出底层页、
@@ -1570,6 +1622,29 @@ def save_index(path, index: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def keyed_pages(index: dict) -> dict[str, dict]:
+    """`page_key → 页`，**并把 `aliases` 的旧 key 也指向代表页**。
+
+    为什么必须解析 alias（2026-10-29）：`mat fragments --apply` 会**删掉**被并页，
+    只在 `index["aliases"]` 里留档。运行期拿到的是**活页面的 page_key**——它可能正好是
+    被删掉的那个碎片（合并前记进图谱的那一份）。此时 `pages_by_key.get(key)` 是 None，
+    `pages_equivalent(None, target)` 恒 False ⇒ 置备/走链会认为"没到目标页"，
+    于是**多走一跳或直接判失败**，而现象看起来像"定位值写错"。
+
+    合并前这个窗口是存在的（命中已记录的碎片就能认出），合并后不解析 alias 就等于
+    **把那条路封死**。所以凡是"按 key 反查页"的地方都该用本函数。
+    """
+    out: dict[str, dict] = {}
+    for page in (index or {}).get("pages", []) or []:
+        if isinstance(page, dict) and page.get("page_key"):
+            out[page["page_key"]] = page
+    for old, info in ((index or {}).get("aliases") or {}).items():
+        rep = out.get((info or {}).get("of") or "")
+        if rep is not None and old not in out:
+            out[old] = rep
+    return out
 
 
 def merge_pages(index: dict, incoming: list[dict], source: str = "index") -> dict:

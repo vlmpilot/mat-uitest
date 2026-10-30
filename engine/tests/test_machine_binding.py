@@ -126,7 +126,7 @@ def test_activate_registers_on_server_and_prints_the_env_hint(monkeypatch, capsy
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
-    assert "已激活 pro" in out
+    assert "已激活 标准版" in out
     assert "1/2 台机器" in out
     assert "GEN_API_KEY=srv-tok" in out
 
@@ -149,7 +149,7 @@ def test_local_activation_succeeds_when_the_server_is_unreachable(monkeypatch, c
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
-    assert "已激活 pro" in out, "本地激活必须成功"
+    assert "已激活 标准版" in out, "本地激活必须成功"
     assert licensing.read_license()["plan"] == "pro"
     assert "服务端登记未完成" in out
     assert "本地授权已生效" in out
@@ -175,7 +175,7 @@ def test_activate_reports_the_machine_limit_rejection(monkeypatch, capsys):
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
-    assert "已激活 pro" in out
+    assert "已激活 标准版" in out
     assert "409" in out and "已绑定 2 台机器" in out
     assert licensing.read_license()["plan"] == "pro"
 
@@ -387,7 +387,7 @@ def test_status_shows_server_authorization_and_stays_offline(monkeypatch, tmp_pa
     cli.cmd_status(None)
 
     out = capsys.readouterr().out
-    assert "Pro 服务端授权" in out and "1/2 台机器" in out
+    assert "服务端授权" in out and "1/2 台机器" in out
     assert rec.calls == [], "mat status 绝不许联网"
 
 

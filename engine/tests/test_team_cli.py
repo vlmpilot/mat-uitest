@@ -145,10 +145,11 @@ def test_push_filters_by_app_and_counts_failures(tmp_path, monkeypatch):
 # -- pull -----------------------------------------------------------------
 
 def test_pull_writes_files_but_does_not_overwrite_by_default(tmp_path, monkeypatch):
-    rec = Recorder(cases=[{"app": "com.demo", "name": "登录冒烟", "actor": "u",
-                           "updated_at": "", "size": 10}],
+    rec = Recorder(cases=[{"app": "com.demo", "case_id": "case_login", "name": "登录冒烟",
+                           "actor": "u", "updated_at": "", "size": 10}],
                    detail={"content": '{"name": "登录冒烟"}', "app": "com.demo",
-                           "name": "登录冒烟", "actor": "u", "updated_at": ""})
+                           "case_id": "case_login", "name": "登录冒烟", "actor": "u",
+                           "updated_at": ""})
     monkeypatch.setattr(team_mod.cloudapi, "request", rec)
     assert team_mod.pull(tmp_path) == 0
     dest = tmp_path / "cases" / "登录冒烟.json"
@@ -160,6 +161,36 @@ def test_pull_writes_files_but_does_not_overwrite_by_default(tmp_path, monkeypat
 
     assert team_mod.pull(tmp_path, force=True) == 0
     assert "登录冒烟" in dest.read_text(encoding="utf-8")
+
+
+def test_pull_keeps_same_name_cases_apart(tmp_path, monkeypatch):
+    """同名不同 caseId 的两条用例都要落地（2026-10-30 实测：第二条被当成"本地已有"丢掉）。
+
+    团队库自 0.7.6 起按 caseId 存，客户端文件名却只能是标题——所以重名时要靠
+    `标题__caseId.json` 区分；第二次拉取必须幂等（各认各的文件，不重复写）。
+    """
+    meta = [{"app": "com.demo", "case_id": cid, "name": "登录冒烟",
+             "actor": "u", "updated_at": "", "size": 10} for cid in ("c-a", "c-b")]
+
+    def fake(method, path, payload=None, bearer=None):
+        if method == "GET" and path.startswith("/team/cases/"):
+            parts = path.strip("/").split("/")   # team/cases/<app>/<case_id>
+            pkg, cid = parts[-2], parts[-1]
+            return {"content": json.dumps({"caseId": cid, "name": "登录冒烟"}),
+                    "app": pkg, "case_id": cid, "name": "登录冒烟",
+                    "actor": "u", "updated_at": ""}
+        if method == "GET":
+            return {"cases": meta}
+        return {}
+
+    monkeypatch.setattr(team_mod.cloudapi, "request", fake)
+    assert team_mod.pull(tmp_path) == 0
+    files = sorted(p.name for p in (tmp_path / "cases").glob("*.json"))
+    assert files == ["登录冒烟.json", "登录冒烟__c-b.json"], files
+    assert json.loads((tmp_path / "cases" / "登录冒烟.json").read_text())["caseId"] == "c-a"
+
+    assert team_mod.pull(tmp_path) == 0, "第二次拉取应幂等（不重复写新文件）"
+    assert len(list((tmp_path / "cases").glob("*.json"))) == 2
 
 
 def test_pull_empty_team_is_not_an_error(tmp_path, monkeypatch):

@@ -28,6 +28,7 @@ from .page_index import (
     is_ad_landing,
     is_content_label,
     is_transient_frame,
+    keyed_pages,
     load_index,
     page_key,
     pages_equivalent,
@@ -426,10 +427,13 @@ def verify_arrivals(drv, package: str, index_path: Path, trials: int = 3,
         if launch_act:
             index["launch_activity"] = launch_act
 
-    pages_by_key = {p.get("page_key"): p for p in index.get("pages", [])
-                    if isinstance(p, dict) and p.get("page_key")}
-    targets = [p for p in pages_by_key.values()
-               if isinstance(p.get("depth"), int) and p["depth"] >= 1]
+    # ⚠️ 用 `keyed_pages`（会解析 `aliases`）：碎片合并删掉的旧 key 必须仍能反查到代表页，
+    # 否则"落点 == 某个被删碎片"时 `pages_equivalent` 恒 False ⇒ 误判没到目标页。
+    pages_by_key = keyed_pages(index)
+    # targets 只取**活页**：`pages_by_key` 含 alias 后 `values()` 会有重复代表页。
+    targets = [p for p in index.get("pages", [])
+               if isinstance(p, dict) and p.get("page_key")
+               and isinstance(p.get("depth"), int) and p["depth"] >= 1]
     if page_keys is not None:
         wanted = set(page_keys)
         targets = [p for p in targets if p["page_key"] in wanted]

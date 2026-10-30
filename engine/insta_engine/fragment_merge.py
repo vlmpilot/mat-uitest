@@ -12,6 +12,20 @@
 - B 放宽链根：70 页大组 minJ=0.00（传递闭包链式稀释实锤）且并掉根页
   破坏结构 —— **否决**。
 
+## 两条通道（2026-10-29，真机实测后补）
+
+原判据只有 rid 通道（`identities` 里的 `rid:` 集合 Jaccard）。它在 **rid 稀薄**的
+图谱上是坏的：某内容社区 App 全图只有一个非退化 rid，而且是根容器 `index_store`
+（每页都有）⇒ 16 个页面（首页 / 市集 / 消息 / 我的）的 rid 集合都是 `{index_store}`，
+Jaccard 恒为 1.0 ⇒ 合并把「首页 + 消息 + 我的」并成一页（dry-run 实测
+52 页 → 8 页，缩 85%，其中 85% 是错的）。1 元集的 Jaccard 只有 0/1 两档，
+没有"部分相似"，**不能当相似度用**。
+
+⇒ 通道选择按 rid 证据量：`len(rid_set) >= MIN_RID_SIGNALS(2)` 走 rid 通道
+（历史口径，阈值 `threshold`）；否则走**骨架通道**（`page_index.chrome_signals`：
+tab / 底栏 / 搜索 / 菜单这类与内容无关的短文案，阈值 `chrome_threshold=0.6`）。
+两条通道信号空间不同，**不跨通道比较**。
+
 ## 单锚点语义
 
 每个闭包组内选**代表页**（rank 与 `arrival_provision.infer_target_page` 同款：
@@ -47,14 +61,68 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .page_index import EQUIV_SIM
+from .page_index import EQUIV_SIM, chrome_signals
 
 __all__ = ["merge_fragments", "save_report"]
+
+#: rid 证据量的下限：**单 rid 不构成证据**。
+#:
+#: 2026-10-29 真机实测：全图只有一个非退化 rid，还是根容器 `index_store`
+#: （每页都有）⇒ 16 个页面（首页 / 市集 / 消息 / 我的）的 rid 集合都是 `{index_store}`，
+#: Jaccard 恒为 1.0 ⇒ 按 rid 判会把它们并成一页（dry-run 实测 52 页 → 8 页）。
+#: 集合论上 1 元集的 Jaccard 只有 0/1 两档，没有"部分相似"，不能当相似度用。
+MIN_RID_SIGNALS = 2
+
+#: 骨架通道（rid 稀薄时改用 `page_index.chrome_signals`）的相似度门槛。
+#:
+#: 标定见 `chrome_signals` 的 docstring：同页型碎片 0.64~0.74、跨页型 ≤0.32。
+#: ⚠️ 不要降到 0.5——那会把两个**不同类目**的市集页（0.55）并掉。
+CHROME_SIM = 0.6
+
+#: 骨架通道的最小信号数（1~2 个短文案撑不起相似度，同 `MIN_RID_SIGNALS` 的道理）。
+MIN_CHROME_SIGNALS = 3
 
 
 def _rid_set(page: dict) -> frozenset[str]:
     return frozenset(s for s in (page.get("identities") or [])
                      if str(s).startswith("rid:"))
+
+
+def _signals(page: dict) -> tuple[str, frozenset[str]]:
+    """该页参与相似度比较的**通道与信号集**：`("rid", …)` 或 `("chrome", …)`。
+
+    两条通道**不能混比**（信号空间不同）——调用方必须同通道才比。
+    """
+    rids = _rid_set(page)
+    if len(rids) >= MIN_RID_SIGNALS:
+        return "rid", rids
+    return "chrome", chrome_signals(page.get("controls") or [])
+
+
+def _min_signals(channel: str) -> int:
+    return MIN_RID_SIGNALS if channel == "rid" else MIN_CHROME_SIGNALS
+
+
+def _union_controls(groups: list[list[dict]]) -> list[dict]:
+    """多份观测的控件取并集（按 `(class, res-id, text, desc)` 去重，先到先得）。
+
+    为什么按**四元组**而不是"只看文案"：`text=分享` 这类骨架控件在两份观测里属性完全相同
+    ⇒ 收成 1 条（否则同一页出现 N 个同名控件，R21 会当成歧义）；而推荐流标题这类内容型
+    文案各不相同 ⇒ 各自留下（合并的目的就是保住这些覆盖）。
+    """
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for group in groups:
+        for control in group:
+            key = (str(control.get("class") or ""),
+                   str(control.get("res-id") or ""),
+                   str(control.get("text") or ""),
+                   str(control.get("desc") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(control)
+    return out
 
 
 def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
@@ -116,13 +184,19 @@ def _representative_rank(page: dict):
 
 def merge_fragments(index: dict, apply: bool = False,
                     threshold: float = EQUIV_SIM,
-                    exclude_activity: tuple[str, ...] = ()) -> dict:
+                    exclude_activity: tuple[str, ...] = (),
+                    chrome_threshold: float = CHROME_SIM) -> dict:
     """图谱碎片合并（A' 单锚点）。dry-run 只算不改；apply 就地修改。
 
     exclude_activity：activity 含任一子串的页不参与合并（2026-10-17 tx-news
     审查结论：WebView 壳类（WebAdvert/CustomWebBrowser）的 rid 是网页控件
     随机堆叠，J 压线 0.5 可能只是不同网页共享广告框架控件——合并语义存疑，
     宁漏勿错，等有 arrival 证据后再议）。
+
+    **两条通道**（2026-10-29）：rid 证据足够（≥ `MIN_RID_SIGNALS`）走 rid 通道
+    （历史口径，阈值 `threshold`）；rid 稀薄（某内容社区 App 全图只有一个非退化
+    rid，还是根容器）走骨架通道（`page_index.chrome_signals`，阈值
+    `chrome_threshold`）。两条通道的信号空间不同，**不跨通道比较**。
     """
     if not isinstance(index, dict):
         raise TypeError("index 必须是 dict")
@@ -133,12 +207,29 @@ def merge_fragments(index: dict, apply: bool = False,
         act = (page.get("activity") or "")
         return any(sub in act for sub in exclude_activity)
 
-    # ---- 候选与两两关系（链根全等 + activity 全等 + rid J≥阈值）----
-    cand = [p for p in pages
-            if (p.get("activity") or "").strip() and _rid_set(p)
-            and not excluded(p)]
+    # ---- 候选与两两关系（链根全等 + activity 全等 + 同通道 + 相似度≥该通道阈值）----
     roots = {p["page_key"]: _chain_root(p, pages_by_key) for p in pages}
-    rid_sets = {p["page_key"]: _rid_set(p) for p in pages}
+    sig = {p["page_key"]: _signals(p) for p in pages}
+    cand = [p for p in pages
+            if (p.get("activity") or "").strip() and not excluded(p)
+            and len(sig[p["page_key"]][1]) >= _min_signals(sig[p["page_key"]][0])]
+
+    def sim(a: str, b: str) -> float | None:
+        """同通道才给相似度；跨通道/信号不足 ⇒ None（=不比较）。"""
+        ca, sa = sig[a]
+        cb, sb = sig[b]
+        if ca != cb:
+            return None
+        return _jaccard(sa, sb)
+
+    def passes(a: str, b: str) -> float | None:
+        """相似度是否达到**该通道**的阈值；达到返回相似度，否则 None。"""
+        value = sim(a, b)
+        if value is None:
+            return None
+        limit = threshold if sig[a][0] == "rid" else chrome_threshold
+        return value if value >= limit else None
+
     adj: dict[str, set[str]] = {}
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
@@ -148,7 +239,7 @@ def merge_fragments(index: dict, apply: bool = False,
             if (cand[i].get("activity") or "").strip() != \
                     (cand[j].get("activity") or "").strip():
                 continue
-            if _jaccard(rid_sets[a], rid_sets[b]) >= threshold:
+            if passes(a, b) is not None:
                 adj.setdefault(a, set()).add(b)
                 adj.setdefault(b, set()).add(a)
 
@@ -172,21 +263,24 @@ def merge_fragments(index: dict, apply: bool = False,
         while pool:
             rep = max(pool, key=lambda k: _representative_rank(pages_by_key[k]))
             members = sorted(
-                (k for k in pool if k != rep
-                 and _jaccard(rid_sets[rep], rid_sets[k]) >= threshold),
-                key=lambda k: -_jaccard(rid_sets[rep], rid_sets[k]))
-            clusters.append({
-                "representative": rep,
-                "members": [{"page_key": k,
-                             "j": round(_jaccard(rid_sets[rep], rid_sets[k]), 3)}
-                            for k in members],
-            })
+                (k for k in pool if k != rep and passes(rep, k) is not None),
+                key=lambda k: -(sim(rep, k) or 0.0))
+            # 空组（代表页与组内其余页都够不上阈值）不进报告：`pool -= {rep}` 后
+            # 代表页必然单独成组，但它没有"并掉"任何页，列出来只是噪声。
+            if members:
+                clusters.append({
+                    "representative": rep,
+                    "members": [{"page_key": k,
+                                 "j": round(sim(rep, k) or 0.0, 3)}
+                                for k in members],
+                })
             pool -= {rep, *members}
 
     merged_away = sum(len(c["members"]) for c in clusters)
     report = {
         "applied": bool(apply),
         "threshold": threshold,
+        "chrome_threshold": chrome_threshold,
         "before": len(pages),
         "after": len(pages) - merged_away,
         "merged_away": merged_away,
@@ -210,15 +304,25 @@ def merge_fragments(index: dict, apply: bool = False,
             return key
         return alias[key]["of"] if key in alias else key
 
-    # ① 代表页归并成员证据（hits 累加 / absorbed 留档）。
+    # ① 代表页归并成员证据（hits 累加 / absorbed 留档 / 控件取并集）。
     # arrival 不归并：rank 里 stable 优先 ⇒ stable 成员必然当代表，证据天然保留，
     # 不存在「代表缺 stable 而成员有」的可达状态（防御性搬运 = 死代码）。
+    #
+    # ⚠️ **控件必须取并集**（2026-10-29 实测）：只留代表页自己的 controls 时，
+    # 被并页独有的控件从 `controls_list_for`（生成侧候选集）与 R18 的"存在性"判定里
+    # **静默消失**。实测资讯类 App 合并后，某用例的一个定位值从"在清单里"变成"不在"
+    # （召回 22/35 → 21/35）——合并本来是"同一页的多份观测"，丢观测等于降覆盖。
+    # 去重键取**完整四元组**：`text=分享` 在两份观测里属性相同 ⇒ 收成 1 条（R21 不误报），
+    # 而内容型文案各不相同 ⇒ 都留下（那正是合并想保留的覆盖）。
     for cluster in clusters:
         rep = pages_by_key[cluster["representative"]]
         members = [pages_by_key[m["page_key"]] for m in cluster["members"]]
         rep["hits"] = (rep.get("hits") or 0) + sum(m.get("hits") or 0 for m in members)
         rep["absorbed"] = (rep.get("absorbed") or []) + [
             {"page_key": m["page_key"], "j": m["j"]} for m in cluster["members"]]
+        rep["controls"] = _union_controls(
+            [rep.get("controls") or []] + [m.get("controls") or [] for m in members])
+        rep["node_count"] = len(rep["controls"])
 
     # ② parent 重定向：**先全量计算、后统一落笔**（读-算-写分离）。
     # tx-news 实测教训一：边遍历边就地改写 parent_key，会让先处理页的祖先链被

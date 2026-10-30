@@ -31,6 +31,30 @@ if TYPE_CHECKING:  # 能力层不依赖编排层
 # 与 prompts/ 目录一一对应
 TASKS = ("gen", "convert", "map", "vision-locate", "describe")
 
+#: 服务端**实际路由**计数（2026-10-30）：`local` / `maas` / `unknown`。
+#: 为什么客户端要记：本地优先的回落是静默的（Mac 睡眠、隧道断、模型异常），同一批
+#: 跑批可能一半 14B、一半官方；不记录口径，基线就把混源数字固化成参照了
+#: 判读与运维做法见本地模型部署文档 §11.1。**只对 server 模式有效**——BYOK 直连不经过
+#: `/mat/complete`，那里没有"路由"这回事。
+_ROUTE_COUNTS: dict[str, int] = {"local": 0, "maas": 0, "unknown": 0}
+
+
+def route_reset() -> None:
+    """一批跑批开始前清零（`mat eval run` 调用）。"""
+    for key in _ROUTE_COUNTS:
+        _ROUTE_COUNTS[key] = 0
+
+
+def route_snapshot() -> dict[str, int]:
+    """当前累计，写进 report 的 `route_mix`。"""
+    return dict(_ROUTE_COUNTS)
+
+
+def _note_route(route) -> None:
+    """记一次路由。**旧服务端不认识这个字段** ⇒ 记 unknown，而不是假装走本地。"""
+    key = str(route or "").strip().lower()
+    _ROUTE_COUNTS[key if key in ("local", "maas") else "unknown"] += 1
+
 
 def apply_quality_gate(case: TestCase, index_dir: Path | None = None) -> TestCase:
     """把**用例质量闸门**套在生成产物上（与 `mat import` 共用同一实现）。
@@ -642,6 +666,7 @@ def _server_task_text(client, task: str, variables: dict, context: str,
                 continue
             resp.raise_for_status()
             body = resp.json()
+            _note_route(body.get("route"))
             content = GenClient._strip_fences(body["content"])
             # 代理目前只回 content（无 usage）⇒ token 记 None，由字符数兜底估算
             _record_metrics(task=task, model=str(body.get("model") or "server"),

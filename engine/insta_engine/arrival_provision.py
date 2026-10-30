@@ -52,6 +52,7 @@ from pathlib import Path
 from .page_index import (
     BACK_HOP,
     is_transient_frame,
+    keyed_pages,
     load_index,
     page_key,
     pages_equivalent,
@@ -207,7 +208,8 @@ def provision(case, drv, package: str, index_path: Path,
 
         key = target.get("page_key") or ""
         evidence["page"] = key[:8]
-        pages_by_key = {p.get("page_key"): p for p in pages if p.get("page_key")}
+        # 解析 `aliases`：碎片合并删掉的旧 key 也要能反查到代表页（见 `keyed_pages`）
+        pages_by_key = keyed_pages(index)
         try:
             current = page_key(drv.dump(), package)
         except Exception as exc:

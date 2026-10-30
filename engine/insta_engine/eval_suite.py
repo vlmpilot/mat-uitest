@@ -225,6 +225,10 @@ def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,
     report_dir = Path("artifacts") / "eval"
     report_dir.mkdir(parents=True, exist_ok=True)
 
+    # 路由口径清零：报告里的 `route_mix` 必须是**这一批**的，不能带上历史累计
+    from . import ai_client
+
+    ai_client.route_reset()
     results: list[dict] = []
     blocked_streak = 0
     aborted = False
@@ -260,6 +264,9 @@ def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,
         "platform": platform,
         "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "total_steps_planned": sum(len(t["case"]["steps"]) for t in tasks) * repeat,
+        # 本批实际走了哪条上游（local / maas / unknown）：回落是静默的，
+        # 没有这个字段就无法判断"两批数字能不能直接比"（部署文档里记了判读方法）
+        "route_mix": ai_client.route_snapshot(),
         **sm,
     }
     out = report_dir / f"{suite_path.stem}-report.json"
@@ -339,6 +346,17 @@ def compare(report: dict, baseline: dict,
     if new_crash:
         notes.append(f"新增崩溃任务 {len(new_crash)} 个（{'、'.join(new_crash[:5])}"
                      f"{'…' if len(new_crash) > 5 else ''}）——可能是 App 变化引入的真缺陷，人工确认")
+
+    # 路由口径（2026-10-30）：基线走本地、这次走官方（或反之）时，中位数差异里混着
+    # "生成模型不同"这一层——不能当回归/改善引用。只进 note，不判 FAIL（那不是产品回归）。
+    def _dominant(mix: dict | None) -> str:
+        m = {k: int(v or 0) for k, v in (mix or {}).items()}
+        return max(m, key=lambda k: m[k]) if sum(m.values()) else ""
+
+    base_route, cur_route = _dominant(baseline.get("route_mix")), _dominant(report.get("route_mix"))
+    if base_route and cur_route and base_route != cur_route:
+        notes.append(f"路由不同（基线 {base_route} / 本次 {cur_route}）——"
+                     "生成模型不同，中位差异不能当回归或改善引用")
     return {"schema": SCHEMA, "compare": True,
             "verdict": verdict, "regressions": regressions,
             "improvements": improvements,
@@ -384,4 +402,14 @@ def summary_line(report: dict) -> str:
     if crash.get("task_runs"):
         parts.append(f"崩溃 {crash['task_runs']} 个「任务×遍」"
                      f"（{'、'.join((crash.get('tasks') or [])[:4])}）")
+    mix = {k: int(v or 0) for k, v in (report.get("route_mix") or {}).items()}
+    if sum(mix.values()):
+        local, maas, unknown = mix.get("local", 0), mix.get("maas", 0), mix.get("unknown", 0)
+        if local == 0 and maas:
+            parts.append(f"本批全部走官方模型（{maas} 次调用，本地未命中）"
+                         "——数字不可与走本地的一批直接比")
+        elif local and maas:
+            parts.append(f"路由混源：本地 {local} / 官方 {maas} ⇒ 数字含两种模型")
+        elif unknown:
+            parts.append(f"路由未上报 {unknown} 次（服务端版本较旧）")
     return " · ".join(parts)

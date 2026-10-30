@@ -1146,12 +1146,13 @@ def cmd_fragments(args) -> int:
     if index is None:
         print(f"没有页面图谱: {index_path.resolve()}——请先 mat index / mat explore")
         return 1
-    print(f"碎片合并: {index_path}（与代表 J≥{args.min_sim}，单锚点口径"
+    print(f"碎片合并: {index_path}（与代表 J≥{args.min_sim}，骨架通道 J≥{args.chrome_min_sim}，单锚点口径"
           + (f"，排除 activity 含 {'/'.join(args.exclude_activity)}"
              if args.exclude_activity else "")
           + ("" if args.apply else "【试运行，不写回】") + ") …")
     report = merge_fragments(index, apply=args.apply, threshold=args.min_sim,
-                             exclude_activity=tuple(args.exclude_activity))
+                             exclude_activity=tuple(args.exclude_activity),
+                             chrome_threshold=args.chrome_min_sim)
     pct = report["merged_away"] / max(report["before"], 1) * 100
     print(f"页面 {report['before']} → {report['after']}"
           f"（并掉 {report['merged_away']} 页，缩 {pct:.0f}%）· 组 {len(report['groups'])}")
@@ -2903,6 +2904,9 @@ def main(argv: list[str] | None = None) -> None:
     frag.add_argument("package", help="被测 App 包名")
     frag.add_argument("--min-sim", type=float, default=0.5,
                       help="与代表页的 rid Jaccard 门槛（默认 0.5）")
+    frag.add_argument("--chrome-min-sim", type=float, default=0.6,
+                      help="rid 稀薄时改比「UI 骨架信号」，此为门槛（默认 0.6；"
+                           "标定：同页型碎片 0.64~0.74、跨页型 ≤0.32）")
     frag.add_argument("--exclude-activity", action="append", default=[],
                       metavar="SUBSTR",
                       help="activity 含此子串的页不参与合并（可多次传，"
