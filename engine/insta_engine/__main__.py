@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,6 +51,13 @@ def cmd_init(_args) -> int:
     return 0
 
 
+#: 连接设备也要串行（2026-10-30 修）：uiautomator2 在同一台设备上并发初始化会互抢
+#: ATX 服务，表现为"一条成功、一条莫名失败"——这类失败会被归因成用例问题，查错方向全反。
+#: 控制台侧 `web_api.runtime.get_driver` 一直有全局锁（`_DRV_LOCK`），而 CLI/MCP 走的
+#: 是本函数，此前没有锁；`mat verify` 被并发调用时正好踩在这里。
+_CONNECT_LOCK = threading.Lock()
+
+
 def _connect_driver(serial: str | None, platform: str = "android"):
     """连接设备；失败时给出可行动的排查提示（而非原始 traceback）。
 
@@ -61,27 +69,33 @@ def _connect_driver(serial: str | None, platform: str = "android"):
     """
     from .driver_factory import connect_driver
 
+    # 排查提示一律走 stderr：`mat verify --json` 的 stdout 是**机器契约**，
+    # 前面混几行人读文本，agent/CI 的 json.loads 就整段崩（2026-10-31 实测）。
+    def _hint(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
     if platform == "ios":
         from . import ios_device
 
         try:
             serial = ios_device.resolve_ios_serial(serial)
         except RuntimeError as exc:
-            print(f"无法确定目标 iOS 设备: {exc}")
+            _hint(f"无法确定目标 iOS 设备: {exc}")
             return None
     try:
-        return connect_driver(serial, platform)
+        with _CONNECT_LOCK:
+            return connect_driver(serial, platform)
     except Exception as exc:
         if platform == "ios":
-            print(f"连接 iOS 设备失败: {type(exc).__name__}: {exc}")
-            print("排查: 1) WDA 服务须在模拟器/真机上运行（复现命令）")
-            print("      2) `curl http://localhost:8100/status` 应返回 JSON（模拟器）")
-            print("      3) 真机走 usbmux 直连（wda.USBClient，无需 iproxy）：--serial <udid>，"
+            _hint(f"连接 iOS 设备失败: {type(exc).__name__}: {exc}")
+            _hint("排查: 1) WDA 服务须在模拟器/真机上运行（复现命令）")
+            _hint("      2) `curl http://localhost:8100/status` 应返回 JSON（模拟器）")
+            _hint("      3) 真机走 usbmux 直连（wda.USBClient，无需 iproxy）：--serial <udid>，"
                   "`mat ios-setup` 查环境")
         else:
-            print(f"连接设备失败: {type(exc).__name__}: {exc}")
-            print("排查: 1) 插上手机并开启 USB 调试、在手机上允许授权  2) `mat devices` 确认在线")
-            print("      3) 多台设备时用 --serial 指定  4) WiFi 调试需先 `adb connect <ip:port>`")
+            _hint(f"连接设备失败: {type(exc).__name__}: {exc}")
+            _hint("排查: 1) 插上手机并开启 USB 调试、在手机上允许授权  2) `mat devices` 确认在线")
+            _hint("      3) 多台设备时用 --serial 指定  4) WiFi 调试需先 `adb connect <ip:port>`")
         return None
 
 
@@ -329,6 +343,79 @@ def _write_batch_suite(package: str, files: list[Path]) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="mat-suite-")) / f"suite_{package.replace('.', '_')}.json"
     tmp.write_text(json.dumps(suite, ensure_ascii=False), encoding="utf-8")
     return tmp
+
+
+def cmd_verify(args) -> int:
+    """`mat verify`：跑一条用例并把结果摊成协议化 verdict。
+
+    退出码与 `mat run` 同一套（0/2/3/4/1）——**不另立**：CI 脚本与 agent 不该因为
+    换了命令就要改判定逻辑。
+    """
+    from . import verify as verify_mod
+    from . import verify_subset as subset_mod
+
+    if getattr(args, "subset", None) and getattr(args, "case", None):
+        print("--subset 与用例位置参数互斥——批量给 --subset,单条给 case", file=sys.stderr)
+        return 1
+    if not getattr(args, "subset", None) and not getattr(args, "case", None):
+        # case 曾是位置必填 ⇒ `mat verify --subset smoke` 在 argparse 层就报
+        # "the following arguments are required: case"，批量模式整体不可用。
+        print("缺少用例路径：单条给 case，批量给 --subset smoke|last-failed|changed",
+              file=sys.stderr)
+        return 1
+    if getattr(args, "subset", None):
+        from .pkgname import safe_package_name
+
+        # 子集按 (包名, 模式) 分键（_selection.json）——没有包名就没法判断哪些用例
+        # 属于同一个 App，`graph_sha` 也会退化成永远"无图谱⇒全量"。宁可在入口挡掉。
+        pkg_raw = (getattr(args, "package", "") or "").strip()
+        if not pkg_raw:
+            print("--subset 需要 --package（如 --package com.example.app）："
+                  "子集按「包名 + 模式」分键，缺包名无法确定用例范围", file=sys.stderr)
+            return 1
+        try:
+            pkg = safe_package_name(pkg_raw)
+        except ValueError as e:
+            print(f"包名不合法：{e}", file=sys.stderr)
+            return 1
+        case_paths = subset_mod.collect_cases(Path.cwd())
+        agg = subset_mod.run_subset(
+            Path.cwd(), case_paths, mode=args.subset, package=pkg,
+            serial=args.serial, platform=args.platform,
+            artifacts=Path(args.artifacts) if args.artifacts else None,
+            allow_unmet=getattr(args, "allow_unmet_preconditions", False),
+            quality_gate=not getattr(args, "no_quality_gate", False),
+            timeout_s=getattr(args, "timeout_s", None),
+            apk=Path(args.apk) if getattr(args, "apk", None) else None,
+            reinstall=getattr(args, "reinstall", False),
+            max_duration=getattr(args, "max_duration", None))
+        if args.json:
+            print(json.dumps(agg, ensure_ascii=False, indent=1))
+        else:
+            sm = agg.get("summary") or {}
+            print(f"=== 子集 {args.subset}: {agg['verdict']} ===")
+            print(f"  选中 {sm.get('selected', 0)} · 通过 {sm.get('passed', 0)} · "
+                  f"失败 {sm.get('failed', 0)} · 拒跑 {sm.get('blocked', 0)} · "
+                  f"未跑完 {sm.get('incomplete', 0)}")
+            for note in agg.get("notes") or []:
+                print(f"  ⚠️ {note}")
+        return agg["exit_code"]
+
+    code, verdict = verify_mod.run_verify(
+        Path.cwd(), Path(args.case), serial=args.serial, platform=args.platform,
+        artifacts=Path(args.artifacts) if args.artifacts else None,
+        allow_unmet=getattr(args, "allow_unmet_preconditions", False),
+        timeout_s=getattr(args, "timeout_s", None),
+        apk=Path(args.apk) if getattr(args, "apk", None) else None,
+        package=getattr(args, "package", None),
+        reinstall=getattr(args, "reinstall", False),
+        quality_gate=not getattr(args, "no_quality_gate", False),
+    )
+    if args.json:
+        print(json.dumps(verdict, ensure_ascii=False, indent=1))
+    else:
+        print(verify_mod.render_text(verdict))
+    return code
 
 
 def cmd_run(args) -> int:
@@ -1632,6 +1719,8 @@ def cmd_team(args) -> int:
     from . import team as team_mod
 
     root = Path.cwd()
+    if args.team_cmd == "status":
+        return team_mod.status()
     if args.team_cmd == "push":
         return team_mod.push(root, app=args.app)
     if args.team_cmd == "pull":
@@ -1657,17 +1746,30 @@ def cmd_activate(args) -> int:
 
     if getattr(args, "file", None):
         try:
-            info = licensing.activate_license_file(args.file)
+            info = licensing.activate_license_file(args.file, force=args.force)
         except ValueError as exc:
             print(f"❌ {exc}")
             return 1
         import time as _t2
+        if info.get("kept_existing"):
+            cur = int(info.get("current_expires_at") or 0)
+            print(f"ℹ️ 本机已有更长的授权（至 {_t2.strftime('%Y-%m-%d', _t2.localtime(cur))}）"
+                  "——本次未做任何改动；确认要用这份更短的合同覆盖，加 --force 重跑。")
+            return 0
         cust = f" · {info['customer']}" if info.get("customer") else ""
         print(f"✅ 已激活 {licensing.plan_label(info['plan'])} 授权（离线验签{cust}）")
         print(f"   功能: {', '.join(sorted(info.get('features') or [])) or '—'}")
         seats = info.get("seats")
         print(f"   席位: {seats if seats is not None else '—'}"
               f" · 有效期至 {_t2.strftime('%Y-%m-%d', _t2.localtime(info['expires_at']))}")
+        srv = info.get("server") or {}
+        if srv.get("ok"):
+            print(f"   团队库: 已连通（团队 {srv.get('team_id')} · {srv.get('seats')} 席"
+                  f" · 合同 {srv.get('license_id')}）")
+            print("   验证: mat team status   # 确认同事看到的是同一个库")
+        else:
+            print(f"   ⚠️ 团队库未连通：{srv.get('error') or '未知原因'}")
+            print("      本地授权已生效，不影响生成/执行；联网后重跑同一条命令即可补上（幂等）。")
         return 0
 
     if not getattr(args, "code", None):
@@ -1676,7 +1778,7 @@ def cmd_activate(args) -> int:
               file=sys.stderr)
         return 1
     try:
-        info = licensing.activate(args.code)
+        info = licensing.activate(args.code, force=args.force)
     except ValueError as exc:
         print(f"❌ {exc}")
         return 1
@@ -2254,8 +2356,17 @@ def cmd_status(_args) -> int:
 def cmd_cred(args) -> int:
     store = CredentialStore()
     if args.cred_cmd == "set":
-        import getpass
-        value = getpass.getpass(f"输入 {args.name} 的值（输入不回显）: ")
+        if getattr(args, "stdin", False):
+            # 非交互入口（agent / CI）：值从 stdin 读一行——既不回显、也不进 shell
+            # history（`mat cred set x --value ...` 那种写法会把明文留在 history 里）。
+            value = sys.stdin.readline().rstrip("\r\n")
+            if not value:
+                print("没有从 stdin 读到值。用法：printf '%s' \"$SECRET\" | "
+                      "mat cred set <名称> --stdin", file=sys.stderr)
+                return 1
+        else:
+            import getpass
+            value = getpass.getpass(f"输入 {args.name} 的值（输入不回显）: ")
         store.set(args.name, value)
         print(f"已保存凭据 {args.name}；用例中以 ${{cred.{args.name}}} 引用")
         return 0
@@ -2546,8 +2657,17 @@ def cmd_skill(args) -> int:
         return 1
 
     status, dest = result["status"], result["target"]
+    # 默认落点提醒（只提醒不改行为）：本机还装着别的助手时，别让人以为装到 claude 就够了
+    hint = _skill.default_target_hint(getattr(args, "target", None),
+                                      getattr(args, "dir", None))
+
+    def _warn_target() -> None:
+        if hint:
+            print(f"  ⚠️ {hint}")
+
     if status == "up-to-date":
         print(f"已是最新，无需操作：{dest}")
+        _warn_target()
         return 0
     if status == "differs":
         print(f"目标已存在且内容不同：{dest}")
@@ -2556,6 +2676,7 @@ def cmd_skill(args) -> int:
         return 1
     print(f"{'已覆盖更新' if result.get('overwritten') else '已安装'}：{dest}"
           f"（{len(result['files'])} 个文件）")
+    _warn_target()
     if getattr(args, "target", None) in _skill.UNVERIFIED_TARGETS:
         print("  ⚠️ 该落点未经实测：文件已写入，但助手是否会扫描它需要你自己确认；"
               "不确定就改用 --target agents。")
@@ -2641,11 +2762,112 @@ def cmd_console(args) -> int:
     return 0
 
 
-def cmd_mcp(args) -> int:
-    """MCP 服务器：stdio 长驻，把 MAT 能力暴露给 AI 编码工具。"""
-    from .mcp_server import main as mcp_main
+def _mcp_workspace(explicit: str | None) -> tuple[Path | None, str | None]:
+    """`mcp install` 用的工作区解析——**故意不套 `resolve_workspace`**。
 
-    mcp_main(args.root)
+    那个函数在非工作区里会自动建 `~/.mat/workspace` 并铺示例用例（`mat console` 的
+    兜底行为）。这里不能这样：配置里写死的 `--root` 会长期生效，一旦指向一个空工作区，
+    agent 之后每次都跑在错的地方，而用户完全不知道发生过什么。所以宁可在入口拒绝。
+    """
+    if explicit:
+        root = Path(explicit).expanduser().resolve()
+        if not root.is_dir():
+            return None, f"--root 指向的目录不存在：{root}"
+        return root, None
+    cwd = Path.cwd()
+    if (cwd / "cases").exists() or (cwd / "artifacts").exists():
+        return cwd, None
+    return None, (f"当前目录不像 MAT 工作区（没有 cases/ 也没有 artifacts/）：{cwd}\n"
+                  "  · 先在被测 App 的仓库根跑 `mat init`，再回来配置；或\n"
+                  "  · 用 `--root <工作区路径>` 指定。")
+
+
+def cmd_mcp(args) -> int:
+    """`mat mcp` 启动 stdio 服务器；加动作词则管理「把 MAT 注册进客户端」这件事。
+
+    为什么合在一条命令下：对用户来说这是同一件事的两个阶段（先配好，再被调用），
+    分成 `mat mcp` 和 `mat mcp-install` 只会让 `--help` 更难读。
+    """
+    action = getattr(args, "action", None)
+    if action is None:
+        from .mcp_server import main as mcp_main
+
+        mcp_main(args.root)
+        return 0
+
+    from . import mcp_install as mi
+
+    if action == "targets":
+        detected = mi.detected_keys()
+        print("已收录的客户端（`mat mcp install --target <键>`）：")
+        for key, tgt in mi.known_targets().items():
+            mark = "✓ 本机已装" if key in detected else "· 未检测到"
+            warn = "" if tgt.verified else "  ⚠️ 未实测"
+            print(f"  {key:<15} {tgt.name:<14} {tgt.path}")
+            print(f"  {'':<15} {mark}{warn}")
+            if tgt.note:
+                print(f"  {'':<15} {tgt.note}")
+        print("\n未收录的（VS Code、Codex、项目级 .cursor/mcp.json 等）用 `mat mcp show` "
+              "拿片段手工加。")
+        return 0
+
+    if action == "show":
+        root, err = _mcp_workspace(args.root)
+        if root is None:
+            print(err, file=sys.stderr)
+            return 1
+        spec = mi.launch_spec(root)
+        print(f"# 工作区：{root}")
+        print(json.dumps(mi.snippet(root), ensure_ascii=False, indent=2))
+        print("\n# Claude Code 也可以直接用命令注册：")
+        print(f"#   claude mcp add {mi.SERVER_NAME} -- {spec['command']} "
+              f"{' '.join(spec['args'])}")
+        return 0
+
+    target, terr = mi.resolve_target(getattr(args, "target", None),
+                                     getattr(args, "config", None))
+    if target is None:
+        print(terr, file=sys.stderr)
+        return 1
+
+    root, err = _mcp_workspace(args.root)
+    if root is None:
+        print(err, file=sys.stderr)
+        return 1
+
+    if action == "install" and not mi.mcp_dependency_ready():
+        # 放在写配置**之前**：幂等分支（"已经是这个配置"）会提前 return，写在后面就漏了。
+        # 这条警告要说清后果——不解解释清楚的话，用户看到的是"✅ 已写入"然后客户端起不来。
+        print("⚠️ 当前环境缺 MCP 依赖——客户端启动这个服务器时会失败。补装：",
+              file=sys.stderr)
+        print('   uv tool install "mat-uitest[mcp]"'
+              '   # 或 pip install "mat-uitest[mcp]"', file=sys.stderr)
+
+    if action == "install":
+        res = mi.install(target, root, dry_run=args.dry_run)
+    else:
+        res = mi.uninstall(target, dry_run=args.dry_run)
+
+    if not res["ok"]:
+        print(res["error"], file=sys.stderr)
+        return 1
+    if res.get("dry_run"):
+        print(f"# 将写入 {res['path']}（--dry-run，未落盘）：")
+        print(res["preview"])
+        return 0
+    if not res["changed"]:
+        print(f"{res.get('note') or '没有改动'}：{res['path']}")
+        return 0
+
+    verb = "写入" if action == "install" else "移除"
+    print(f"✅ 已{verb} {res['path']}")
+    if res.get("backup"):
+        print(f"   旧配置已备份：{res['backup']}")
+    if action == "install":
+        spec = res["entry"]
+        print(f"   启动命令：{spec['command']} {' '.join(spec['args'])}")
+        print("   下一步：重启该客户端（多数是重开会话/窗口），让它调用 mat_status 确认连通。")
+        print(f"   撤销：mat mcp uninstall --target {target.key}")
     return 0
 
 
@@ -2740,14 +2962,25 @@ def main(argv: list[str] | None = None) -> None:
                          help="工作区根目录（缺省规则见 --help 顶部说明：当前目录是工作区则用它，否则 ~/.mat/workspace）")
     console.set_defaults(func=cmd_console)
 
-    mcp_p = sub.add_parser("mcp", help="启动 MCP 服务器（stdio，供 Cursor/Codex 等 AI 工具接入；需 mat-uitest[mcp]）")
-    mcp_p.add_argument("--root", default=None, help="工作区根目录（缺省规则同 mat console）")
+    mcp_p = sub.add_parser(
+        "mcp", help="MCP：启动服务器，或把它注册进 AI 客户端（需 mat-uitest[mcp]）")
+    mcp_p.add_argument("--root", default=None,
+                       help="工作区根目录（install 时缺省 = 当前目录，须是工作区）")
+    mcp_p.add_argument("action", nargs="?",
+                       choices=("targets", "install", "uninstall", "show"),
+                       help="不填=启动 stdio 服务器；targets=列客户端；"
+                            "install/uninstall=改配置；show=打印可粘贴片段")
+    mcp_p.add_argument("--target", help="install/uninstall 的目标客户端（见 mat mcp targets）")
+    mcp_p.add_argument("--config", help="显式指定配置文件（覆盖 --target 的默认路径）")
+    mcp_p.add_argument("--dry-run", action="store_true", help="只打印将写入的内容，不落盘")
     mcp_p.set_defaults(func=cmd_mcp)
 
     cred = sub.add_parser("cred", help="凭据管理（用例中以 ${cred.名称} 引用）")
     cred_sub = cred.add_subparsers(dest="cred_cmd", required=True)
-    cred_set = cred_sub.add_parser("set", help="保存凭据（输入不回显）")
+    cred_set = cred_sub.add_parser("set", help="保存凭据（默认交互输入不回显；--stdin 供脚本/agent）")
     cred_set.add_argument("name")
+    cred_set.add_argument("--stdin", action="store_true",
+                          help="从标准输入读一行作为值（不进 shell history）")
     cred_set.set_defaults(func=cmd_cred)
     cred_sub.add_parser("list", help="列出凭据名（不显示值）").set_defaults(func=cmd_cred)
     cred_del = cred_sub.add_parser("del", help="删除凭据")
@@ -2796,6 +3029,8 @@ def main(argv: list[str] | None = None) -> None:
     act.add_argument("--unbind", metavar="机器标识", help="解绑一台机器（换机/重装场景）")
     act.add_argument("--file", metavar="license.json",
                      help="用 license v2 文件激活（Team/Private 签发的 JSON，离线验签）")
+    act.add_argument("--force", action="store_true",
+                     help="允许更短期限覆盖现有授权 / 允许标准码把团队授权降级")
     act.set_defaults(func=cmd_activate)
     upg = sub.add_parser("upgrade",
                          help="标准版支持卡（3 个月）下单并自动激活（下单→支付→领码→激活）")
@@ -2828,6 +3063,9 @@ def main(argv: list[str] | None = None) -> None:
     tau.add_argument("--limit", type=int, default=50, help="条数（默认 50，上限 500）")
     tau.add_argument("--action", help="只看某类动作（case.push / report.share）")
     tau.set_defaults(func=cmd_team)
+    tst = team_sub.add_parser(
+        "status", help="现状：本机授权 / 云端身份（和谁一个库）/ 团队库概览")
+    tst.set_defaults(func=cmd_team)
     inv_p = sub.add_parser("invite", help="邀请同事用 MAT，分享人得额度（需联网；仅本命令会注册匿名 ID）")
     inv_p.add_argument("--accept", metavar="邀请码", help="接受别人的邀请（对方将获得额度）")
     inv_p.add_argument("--confirm", action="store_true",
@@ -2990,6 +3228,34 @@ def main(argv: list[str] | None = None) -> None:
                      help="放行「前置条件 MAT 无法置备」的用例（默认拒跑，见 preconditions.py）")
     run.set_defaults(func=cmd_run)
 
+    # 给 agent/CI 的门面（2026-10-30）：一条命令 → 机器可判定的结论。
+    # 与 run 的区别只在**输出契约**：执行语义、退出码、产物完全同一套。
+    ver = sub.add_parser(
+        "verify", help="验证一条用例并返回机器可判定的结论（协议 mat.verify/1；agent/CI 用）")
+    ver.add_argument("case", nargs="?",
+                     help="用例 JSON 路径（如 cases/登录.json）；用 --subset 批量时省略")
+    ver.add_argument("--serial", help="设备序列号（缺省取唯一在线设备）")
+    ver.add_argument("--platform", default="android",
+                     choices=("android", "ios", "harmony"),
+                     help="设备平台（默认 android）")
+    ver.add_argument("--artifacts", help="产物目录（缺省 artifacts/verify/<用例名>-<时间>）")
+    ver.add_argument("--json", action="store_true", help="输出 mat.verify/1 JSON（agent 用这个）")
+    ver.add_argument("--no-quality-gate", action="store_true", help="跳过用例质量闸门")
+    ver.add_argument("--allow-unmet-preconditions", action="store_true",
+                     help="放行「前置条件 MAT 无法置备」的用例（默认拒跑，退出码 3）")
+    ver.add_argument("--apk", help="被测 App 的 APK 路径(仅 Android;须在工作区内)——先装再验")
+    ver.add_argument("--package", help="校验用包名(APK 解析包名必须一致,缺省用用例 target.package)")
+    ver.add_argument("--reinstall", action="store_true", help="先卸载再安装(全新安装)")
+    ver.add_argument("--subset", choices=("smoke", "last-failed", "changed"),
+                     help="批量模式:smoke=冒烟标记/高优先 · last-failed=最近失败 · "
+                          "changed=图谱变化后全量(与 case 位置参数互斥)")
+    ver.add_argument("--max-duration", type=float, default=300,
+                     help="批量总时长预算(秒,默认 300)——超出记 incomplete,绝不报 pass")
+    ver.add_argument("--timeout-s", type=float, default=180,
+                     help="设备排队等待上限（秒，不含用例执行时长）。超时 ⇒ exit=1 + "
+                          "queued=true——这是排队不是用例失败，不要改用例")
+    ver.set_defaults(func=cmd_verify)
+
     heal = sub.add_parser("heal", help="自愈提案查看与回写（回写不覆盖原用例）")
     heal_sub = heal.add_subparsers(dest="heal_cmd", required=True)
     heal_list = heal_sub.add_parser("list", help="查看某次执行的自愈提案")
@@ -3091,10 +3357,14 @@ def main(argv: list[str] | None = None) -> None:
     skill_sub.add_parser("targets", help="列出已知的助手 skill 落点（含是否实测）").set_defaults(
         func=cmd_skill)
     skill_install = skill_sub.add_parser("install", help="安装到 AI 助手的 skill 目录")
-    skill_install.add_argument("--target", choices=sorted(KNOWN_TARGETS), default="claude",
-                               help="已知落点（mat skill targets 看全表）：claude=~/.claude/skills"
-                                    "（默认）、workbuddy、agents=~/.agents/skills（国内跨平台首选）、"
-                                    "trae=Trae 国内版、qoderwork、codebuddy、qwen")
+    # 默认值必须是 None 而不是 "claude"：install 的落点回落在 resolve_target 里做
+    # （`target or "claude"`），这里留 None 才能区分「用户显式指定」与「用了默认」——
+    # 默认落点时要提醒「本机还装着别的助手」，否则 skill 会静默装进一个没人读的目录。
+    skill_install.add_argument("--target", choices=sorted(KNOWN_TARGETS), default=None,
+                               help="已知落点（mat skill targets 看全表）：缺省 claude="
+                                    "~/.claude/skills（本机还装着别的助手时会提醒）；workbuddy、"
+                                    "agents=~/.agents/skills（国内跨平台首选）、trae=Trae 国内版、"
+                                    "qoderwork、codebuddy、qwen")
     skill_install.add_argument("--dir", default=None,
                                help="自定义安装根目录（优先于 --target）")
     skill_install.add_argument("--force", action="store_true",

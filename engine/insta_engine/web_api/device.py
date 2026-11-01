@@ -24,6 +24,13 @@ _KEY_ACTIONS = ("home", "back", "recents", "settings")
 _IOS_CACHE_TTL = 8.0
 _ios_cache: list = [0.0, []]  # [过期时间戳, 设备列表]
 
+#: 鸿蒙设备枚举的 TTL 缓存（2026-10-31）：`hdc.hdc_available()` 在本机固定要 1.3s
+#: （找二进制 + 探版本），而 /api/state 每 5s 被轮询一次——iOS 有缓存、鸿蒙没有，
+#: 等于每个控制台标签页每 5s 白烧 1.3s。它还把 `test_web_api` 的就绪探测（timeout=1s）
+#: 拖成稳定红。TTL 与 iOS 取同一个值，运维解释只有一套。
+_HARMONY_CACHE_TTL = 8.0
+_harmony_cache: list = [0.0, []]  # [过期时间戳, 设备列表]
+
 
 def ios_state_devices() -> list[dict]:
     """iOS **USB** 真机并入设备清单（2026-10-19，控制台真机入口）。
@@ -71,7 +78,19 @@ def harmony_state_devices() -> list[dict]:
     model 显示口径：模拟器(单台,127.0.0.1)用**最近启动实例的机型名**（
     lists.json——param 的 model 恒为 "emulator" 没有信息量）；真机/多台回落
     设备侧 param 或 serial。os 取实例的 showVersion（如 "HarmonyOS 7.0.0(26.0.0)"）。
+
+    结果按 8s TTL 缓存：「没装 hdc」也是结果，一并缓存——否则每轮询都要重探一次。
     """
+    now = time.monotonic()
+    if now < _harmony_cache[0]:
+        return _harmony_cache[1]
+    out = _harmony_state_devices_uncached()
+    _harmony_cache[:] = [now + _HARMONY_CACHE_TTL, out]
+    return out
+
+
+def _harmony_state_devices_uncached() -> list[dict]:
+    """真实枚举（慢路径，含 hdc 可用性探测）；缓存壳见 `harmony_state_devices`。"""
     from .. import harmony_hdc as hdc
 
     if not hdc.hdc_available():

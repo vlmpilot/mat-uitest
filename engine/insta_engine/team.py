@@ -17,13 +17,28 @@ from pathlib import Path
 from . import cloudapi, entitlements
 
 
-def _bearer() -> str:
+def bearer() -> str:
+    """云端凭证，按**身份优先级**取：
+
+    1. 本机授权换来的 token（`license_server.json`，团队授权 activate 时写入）；
+    2. 匿名/邀请 token（`invite.json`）或 `GEN_API_KEY`。
+
+    为什么授权优先：团队客户的身份是"这份合同"，不是某个匿名 ID。同一台机器可能先
+    体验过、后来买了团队授权，以授权为准才符合直觉。标准版客户走不到团队命令
+    （`entitlements` 先拦），顺序变化对他们没有影响。
+    """
+    from . import licensing
     from .invite import auth_token
 
-    token = auth_token()
+    return licensing.read_server_token() or auth_token()
+
+
+def _bearer() -> str:
+    token = bearer()
     if not token:
         raise SystemExit(
-            "缺少云端凭据：先 `mat token`（或把官方代理的 Key 配成 GEN_API_KEY）后再试。")
+            "缺少云端凭据：团队授权请先 `mat activate --file <license.json>`"
+            "（会换发团队凭证）；没有授权时再用 `mat token` 换一张匿名凭证。")
     return token
 
 
@@ -220,4 +235,68 @@ def audit(limit: int = 50, action: str = "") -> int:
         print(f"{str(e['created_at'])[:19]:20s} {str(e['actor'])[:16]:16s} "
               f"{str(e['action'])[:14]:14s} {str(e['target'])[:28]:28s}")
     print(f"\n共 {len(events)} 条（新到旧）。")
+    return 0
+
+
+# -- 现状 -------------------------------------------------------------------
+
+def status() -> int:
+    """`mat team status`：本机授权 + 云端身份 + 团队库概览。
+
+    为什么需要它：团队库的语义是"多台机器同一个库"，而这件事**从本机看不出来**。
+    没有这条命令，客户只能靠"我推了他能不能拉到"来猜，接错了团队（最常见的是每台
+    机器各自激活成独立团队）也不会报错。三件事必须一眼可见：我是什么档位、我和谁
+    一个库、库里有什么。
+    """
+    from . import licensing
+
+    ent = licensing.read_license()
+    plan = str(ent.get("plan") or "free")
+    seats = ent.get("seats")
+    expires = ent.get("expires_at")
+    bits = [licensing.plan_label(plan)]
+    if seats:
+        bits.append(f"{seats} 席")
+    if expires:
+        import time as _t
+
+        bits.append("至 " + _t.strftime("%Y-%m-%d", _t.localtime(int(expires))))
+    if ent.get("license_id"):
+        bits.append(str(ent["license_id"]))
+    print("本机授权: " + " · ".join(bits))
+
+    if "team_share" not in (ent.get("features") or ()):
+        print("云端身份: —（当前档位不含团队协作，服务端会拒绝这类请求）")
+        return 1
+
+    token = bearer()
+    if not token:
+        print("云端身份: 未连接（本机没有云端凭证）")
+        print("  团队授权：mat activate --file <license.json>   # 会换发团队凭证")
+        print("  无授权时：mat token --new")
+        return 1
+    try:
+        usage = cloudapi.get("/usage", bearer=token)
+        meta = cloudapi.get("/team/cases", bearer=token)
+    except cloudapi.CloudError as exc:
+        print(f"云端身份: 未连通（{exc}）")
+        print("  本地功能不受影响；联网后重跑本命令即可。")
+        return 1
+
+    team = str(usage.get("team_id") or "")
+    gen = usage.get("gen") or {}
+    print(f"云端身份: 团队 {team or '未归属（服务端未返回 team_id，可能需要升级）'}"
+          f" · 档位 {usage.get('plan')}"
+          f" · 本月生成 {gen.get('used', 0)}/{gen.get('limit', '?')}")
+
+    cases = meta.get("cases") or []
+    apps = sorted({str(c.get("app")) for c in cases if c.get("app")})
+    tail = f"（{'、'.join(apps[:5])}{' 等' if len(apps) > 5 else ''}）" if apps else ""
+    print(f"团队库: {len(cases)} 条用例 · {len(apps)} 个应用{tail}")
+    if cases:
+        newest = max(cases, key=lambda c: str(c.get("updated_at") or ""))
+        print(f"  最近更新: {_brief(str(newest.get('name') or ''))}"
+              f" · {newest.get('actor')} · {str(newest.get('updated_at'))[:19]}")
+    else:
+        print("  库里还是空的：mat team push 把本地 cases/ 推上去。")
     return 0

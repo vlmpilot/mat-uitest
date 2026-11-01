@@ -7,7 +7,13 @@ export type RunInfo = { dir: string; case_id?: string; case_name?: string; packa
   platform?: "android" | "ios" | "harmony";
   failed_categories?: Record<string, number>;
   batch?: { id: string; suite: string; index: number; total: number };
-  diagnosed?: boolean; calibrated?: boolean; human_marked?: boolean };
+  diagnosed?: boolean; calibrated?: boolean; human_marked?: boolean;
+  /** `mat verify` 的判定（同目录 verify.json 的摘要；非 verify 产物为 null/缺省） */
+  verify?: { verdict?: string; exit_code?: number; ok?: boolean;
+    summary?: Record<string, number> | null;
+    next_actions?: { category: string; action: string }[];
+    /** 判定不是这一次运行的（目录被后来的运行覆盖过）——界面要标出来，别当成结论 */
+    stale?: boolean } | null };
 export type JobInfo = { id: string; kind: string; status: string; started_at: string;
   summary?: string | null; error?: string | null; link?: string | null; seq: number;
   serial?: string | null; platform?: string; operator?: string };

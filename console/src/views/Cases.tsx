@@ -63,8 +63,7 @@ function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial
           value={runSerial ?? undefined}
           onChange={setRunSerial}
           options={state.devices
-            .filter((d) => d.state === "device" && (runPlatform === "ios"
-              ? d.platform === "ios" : (d.platform || "android") === "android"))
+            .filter((d) => d.state === "device" && (d.platform || "android") === runPlatform)
             .map((d) => ({ value: d.serial, label: `${d.model || d.serial} · ${d.serial}` }))} />
       </Tooltip>
       <Tooltip title="全程录屏；通过的自动删除、失败的保留进 artifacts/video/ 并内嵌报告（iOS 真机暂不支持）">
@@ -76,12 +75,13 @@ function RunParams({ state, runPlatform, setRunPlatform, runSerial, setRunSerial
 
 function useRunTarget(state: StateResp, runPlatform: "android" | "ios" | "harmony", runSerial: string | null) {
   const online = state.devices.filter((d) => d.state === "device");
-  const androidOnline = online.filter((d) => (d.platform || "android") === "android");
-  const runDisabled = runPlatform === "android" && androidOnline.length === 0;
+  // 平台严格匹配（2026-10-28：此前非 iOS 一律按 Android 过滤，鸿蒙设备被筛掉）
+  const platformOnline = online.filter((d) => (d.platform || "android") === runPlatform);
+  const runDisabled = runPlatform !== "ios" && platformOnline.length === 0;
   const runTarget = runSerial
-    ? (online.find((d) => d.serial === runSerial)?.model || runSerial)
+    ? (platformOnline.find((d) => d.serial === runSerial)?.model || runSerial)
     : runPlatform === "ios" ? "iOS 模拟器"
-    : (androidOnline.length ? androidOnline[0].serial : "默认设备");
+    : (platformOnline.length ? platformOnline[0].serial : "默认设备");
   return { runDisabled, runTarget };
 }
 
@@ -188,7 +188,7 @@ function CasesTab({ state, onLaunched, openCaseName, onOpenCase, onNav, onCasesC
     // iOS：选了 USB 真机就传 udid（WDA 走 usbmux）；留空 = 模拟器（localhost:8100）
     const serial = runSerial || (runPlatform === "ios" ? null
       : state.devices.find((d) => d.state === "device"
-          && (d.platform || "android") === "android")?.serial || null);
+          && (d.platform || "android") === runPlatform)?.serial || null);
     setRunning(true);
     try {
       const { job_id } = await runCase({ cases: selNames, serial, platform: runPlatform, record, reset });
@@ -376,7 +376,7 @@ function SuitesTab({ state, onLaunched, runPlatform, setRunPlatform, runSerial, 
     // iOS：选了 USB 真机就传 udid；留空 = 模拟器。Android 未选则回落首台在线设备
     const serial = runSerial || (runPlatform === "ios" ? null
       : state.devices.find((d) => d.state === "device"
-          && (d.platform || "android") === "android")?.serial || null);
+          && (d.platform || "android") === runPlatform)?.serial || null);
     setRunning(true);
     try {
       let first = "";

@@ -142,3 +142,49 @@ def test_read_back_empty_is_true_for_genuinely_empty_field(monkeypatch):
     assert element._input_landed("alice") is False, "回读为空 ⇒ 判未生效 ⇒ 走二级通道"
 
 
+def test_password_field_is_recognised_by_its_mask(monkeypatch):
+    """**密码框回读是掩码** ⇒ 不得判"未生效"，否则二级通道会把文本打两遍。
+
+    真机实测（2026-10-31，InstaDemo）：`input pass1234` 之后密码框是 **16** 个 `•`
+    （8 字符 ×2），登录必报「账号或密码错误（1）」⇒ 冒烟② 稳定红 3/3。
+    根因：`_is_password()` 读 `node.info["password"]`，而 **u2 的 info 里没有这个键**
+    （XML 上有 `password="true"`，info 的 17 个键里没有）⇒ 判据永远不成立。
+    """
+    monkeypatch.setattr(locator_mod.time, "sleep", lambda _s: None)
+
+    class _Pwd:
+        """只长成 u2 节点：`info` 里**没有** password 键，回读是掩码。"""
+
+        exists = True
+        info = {"text": "••••••••", "className": "android.widget.EditText"}
+
+        def __init__(self):
+            self.clicks = 0
+            self.set_texts: list[str] = []
+
+        def click(self):
+            self.clicks += 1
+
+        def set_text(self, text: str):
+            self.set_texts.append(text)
+
+        @staticmethod
+        def get_text():
+            return "••••••••"
+
+    class _Drv:
+        platform = "android"
+        calls: list[str] = []
+
+        def fallback_input(self, text: str) -> bool:  # noqa: ARG002
+            self.calls.append(text)
+            return True
+
+    node, drv = _Pwd(), _Drv()
+    element = Element(strategy="res-id", value="password", node=node, drv=drv)
+    assert element._is_password() is True, "掩码回读必须认成密码框"
+    element.set_text("pass1234")
+    assert node.set_texts == ["pass1234"], "输入本身必须发生"
+    assert drv.calls == [], "密码框不得走二级通道（会把文本打两遍）"
+
+

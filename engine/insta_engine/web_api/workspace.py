@@ -180,6 +180,46 @@ def case_meta(root: Path) -> dict:
     return meta
 
 
+def _verify_summary(run_dir: Path, case_id: str | None = None) -> dict | None:
+    """读同目录的 `verify.json`（mat verify 落的判定），裁成列表/卡片够用的形状。
+
+    只带**人要看**的四项：五态 verdict、退出码、失败计数、下一步动作。完整判定仍在
+    `verify.json` 里（agent 与复盘看那份），不重复塞进 `/api/state`（5s 轮询，别背大对象）。
+
+    ⚠️ **陈旧判定必须标出来**（2026-11-01 复核）：`verify.json` 与 `run.json` 是两个时刻
+    写的，目录可以被后来的运行覆盖（`mat verify --artifacts artifacts/<stem>` 之后又在
+    控制台重跑同一条用例——控制台单条跑用的就是固定目录 `artifacts/<stem>`）。实测那种
+    现场会渲染成「状态：失败」+「验证结论：通过 exit 0」自相矛盾的一行，正好毁掉这个
+    功能存在的理由。判据两条，任一命中就 `stale=True`：
+    ① `case_id` 对不上（同目录被另一条用例的判定占用）；
+    ② `verify.json` 的 mtime **早于** `run.json`（判定写在更早那次运行上）。
+    正常路径（verify 跑完写 run.json 再写 verify.json）两条都不成立。
+    """
+    path = Path(run_dir) / "verify.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        verify_mtime = path.stat().st_mtime
+    except (OSError, ValueError):
+        return None
+    try:
+        run_mtime: float | None = (Path(run_dir) / "run.json").stat().st_mtime
+    except OSError:
+        # 没有 run.json（运行期崩在落 run.json 之前）⇒ 无从比较新旧，不因此丢掉判定
+        run_mtime = None
+    actions = [{"category": str(a.get("category") or ""),
+                "action": str(a.get("action") or "")}
+               for a in (data.get("next_actions") or []) if isinstance(a, dict)]
+    own = str(data.get("case_id") or "")
+    stale = bool(case_id and own and own != str(case_id))
+    if run_mtime is not None:
+        stale = stale or verify_mtime < run_mtime
+    return {"verdict": data.get("verdict"), "exit_code": data.get("exit_code"),
+            "ok": data.get("ok"), "summary": data.get("summary"),
+            "next_actions": actions, "stale": stale}
+
+
 def list_runs(root: Path) -> list[dict]:
     runs = []
     artifacts = root / "artifacts"
@@ -215,6 +255,10 @@ def list_runs(root: Path) -> list[dict]:
                     "calibrated": (run_dir / "calibration.json").exists(),
                     "human_marked": any(s.get("category_source") == "human"
                                         for s in run.get("steps") or []),
+                    # 验证判定（2026-11-01）：`mat verify` 会把 mat.verify/1 落成 verify.json。
+                    # 有就带出来——控制台据此渲「验证结论」卡；没有就别塞空对象（旧产物）。
+                    # 带 `stale` 标记：目录被后来的运行覆盖过 ⇒ 判定不是这一次的（见函数注释）。
+                    "verify": _verify_summary(run_dir, run.get("case_id")),
                 })
             except (OSError, ValueError):
                 continue

@@ -5,7 +5,7 @@ display_name_en: Mobile App UI Testing
 description: Runs AI-assisted mobile UI tests against a connected Android device via the MAT CLI — generates test cases from natural language, executes them with screenshot-backed evidence, heals broken locators after an app update, explores an app into a page graph, and attributes failures with an LLM. Use when testing an Android app on a real device or emulator; when the user mentions UI tests, regression, smoke tests, 真机测试, 冒烟, or 移动端自动化; or when an existing mobile test case broke after a UI change.
 description_zh: 在本机 Android 真机或模拟器上跑 AI 辅助的 UI 测试：一句话生成用例、带截图证据执行、App 改版后自愈定位、遍历探索生成页面图谱，并对失败步骤做归因。
 description_en: AI-assisted UI testing on a real Android device or emulator through the mat CLI — cases from one sentence, runs with screenshot evidence, locator self-healing after an app update, exploration into a page graph, and LLM failure attribution.
-version: "0.7.6"
+version: "0.7.10"
 author: "vlmpilot"
 license: Complete terms in LICENSE.txt
 examples_zh:
@@ -29,8 +29,11 @@ To test Android apps on a connected device, use the `mat` CLI. Every command is 
 
 ## Setup (agent-executable — run this first; covers not-installed and already-installed)
 
-Version floor: **mat-uitest ≥ 0.7.0**; the `mat summary` digest command used
-throughout this skill needs **≥ 0.7.1** — always install the latest available.
+Version floor: **mat-uitest ≥ 0.7.9** — this skill teaches `mat verify` with batch
+(`--subset`, `--apk`), the MCP tools `mat_doctor` / `mat_cred` / `mat_verify(subset=…)`,
+and `mat cred set --stdin`, all of which exist only in 0.7.9+. If the user is pinned to an
+older version: `mat verify` (single case) needs ≥ 0.7.6, `mat summary` needs ≥ 0.7.1.
+Always install the latest available.
 Human-only prerequisite: an Android device
 with USB debugging enabled (or an emulator) plugged in — everything else below the
 agent can do itself.
@@ -107,6 +110,10 @@ rename breaks your cases.
 ## Device Readiness (check before anything else)
 
 - **0 devices** in `mat devices` → run `mat doctor`; check USB debugging.
+  **MCP clients**: call the `mat_doctor` tool instead of running the CLI — it returns
+  `{ok, blocking[], warnings[], checks[]}`, and each item's `hint` is the next action.
+  Do this **before** blaming the case: a blocking item means nothing you change in the
+  test will help.
 - **Multiple devices** → always pass `--serial`; otherwise behavior is undefined.
 - **HarmonyOS NEXT** (`--platform harmony`, MAT ≥0.8.0): needs the `hdc` tool
   (bundled with DevEco Studio — MAT auto-discovers the macOS standard install path).
@@ -154,6 +161,41 @@ rename breaks your cases.
    screen + step events in real time. You do not
    need this page — your ground truth stays `run.json` / tool outputs.
 
+## Code Change Workflow: Verify After Every Change (the loop agents live in)
+
+When you (or the user) change **app code** and need to know if it still works:
+
+```bash
+# 1) Install the fresh build + run the case (one command; workspace must live in the app repo root)
+mat verify cases/登录.json --apk build/app-debug.apk --package com.example.app --json
+
+# 2) Read ONLY the JSON verdict — never guess from terminal text
+#    exit 0=pass · 2=case failed (read failed_categories + next_actions) ·
+#    3=blocked (device busy / precondition — wait or fix the case, do NOT edit code) ·
+#    1=error (install/device — fix environment)
+# 3) When it fails: fix app code (crash / wrong behavior) or fix the case
+#    (wrong page / stale locator), then re-verify.
+```
+
+- `mat verify` prints `mat.verify/1` JSON with `verdict`, `failed_categories`,
+  and `next_actions` — one entry per category, each carrying the concrete next step.
+  **The category set is exactly**: `locate-fail` / `assert-fail` / `env-failure` /
+  `app-crash` / `api` / `unknown`, plus the non-failure reasons `precondition` /
+  `device-busy` (blocked) and `install` (the APK never got installed, so **no step ran**).
+  There is no `app-bug` / `ui-change` / `env-flake` category — those are `mat diagnose`
+  attribution labels, a different vocabulary; don't look for them here.
+  Consume JSON; do not parse terminal text.
+- Batch mode (after bigger changes): `mat verify --subset smoke --package com.x --json`
+  runs only smoke-tagged / high-priority cases **whose `target.package` is `com.x`** —
+  other apps' cases in the same `cases/` are excluded, and `selection.skipped_other_package`
+  tells you how many. **Empty selection ⇒ verdict=blocked**, never pass. Note: `mat gen`
+  cases carry no tags by default — tag key flows manually or use `last-failed`.
+  **MCP clients**: same thing without a shell — `mat_verify(subset="smoke",
+  package="com.x")` (one call, returns the aggregate `summary` + `next_actions`);
+  `mat_verify(case="登录.json")` stays the single-case form.
+- **Console in use?** If a dashboard task is running the same device, verify returns
+  `blocked_reason=device_busy` (exit 3) — wait, do not force.
+
 ## Common Pitfalls (real-device lessons)
 
 - **Vendor keyboards can block text injection** (Huawei/Honor secure keyboard):
@@ -167,11 +209,18 @@ rename breaks your cases.
 - **Screen must be on and unlocked**: `mat run` wakes the device, but a locked
   device mid-run still stalls — check `mat doctor` if steps hang.
 - **Login flows need credentials stored via `mat cred`** (the only hidden
-  prerequisite): save once with `mat cred set` (e.g. name `测试号`; input is
-  hidden), reference it in case params as `${cred.测试号}` — the engine injects
-  the real value at run time and it never appears in reports/logs. If a login
-  case fails with wrong-password errors, check the credential exists
-  (`mat cred list`) before blaming the case. See `mat cred --help`.
+  prerequisite): save once (e.g. name `测试号`), reference it in case params as
+  `${cred.测试号}` — the engine injects the real value at run time and it never
+  appears in reports/logs. Three ways in, pick by who is driving:
+  ```bash
+  mat cred set 测试号              # interactive, input hidden (a human at a terminal)
+  printf '%s' "$SECRET" | mat cred set 测试号 --stdin   # scripts / agents, no shell history
+  ```
+  **MCP clients**: call `mat_cred(action="set", name="测试号", value="…")`; note the
+  value then passes through the conversation context, so when the secret is sensitive
+  ask the user to run the `--stdin` form in their terminal instead. `mat_cred(action="list")`
+  only returns names, never values. If a login case fails with wrong-password errors,
+  check the credential exists (`mat cred list`) before blaming the case.
 - **Exploration is not deterministic**: page-graph walks depend on device state
   (toggles, logged-in state). Run twice and compare distributions before
   concluding anything; a "perfect 100%" on 4 steps deserves suspicion, not celebration.

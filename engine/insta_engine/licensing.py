@@ -75,9 +75,17 @@ def plan_features(plan: str) -> frozenset:
 # 为什么不沿用 v1 HMAC：v1 的验签密钥必须随开源包分发（公开兑底密钥），只配「提高
 # 门槛」；团队/私有化的合同授权需要**不可伪造**的离线验签 ⇒ 非对称签名，公钥内置、
 # 私钥离线（签发脚本从环境变量读 PEM 路径，永不入库）。
-#: 默认**开发公钥**（Ed25519 raw 32B base64）。仅供开发/测试链路；生产必须用
-#: MAT_LICENSE_PUBKEY_B64 或 ~/.mat/license_pubkey.b64 覆盖并全量重签。
-DEV_LICENSE_PUBKEY_B64 = "+CKXLUS5MfcUKD+n3p4nMi/HXncKLHH67LGQ2YzfXZM="
+#: 团队/私有化授权验签公钥（Ed25519 raw 32B base64，2026-11-01 起为生产钥）。
+#: 私钥只在签发端离线保存、永不入库。换钥 = 内置值 + 服务端
+#: `MAT_LICENSE_PUBKEY_B64` 同时更新，并经一次发版（旧客户端不认新钥）。
+LICENSE_PUBKEY_B64 = "oAd+ibv1KqLQXhZ0FsENhByExj38+uzAOr87N2w4/KY="
+
+#: 2026-11-01 之前签发的授权用的是这把（开发钥）。**只验旧文件、不再签发**：
+#: 换钥不该让已交付的合同一夜失效。确认没有存量的旧合同后可整行删除。
+LEGACY_LICENSE_PUBKEY_B64 = "+CKXLUS5MfcUKD+n3p4nMi/HXncKLHH67LGQ2YzfXZM="
+
+#: 兼容旧名（`scripts/issue_license_v2.py` 的注释与历史文档引用过）——指向当前生产钥。
+DEV_LICENSE_PUBKEY_B64 = LICENSE_PUBKEY_B64
 
 #: 激活码（`MAT2-`）验签公钥：**只用来验，签不了**。对应私钥只存在服务端
 #: （`MAT_LICENSE_CODE_KEY`）。v1 的 HMAC 码靠内置对称密钥验签，密钥在源码里
@@ -88,18 +96,27 @@ _V2_REQUIRED = ("license_id", "customer", "plan", "features", "seats",
                 "issued_at", "expires_at", "sig")
 
 
-def _license_pubkey_b64() -> str:
-    """v2 验签公钥：env 覆盖 → 状态目录文件 → 开发默认。"""
+def _license_pubkeys() -> tuple[str, ...]:
+    """v2 验签公钥列表（**逐把试**，任一中即通过）。
+
+    顺序：env 覆盖（可逗号分隔多把）→ 状态目录文件 → 内置（生产钥 + 历史钥）。
+    为什么允许多把：换钥过渡期，新钥要认新合同，旧钥要认已交付的合同。
+    """
     env = os.environ.get("MAT_LICENSE_PUBKEY_B64", "").strip()
     if env:
-        return env
+        return tuple(k.strip() for k in env.split(",") if k.strip())
     try:
         text = (insta_home() / "license_pubkey.b64").read_text(encoding="utf-8").strip()
         if text:
-            return text
+            return (text,)
     except OSError:
         pass
-    return DEV_LICENSE_PUBKEY_B64
+    return (LICENSE_PUBKEY_B64, LEGACY_LICENSE_PUBKEY_B64)
+
+
+def _license_pubkey_b64() -> str:
+    """兼容旧调用点：返回第一把（当前生产钥）。新代码用 `_license_pubkeys()`。"""
+    return _license_pubkeys()[0]
 
 
 def _code_pubkey_b64() -> str:
@@ -177,15 +194,22 @@ def verify_license_v2(data) -> tuple[dict | None, str | None]:
     except ImportError:
         return None, "unsupported"
     try:
-        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(_license_pubkey_b64()))
-        pub.verify(base64.b64decode(str(data["sig"])), _v2_payload_bytes(data))
-    except Exception:  # noqa: BLE001 —— 签名不符/坏编码/公钥坏档一律拒绝（fail closed）
-        return None, "signature"
-    return {"v": 2, "license_id": str(data["license_id"]), "customer": str(data["customer"]),
-            "plan": plan, "features": features, "seats": seats,
-            "machine_limit": int(data.get("machine_limit") or 2),
-            "issued_at": int(data["issued_at"]), "expires_at": expires_at,
-            "source": "v2"}, None
+        sig = base64.b64decode(str(data["sig"]))
+        body = _v2_payload_bytes(data)
+    except Exception:  # noqa: BLE001 —— 坏编码一律按结构问题拒绝
+        return None, "malformed"
+    for key in _license_pubkeys():
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(key))
+            pub.verify(sig, body)
+        except Exception:  # noqa: BLE001 —— 签名不符/公钥坏档：试下一把
+            continue
+        return {"v": 2, "license_id": str(data["license_id"]), "customer": str(data["customer"]),
+                "plan": plan, "features": features, "seats": seats,
+                "machine_limit": int(data.get("machine_limit") or 2),
+                "issued_at": int(data["issued_at"]), "expires_at": expires_at,
+                "source": "v2"}, None
+    return None, "signature"
 
 
 def explain_v2_failure(reason: str | None) -> str:
@@ -202,8 +226,16 @@ def explain_v2_failure(reason: str | None) -> str:
     return "license 文件结构不完整——请使用签发端交付的原始 JSON 文件"
 
 
-def activate_license_file(path) -> dict:
-    """用 v2 license 文件激活（Team/Private）。验签通过才写盘；v1 激活码路径不受影响。"""
+def activate_license_file(path, *, force: bool = False) -> dict:
+    """用 v2 license 文件激活（Team/Private）。验签通过才写盘；v1 激活码路径不受影响。
+
+    **谁长用谁**（2026-11-01 补）：团队合同续期时可能收到一份更短的演示/试用合同，
+    无条件覆写会把有效期砍短且只在事后才发现。与标准码的 `_write_local` 同一口径。
+
+    **顺手换云端凭证**：团队库在云端，而 JSON 授权是离线验签的——不换 token，
+    `mat team *` 就没有 Bearer。best-effort：失败不阻断本地激活（断网是常态），
+    返回体里带 `server` 两态给 CLI 如实播报。
+    """
     p = Path(path)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -212,6 +244,11 @@ def activate_license_file(path) -> dict:
     verified, reason = verify_license_v2(data)
     if verified is None:
         raise ValueError(explain_v2_failure(reason))
+    current = read_license()
+    current_exp = int(current.get("expires_at") or 0)
+    if (not force and current_exp
+            and int(verified["expires_at"]) <= current_exp):
+        return {**verified, "kept_existing": True, "current_expires_at": current_exp}
     lp = license_path()
     lp.parent.mkdir(parents=True, exist_ok=True)
     lp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -219,7 +256,24 @@ def activate_license_file(path) -> dict:
         lp.chmod(0o600)
     except OSError:
         pass
-    return verified
+    out = {**verified, "kept_existing": False}
+    try:
+        out["server"] = attach_on_server(data)
+    except Exception as exc:  # noqa: BLE001 —— 断网/服务端拒绝都不该让本地激活失败
+        out["server"] = {"ok": False, "error": str(exc)}
+    return out
+
+
+def attach_on_server(license_data: dict) -> dict:
+    """团队/私有化 JSON 授权 → 服务端团队凭证（团队库/报告/审计的 Bearer）。
+
+    ⚠️ 调用方必须容忍失败：本地授权已经生效（离线验签），团队库只是附加能力。
+    """
+    from .cloudapi import post
+
+    out = post("/license/attach", {"license": license_data, "machine_id": machine_id()})
+    save_server_token(str(out["token"]), out)
+    return out
 
 
 def insta_home() -> Path:
@@ -446,7 +500,8 @@ def read_server_token() -> str:
 def save_server_token(value: str, meta: dict) -> None:
     path = server_token_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    keep = {k: meta.get(k) for k in ("plan", "expires_at", "machines", "max_machines")}
+    keep = {k: meta.get(k) for k in
+            ("plan", "expires_at", "machines", "max_machines", "team_id", "seats")}
     rec: dict = {}
     rec["tok" + "en"] = value  # 键名运行时拼装（扫描友好，同 invite.py 的 secret 先例）
     rec.update(keep)
@@ -495,7 +550,7 @@ def unbind_on_server(machine: str) -> dict:
     return post("/license/unbind", {"machine_id": machine}, bearer=read_server_token())
 
 
-def activate(code: str) -> dict:
+def activate(code: str, *, force: bool = False) -> dict:
     """激活一张激活码。**续费不砍短**：新码到期日早于本机现有有效期时，保留较长的那个。
 
     为什么要这道保护（2026-10-11 实测发现的真缺陷）：本函数原本是 `write_text` **整体覆写**
@@ -526,18 +581,31 @@ def activate(code: str) -> dict:
         raise ValueError(explain_code_failure(code, reason))
     if verified.get("months"):
         return _activate_duration_card(code, verified)
-    return _write_local(code, verified)
+    return _write_local(code, verified, force=force)
 
 
-def _write_local(code: str, verified: dict) -> dict:
+def _write_local(code: str, verified: dict, *, force: bool = False) -> dict:
     """普通码激活的本地落盘（**谁长用谁**）；调用方已验签。
 
     ⚠️ 这里**只管授权本身**：团队成员名额**不在码里**（2026-10-14 起改为服务端按主机发配额，
     见 `web_api/seats.py` 与 `mat seat`）。授权（有效期）与名额（成员数）是两个独立维度，
     塞进同一张码会让"换一次授权就丢名额"这类问题反复出现。
+
+    **降级保护**（2026-11-01）：本机是团队/私有化 v2 授权时，一张标准码会把
+    `license.json` 整份换成 v1 三字段——`seats`/`features`/`license_id` 全丢，
+    团队库、审计、按席位共享当场失效，而旧实现只打印"已激活标准版"。现在直接拒绝，
+    要降级得显式 `--force`（团队客户拿标准码续费多半是拿错了码）。
     """
     code_expires = verified["expires_at"]
     lic = read_license()
+    new_features = set(plan_features(verified["plan"]))
+    old_features = set(lic.get("features") or ())
+    if not force and ({"team_share", "report_share", "audit_log"} & old_features) \
+            and not ({"team_share", "report_share", "audit_log"} & new_features):
+        raise ValueError(
+            "本机现有的是团队/私有化授权（含团队协作能力），这张标准码会把它降级："
+            "席位、团队库与审计授权都会失效。确认要降级请加 --force 重跑；"
+            "只是想续期请用团队授权文件（mat activate --file）。")
     current = int(lic.get("expires_at") or 0)
     if current and code_expires <= current:
         return {"plan": verified["plan"], "expires_at": current,

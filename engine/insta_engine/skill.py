@@ -80,6 +80,25 @@ def resolve_target(target: str | None = None, directory: str | None = None) -> P
     return Path(KNOWN_TARGETS[key]).expanduser()
 
 
+def default_target_hint(target: str | None, directory: str | None = None) -> str | None:
+    """没指定落点、但本机装着别的助手时，给一句提醒（返回 None 表示无需提醒）。
+
+    为什么需要（2026-10-31 一致性巡检）：`mat mcp install` 会自动检测客户端，而 skill 这条
+    为了不破坏既有脚本保留了 `claude` 默认。默认本身没错，但**沉默**地把 skill 装进一个
+    用户并不使用的目录，会让人以为「装好了」而助手永远读不到——这比报错更难发现。
+    所以只加提醒、不改默认：装了 WorkBuddy/Trae 的人会看到重跑命令。
+    """
+    if target or directory:
+        return None
+    others = [key for key, path in sorted(KNOWN_TARGETS.items())
+              if key != "claude" and Path(path).expanduser().parent.exists()]
+    if not others:
+        return None
+    return (f"没指定 --target，默认装到 claude 落点；本机还检测到 {'、'.join(others)}："
+            f"如果你用的是它们，重跑 mat skill install --target {others[0]}"
+            "（mat skill targets 看全表）")
+
+
 def targets_table() -> list[dict]:
     """已知落点的清单（供 `mat skill targets` 打印；排序稳定便于测试）。"""
     return [

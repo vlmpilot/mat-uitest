@@ -58,3 +58,10 @@ API 形状变更要同步核对 web_server.py 的路由清单。
   → wheel + twine check（三件套内嵌于脚本）。⚠️ 该脚本属维护者内部发布工具，
   **不在公开仓库内**（公开仓的验证路径见上：`pip install -e './engine[dev]'` + ruff + pytest）。
 - 版本号：向后兼容修复升 patch（0.4.x）；新增用户可见能力升 minor（0.5.0）。
+- **发版后两处对外面必须跟上**（漏了不会报错，只会慢慢说谎）：
+  1. **skill 镜像仓**：`bash scripts/sync_skill_repo.sh --write --push`——随包的
+     `mobileapp-testing/SKILL.md` 是唯一事实来源，`vlmpilot/mat-skill` 只是给「助手不能执行
+     终端命令」的人的镜像。2026-10-31 实测它曾落后五个版本（0.7.1 → 0.7.9）。
+     插件市场清单（`marketplace.json` / `plugin.json`）由主仓模板渲染，**别在网页上直改**。
+  2. **官网**：`website/` rsync 上去。顺序是**先发 PyPI 再部署站点**——页面上的版本号、
+     工具数、命令名都是对外承诺，站点跑在包前面等于让访客装不到刚看到的能力。

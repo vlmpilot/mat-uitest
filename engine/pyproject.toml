@@ -92,7 +92,7 @@ include = ["insta_engine*"]
 # skills/*：面向 AI 编码助手的过程知识（mobileapp-testing）。**必须随包分发**——
 # 否则 `pip install mat-uitest` 的用户机器上没有 SKILL.md，`mat skill install` 无料可装。
 insta_engine = ["web/*.html", "web/*.js", "web/*.css", "prompts/*.example",
-                 "console_dist/*.html", "console_dist/assets/*", "console_dist/*.svg", "console_dist/*.ico",
+                    "schemas/*.json", "console_dist/*.html", "console_dist/assets/*", "console_dist/*.svg", "console_dist/*.ico",
                  # 配额策略的包内副本（唯一事实源的随包分发；缺失时回落 _DEFAULTS 同值，
                  # 但那份兜底不该是常态——2026-10-23 实测 wheel 里没有它）
                  "data/*.json",

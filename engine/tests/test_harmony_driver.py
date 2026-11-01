@@ -234,6 +234,7 @@ def test_harmony_state_devices_uses_emulator_instance_name(tmp_path, monkeypatch
     monkeypatch.setattr(hdc, "list_targets", fake.list_targets)
     monkeypatch.setattr(hdc, "shell", fake.shell)
     monkeypatch.setattr(dev_mod.Path, "home", lambda: _FakeHome(lists_json))
+    dev_mod._harmony_cache[:] = [0.0, []]  # 清 TTL 缓存，避免命中上一个用例的结果
     out = dev_mod.harmony_state_devices()
     assert out == [{"serial": "127.0.0.1:5555", "state": "device",
                     "model": "Mate 90 Pro2", "os": "HarmonyOS 7.0.0(26.0.0)",

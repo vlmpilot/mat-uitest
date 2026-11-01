@@ -1,0 +1,247 @@
+{
+ "additionalProperties": false,
+ "description": "单条验证结果(mat.verify/1)。所有字段都有值——部分分支不写的键取默认,\n让\"漏写\"变成\"显式默认\"而不是\"消费方 KeyError\"。",
+ "properties": {
+  "schema": {
+   "const": "mat.verify/1",
+   "default": "mat.verify/1",
+   "title": "Schema",
+   "type": "string"
+  },
+  "verdict": {
+   "enum": [
+    "pass",
+    "fail",
+    "blocked",
+    "incomplete",
+    "error"
+   ],
+   "title": "Verdict",
+   "type": "string"
+  },
+  "ok": {
+   "title": "Ok",
+   "type": "boolean"
+  },
+  "exit_code": {
+   "title": "Exit Code",
+   "type": "integer"
+  },
+  "queued": {
+   "default": false,
+   "title": "Queued",
+   "type": "boolean"
+  },
+  "wait_ms": {
+   "default": 0,
+   "title": "Wait Ms",
+   "type": "integer"
+  },
+  "case_id": {
+   "default": "",
+   "title": "Case Id",
+   "type": "string"
+  },
+  "case_name": {
+   "default": "",
+   "title": "Case Name",
+   "type": "string"
+  },
+  "status": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Status"
+  },
+  "step_success_rate": {
+   "anyOf": [
+    {
+     "type": "number"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Step Success Rate"
+  },
+  "duration_ms": {
+   "anyOf": [
+    {
+     "type": "integer"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Duration Ms"
+  },
+  "steps": {
+   "additionalProperties": true,
+   "title": "Steps",
+   "type": "object"
+  },
+  "failed_categories": {
+   "additionalProperties": true,
+   "title": "Failed Categories",
+   "type": "object"
+  },
+  "failed_steps": {
+   "items": {
+    "additionalProperties": true,
+    "type": "object"
+   },
+   "title": "Failed Steps",
+   "type": "array"
+  },
+  "next_actions": {
+   "items": {
+    "additionalProperties": true,
+    "type": "object"
+   },
+   "title": "Next Actions",
+   "type": "array"
+  },
+  "preconditions": {
+   "items": {},
+   "title": "Preconditions",
+   "type": "array"
+  },
+  "artifacts": {
+   "additionalProperties": true,
+   "title": "Artifacts",
+   "type": "object"
+  },
+  "notes": {
+   "items": {
+    "type": "string"
+   },
+   "title": "Notes",
+   "type": "array"
+  },
+  "verified_at": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Verified At"
+  },
+  "blocked_reason": {
+   "anyOf": [
+    {
+     "enum": [
+      "device_busy",
+      "precondition"
+     ],
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Blocked Reason"
+  },
+  "blocked_preconditions": {
+   "anyOf": [
+    {
+     "items": {},
+     "type": "array"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Blocked Preconditions"
+  },
+  "install": {
+   "anyOf": [
+    {
+     "additionalProperties": true,
+     "type": "object"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Install"
+  },
+  "mode": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Mode"
+  },
+  "summary": {
+   "anyOf": [
+    {
+     "additionalProperties": true,
+     "type": "object"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Summary"
+  },
+  "selection": {
+   "anyOf": [
+    {
+     "additionalProperties": true,
+     "type": "object"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Selection"
+  },
+  "cases": {
+   "anyOf": [
+    {
+     "items": {
+      "additionalProperties": true,
+      "type": "object"
+     },
+     "type": "array"
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "default": null,
+   "title": "Cases"
+  }
+ },
+ "required": [
+  "verdict",
+  "ok",
+  "exit_code"
+ ],
+ "title": "VerifyVerdict",
+ "type": "object",
+ "$id": "mat.verify/1",
+ "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

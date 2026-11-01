@@ -19,6 +19,15 @@ const STATUS_LABEL: Record<string, { text: string; color: string }> = {
   cancelled: { text: "已中止", color: "orange" },
 };
 
+// `mat.verify/1` 的五态（与引擎 verify.py 的 verdict_of 同一套；不要另立词）
+const VERDICT_LABEL: Record<string, { text: string; color: string }> = {
+  pass: { text: "通过", color: "green" },
+  fail: { text: "失败", color: "red" },
+  blocked: { text: "拒跑", color: "orange" },
+  incomplete: { text: "未跑完", color: "blue" },
+  error: { text: "出错", color: "volcano" },
+};
+
 const CAT_LABEL: Record<string, { text: string; color: string }> = {
   "app-crash": { text: "产品bug", color: "volcano" },
   "assert-fail": { text: "断言失败", color: "gold" },
@@ -420,6 +429,43 @@ export default function Reports({ state, onLaunched }: {
                 const m = STATUS_LABEL[s || ""];
                 return m ? <Tag color={m.color}>{m.text}</Tag> : <Tag>{s}</Tag>;
               } },
+            // 验证结论（2026-11-01）：只在该工作区用过 `mat verify` 时才出现这一列——
+            // 给人看「agent 当时拿到的判定 + 下一步」，不必打开 stdout 或重跑一遍。
+            ...(rows.some((r) => !isBatchRow(r) && !isExploreRow(r) && r.verify) ? [{
+              title: "验证结论", dataIndex: "verify", width: 150,
+              render: (_: unknown, r: ReportRow) => {
+                if (isBatchRow(r) || isExploreRow(r) || !r.verify) {
+                  return <span style={{ color: "#9aa1b1" }}>—</span>;
+                }
+                const v = r.verify;
+                // 陈旧判定（2026-11-01 复核）：目录被后来的运行覆盖过 ⇒ 这条判定不是这一次的。
+                // 宁可显式说「旧判定」，也不能让「状态：失败」旁边挂一个「通过 exit 0」——
+                // 那种自相矛盾的行比不显示更坏，人一旦被误导一次就不再信这一列。
+                if (v.stale) {
+                  return (
+                    <Tooltip title="这条判定来自更早的一次验证（该目录后来又被跑过），不代表本行的运行结果。要结论请重新 mat verify。">
+                      <Tag>旧判定</Tag>
+                    </Tooltip>
+                  );
+                }
+                const m = VERDICT_LABEL[v.verdict || ""] || { text: v.verdict || "—", color: "default" };
+                const acts = v.next_actions || [];
+                const tip = acts.length ? (
+                  <div>
+                    {acts.map((a) => (
+                      <div key={a.category} style={{ marginBottom: 4 }}>
+                        <b>{a.category}</b>：{a.action}
+                      </div>
+                    ))}
+                  </div>
+                ) : "没有失败项，无需下一步";
+                return (
+                  <Tooltip title={tip}>
+                    <Tag color={m.color}>{m.text}</Tag>
+                    <span style={{ fontSize: 12, color: "#697080" }}>exit {v.exit_code}</span>
+                  </Tooltip>
+                );
+              } }] : []),
             { title: "失败分类", dataIndex: "failed_categories", width: 180,
               render: (_: unknown, r: ReportRow) => {
                 if (isExploreRow(r)) return "—";

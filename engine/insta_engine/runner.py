@@ -259,6 +259,21 @@ class StepResult(BaseModel):
     #: ⚠️ **只打标，不改 `status` / `category`**：改类别会让历史基线不可比。判据在
     #: `off_page.py`（一处实现，判读工具也调它，所以能对旧产物回溯判定）。
     off_page: str | None = None
+    #: 启动落点（2026-10-31，`landing.py`）：`"home"`（落在首页）/ `"not-home"`（落点不是
+    #: 首页，疑似上一轮残留页面或启动没走完）/ `None`（**判不了**：没图谱、图谱没 depth、
+    #: 这一屏没有被测包控件、或信号太少）。只在 `launch` 步上写。
+    #: ⚠️ **只打标，不改 `status` / `category`**（与 R16 同一条纪律）。为什么单独一个字段
+    #: 而不并进 `off_page`：`off_page` 判的是**动作之后**这一屏还是不是假设的那一页、
+    #: 且只在**失败时**算；落点判的是**动作之前**的起点、在 launch 成功时就要有。
+    #: 塞进同一字段会让"这个字段是谁写的"取决于步骤成败。
+    landing: str | None = None
+    #: 落点判据的分数（`Jaccard(当前屏骨架, 图谱根页骨架)`），便于人工复核
+    #: "0.02 和 0.79 差在哪"；判不了为 None。
+    landing_score: float | None = None
+    #: 冷启动（`launch` 前的 `app_stop`）结果：`"ok"` / `"failed"` / `"skipped"`（参数关了）。
+    #: 2026-10-31 之前这里是 `try/except: pass` ⇒ "冷启动没执行"与"执行了但没清掉残留"
+    #: 在产物里长得一模一样，2026-10-29 r3 那 4 条事后就是判不出到底跑没跑。
+    cold_start: str | None = None
     # 分类来源：None/"rules"=内置规则判定；"human"=**人工校准改判过**（见 calibration.py）。
     # 报告要能标出来 —— 否则人看不出这条结论是自己判的、还是机器判的。
     category_source: str | None = None
@@ -626,6 +641,9 @@ class Runner:
         if batch:
             run_payload["batch"] = batch
         payload = {
+            # 产物协议版本（2026-10-30）：读 run.json 的消费方（verify / 控制台 / CI）
+            # 必须有版本可判，否则字段增删只能靠猜。加字段不改旧键。
+            "schema": "mat.run/1",
             "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "device_serial": getattr(self.drv, "serial", None),
             # 平台 + 设备身份（P2.2）：对外数字必须能回答"测的是哪台、哪个系统"。
@@ -735,6 +753,57 @@ class Runner:
             return str((self.drv.foreground_app() or {}).get("package") or "")
         except Exception:      # noqa: BLE001 - 诊断信息，拿不到就空着
             return ""
+
+    def _landing_controls(self, package: str) -> list[dict]:
+        """取一屏**被测包自己的**控件摘要（落点判据的输入）。拿不到返回空列表。"""
+        from .page_index import digest_page
+
+        xml = self._safe_dump()
+        if not xml:
+            return []
+        return digest_page(xml, package).get("controls") or []
+
+    def _note_landing(self, result: StepResult, package: str) -> None:
+        """判一次「启动落点是不是首页」，写进 `result.landing` / `landing_score`。
+
+        **永不抛出**：这是增益证据，缺了不该影响执行（与 `_write_screen_evidence` 同口径）。
+        判不了（`kind is None`）时**什么都不写** —— 三档里的 `unknown` 就是"静默"，
+        不是"不是首页"（实测存量 8 条 0 控件现场全是别的 App 在前台）。
+
+        为什么判出 `not-home` 还要再看一眼：首屏可能是"还在渲染"。实测
+        `tx-f02-tab-mine-and-back/step_07` 回首页那一刻只剩底栏 16 个控件、信息流全没
+        ⇒ 单次采样会把"加载中"读成"落错页"。渲染中的页面会往上走，真的落错页不会。
+        """
+        from .landing import NOT_HOME, home_profile, landing_kind
+        from .page_index import load_index
+
+        try:
+            # 图谱路径与 `_ensure_arrival` 同约定：显式传入优先，否则 <workspace_root>/artifacts/page_index
+            index_path = self.index_path or (self.workspace_root / "artifacts" / "page_index"
+                                             / f"{package}.json")
+            index = load_index(index_path) if Path(index_path).exists() else None
+            if not index:
+                return                       # 无图谱 ⇒ 判不了（不猜）
+            profile = home_profile(index)
+            if not profile:
+                return                       # 图谱没 depth / 根页没骨架信号 ⇒ 判不了
+            kind, score = landing_kind(self._landing_controls(package), profile)
+            if kind is None:
+                return
+            if kind == NOT_HOME:
+                _pause(0.8)                  # 给"还在渲染"一次机会
+                kind2, score2 = landing_kind(self._landing_controls(package), profile)
+                if kind2 != NOT_HOME:
+                    return                   # 第二眼就不是了 ⇒ 判不了，别记成落错页
+                score = max(score or 0.0, score2 or 0.0)
+            result.landing = kind
+            result.landing_score = score
+            if kind == NOT_HOME:
+                print(f"⚠️ 启动落点不是首页（score={score}）：{package} —— "
+                      "这一步大概率是上一轮残留的页面，或启动没走完；"
+                      "失败不宜按「定位值写错 / 断言耦合」归因", file=sys.stderr)
+        except Exception:  # noqa: BLE001 —— 证据缺失不改判定（同 _write_screen_evidence）
+            pass
 
     def _rid_hints(self, case: TestCase, res_id: str) -> list[str]:
         """取某个 res-id 的历史文案线索（图谱里查）。图谱不存在/读不了就返回空，不报错。"""
@@ -864,7 +933,10 @@ class Runner:
                 result.used_strategy = element.strategy
 
             before = hashlib.md5(xml_before.encode()).hexdigest()  # 复用空闲判定的最后一次 dump
-            self._act(step, case, element, variables)
+            # ⚠️ `result=` 只在**第一次**执行时传：落点/冷启动是"这一次启动发生了什么"的证据，
+            # 重放（953）与自愈（1066）再执行一次**不该覆盖**它（第二眼的屏幕可能已经不是
+            # 起点那一屏了）。那两处刻意不传，也顺便让替身 `_act` 的签名保持原样。
+            self._act(step, case, element, variables, result=result)
             _pause(0.3)
             # 动作自身带回的可复核结论（如「清空后回读仍为 X」）。**必须落盘**：
             # `Element.clear_text` 采到了却没人拼进 warning，等于没采（与 C17 同类）。
@@ -1495,7 +1567,11 @@ class Runner:
             result.error = evidence.get("error") or "API 步骤失败（明细见报告的接口证据区块）"
         return result
 
-    def _act(self, step, case: TestCase, element: Element | None, variables: dict[str, str]) -> None:
+    def _act(self, step, case: TestCase, element: Element | None, variables: dict[str, str],
+             result: StepResult | None = None) -> None:
+        #: `result` 只为**在动作内部就能确定的证据**而传（目前只有 launch 的
+        #: `cold_start` 与 `landing`）：它们发生在 `step.target` 锚点校验之前，
+        #: 锚点校验一抛异常，动作外部就再也拿不到。可选是为了不惊动既有调用方/单测。
         # params 里显式给 null 的值不转成字符串 "None"（2026-10-12 评审🔵）：
         # 此前 params={"text": None} 会往输入框打字"None"。
         params = {k: (None if v is None else substitute_vars(str(v), variables))
@@ -1514,12 +1590,21 @@ class Runner:
             if activity:
                 safe_component(activity)
             self._launched_package = package
+            # 冷启动的**留痕**（2026-10-31）：此前是 `except: pass`，于是"冷启动没执行"
+            # 与"执行了但没清掉残留"在产物里长得一模一样——2026-10-29 r3 那 4 条整组落在
+            # 搜索页，事后就是判不出冷启动到底跑没跑（同一份产物里两种成因无法区分）。
+            cold = "skipped"
             if _cold_start_enabled(params):
                 # 冷启动：先强制停止，保证用例从已知初始态开始（消除跨用例状态污染）
                 try:
                     self.drv.app_stop(package)
-                except Exception:
-                    pass
+                    cold = "ok"
+                except Exception as exc:  # noqa: BLE001 —— 冷启动是增益，失败就退化成热启动
+                    cold = "failed"
+                    print(f"⚠️ 冷启动失败（app_stop {package}: {exc}）——"
+                          "本次从热恢复的页面开始，落点可能不是首页", file=sys.stderr)
+            if result is not None:
+                result.cold_start = cold
             started = False
             # `am_start -W` 是 **adb 命令**：iOS 上传了 serial 会白跑一次 adb 并失败
             # （真机实测 launch 多花 1-2s）。按平台门控。
@@ -1540,6 +1625,13 @@ class Runner:
             # 设备被带到别的 App 也判 passed，错误全部转嫁给下一步（并误标 locate-fail）。
             if getattr(self.drv, "platform", "android") == "android":
                 self._assert_foreground(package)
+                # 落点哨兵（2026-10-31）：launch 之后**立刻**判一次"这一屏是不是首页"。
+                # 为什么必须在这里：起点在第 1 步就错了，而第一次露头是第 4 步的
+                # `LocateFailed: text=国际 未命中`——跟"定位值写错"长得一模一样，
+                # 三道现成判据（false_red / off_page / classify_run_failures）全都不认。
+                # 详见 `landing.py`（阈值与三档语义在那里）。
+                if result is not None:
+                    self._note_landing(result, package)
             if step.target is not None:
                 # 启动后校验锚点：定位不到会抛 LocateFailed（这才是 launch 该有的失败语义）
                 resolve(self.drv, self._subst(step.target, variables), step.timeout_ms)

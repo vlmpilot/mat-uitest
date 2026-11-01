@@ -39,11 +39,15 @@ def server(tmp_path, monkeypatch):
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
-    for _ in range(30):  # 等端口就绪
+    # 等端口就绪：首个请求要付**冷启动**的账（设备枚举要跑 hdc/adb 子进程、字体扫描等，
+    # 2026-10-31 实测 macOS+DevEco 上 hdc list targets 单次 1.3s）——
+    # 旧写法 timeout=1 且只 catch ConnectionError，冷启动一慢就抛 ReadTimeout 把整文件
+    # 25 条用例判成 error（看着像代码坏了，其实是夹具太紧）。放宽到 5s 并一并重试超时。
+    for _ in range(40):  # 等端口就绪
         try:
-            requests.get(f"{base}/api/state", timeout=1)
+            requests.get(f"{base}/api/state", timeout=5)
             break
-        except requests.ConnectionError:
+        except (requests.ConnectionError, requests.ReadTimeout):
             time.sleep(0.1)
     yield base, tmp_path
     srv.shutdown()          # 关键：跑完就关，不留线程
@@ -1866,3 +1870,103 @@ def test_finetune_stats_and_export(server):
     row = json.loads((root / "dataset" / "holdout.jsonl").read_text(
         encoding="utf-8").splitlines()[0])
     assert row["messages"][0]["role"] == "user", "JSONL 必须是 mlx_lm chat 形状"
+
+
+def test_list_runs_carries_verify_summary(tmp_path):
+    """报告列表要带出 `mat verify` 的判定（控制台「验证结论」列的数据源）。
+
+    只带四项（verdict/exit_code/ok/summary/next_actions）——完整判定在 verify.json 里，
+    `/api/state` 是 5s 轮询，不该背大对象。
+    """
+    from insta_engine.web_api.workspace import _verify_summary
+
+    run_dir = tmp_path / "artifacts" / "verify" / "case-20261101-000000"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text('{"run": {"case_id": "c1", "status": "failed"}}',
+                                      encoding="utf-8")
+
+    assert _verify_summary(run_dir) is None, "没有 verify.json 时不要凭空造判定"
+
+    (run_dir / "verify.json").write_text(json.dumps({
+        "schema": "mat.verify/1", "verdict": "fail", "ok": False, "exit_code": 2,
+        "case_id": "c1", "summary": {"failed": 1},
+        "failed_steps": [{"step_id": "s1", "error": "x" * 500}],
+        "next_actions": [{"category": "locate-fail", "action": "看控件树"}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    got = _verify_summary(run_dir)
+    assert got == {"verdict": "fail", "exit_code": 2, "ok": False,
+                   "summary": {"failed": 1},
+                   "next_actions": [{"category": "locate-fail", "action": "看控件树"}],
+                   "stale": False}
+    assert "failed_steps" not in got, "列表用不到逐步骤明细，别塞进轮询接口"
+
+
+def test_verify_summary_marks_stale_when_run_is_newer(tmp_path):
+    """目录被后来的运行覆盖过 ⇒ 判定要标 `stale`，不能让「失败」旁边挂「通过」。
+
+    回归锁（2026-11-01 复核）：`mat verify --artifacts artifacts/<stem>` 之后再在控制台
+    重跑同一条用例（控制台单条跑用的是**固定目录** `artifacts/<stem>`），run.json 被覆盖、
+    verify.json 留着 ⇒ 实测渲染成「状态：失败」+「验证结论：通过 exit 0」。
+    """
+    import os
+
+    from insta_engine.web_api.workspace import _verify_summary
+
+    run_dir = tmp_path / "artifacts" / "case-a"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text('{"run": {"case_id": "c1", "status": "failed"}}',
+                                      encoding="utf-8")
+    (run_dir / "verify.json").write_text(json.dumps({
+        "schema": "mat.verify/1", "verdict": "pass", "ok": True, "exit_code": 0,
+        "case_id": "c1", "summary": {"passed": 1}, "next_actions": [],
+    }), encoding="utf-8")
+    # 判定写在更早那次运行上：verify.json 比 run.json 旧
+    os.utime(run_dir / "verify.json", (1_700_000_000, 1_700_000_000))
+    os.utime(run_dir / "run.json", (1_700_000_900, 1_700_000_900))
+
+    got = _verify_summary(run_dir, "c1")
+    assert got is not None, "判定本身还在，不能静默丢掉"
+    assert got["stale"] is True
+
+
+def test_verify_summary_marks_stale_when_case_id_differs(tmp_path):
+    """同目录里躺着**另一条用例**的判定（手工把产物拷来拷去）⇒ 也标 stale。"""
+    from insta_engine.web_api.workspace import _verify_summary
+
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text('{"run": {"case_id": "c2", "status": "passed"}}',
+                                      encoding="utf-8")
+    (run_dir / "verify.json").write_text(json.dumps({
+        "verdict": "fail", "exit_code": 2, "ok": False, "case_id": "c1",
+        "summary": {}, "next_actions": [],
+    }), encoding="utf-8")
+
+    assert _verify_summary(run_dir, "c2")["stale"] is True
+
+
+def test_verify_summary_keeps_verdict_when_run_json_missing(tmp_path):
+    """没有 run.json（崩在落盘之前）⇒ 不因此丢掉判定，也不误判成 stale。"""
+    from insta_engine.web_api.workspace import _verify_summary
+
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    (run_dir / "verify.json").write_text(json.dumps({
+        "verdict": "error", "exit_code": 1, "ok": False, "case_id": "c1",
+        "summary": {}, "next_actions": [],
+    }), encoding="utf-8")
+
+    got = _verify_summary(run_dir, "c1")
+    assert got["verdict"] == "error" and got["stale"] is False
+
+
+def test_list_runs_ignores_corrupt_verify_json(tmp_path):
+    """verify.json 坏了就当没有——一个坏文件不该让整个报告列表 500。"""
+    from insta_engine.web_api.workspace import _verify_summary
+
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    (run_dir / "verify.json").write_text("{not json", encoding="utf-8")
+
+    assert _verify_summary(run_dir) is None

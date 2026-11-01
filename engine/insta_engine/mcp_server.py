@@ -73,6 +73,67 @@ def build_server(root: Path):
         return obj if code == 200 else {"error": obj}
 
     @mcp.tool()
+    def mat_doctor(platform: str = "android") -> dict:
+        """环境自检（**结构化**）：开工前先跑它，别让 agent 去读人看的终端文本。
+
+        `platform` ∈ android / ios / harmony / all。返回：
+        - `ok`：没有阻塞项时为 true（warn 不算阻塞）；
+        - `checks[]`：逐项 `{id, label, status(ok|warn|fail), critical, detail, hint, fix}`；
+        - `blocking[]` / `warnings[]`：按状态分好的子集，`hint` 就是**下一步该做什么**；
+        - `duration_ms`：这次探测花了多久（所有探测都有超时，不会挂死）。
+        常见阻塞：adb 不在 PATH、没有设备、AI 配置缺失、用例质量闸不通过。
+
+        ⚠️ `platform` 拼错**不会**报错兜底成 android，而是直接返回 `error`：
+        `doctor.run()` 对未知取值一律返回**全平台**检查（`doctor.py:696`），
+        照原样透传会把 iOS/harmony 的阻塞项算进 `ok`——agent 看到 `ok=false`
+        却在自己的平台上找不到对应问题（2026-11-01 复核实测：`platform="foo"`
+        返回 18 条检查，android 只有 8 条）。
+        """
+        plat = (platform or "android").strip().lower()
+        if plat not in ("android", "ios", "harmony", "all"):
+            return {"error": f"未知 platform：{platform}（可选 android / ios / harmony / all）"}
+        code, obj = ws.api_doctor(plat, root)
+        if code != 200:
+            return {"error": obj}
+        checks = obj.get("checks") or []
+        blocking = [c for c in checks if c.get("status") == "fail"]
+        warnings = [c for c in checks if c.get("status") == "warn"]
+        return {"ok": not blocking, "platform": plat,
+                "blocking": blocking, "warnings": warnings,
+                "checks": checks, "ran_at": obj.get("ran_at"),
+                "duration_ms": obj.get("duration_ms")}
+
+    @mcp.tool()
+    def mat_cred(action: str = "list", name: str | None = None,
+                 value: str | None = None) -> dict:
+        """凭据管理（用例里以 `${cred.名称}` 引用，报告与日志不回显值）。
+
+        - `action="list"`：只返回**名称**，永不回值；
+        - `action="set"` + `name` + `value`：保存/覆盖；
+        - `action="delete"` + `name`：删除。
+
+        ⚠️ 走这条路，值会经过对话上下文（模型看得到）。凭据敏感时优先让用户在终端跑
+        `mat cred set <名称> --stdin`（值从 stdin 读，不进 shell history、也不进对话）。
+        """
+        from .credentials import CredentialStore
+
+        store = CredentialStore()
+        act = (action or "list").strip().lower()
+        if act == "list":
+            return {"names": store.names()}
+        if not (name or "").strip():
+            return {"error": f"action={act} 需要 name"}
+        key = name.strip()
+        if act == "set":
+            if value is None or value == "":
+                return {"error": "action=set 需要 value（或让用户用 mat cred set --stdin）"}
+            store.set(key, value)
+            return {"saved": key, "names": store.names()}
+        if act == "delete":
+            return {"deleted": store.delete(key), "names": store.names()}
+        return {"error": f"未知 action：{action}（list / set / delete）"}
+
+    @mcp.tool()
     def mat_list_cases() -> dict:
         """列出工作区全部测试用例（名称、被测应用）。"""
         code, obj = ws.api_state(root)
@@ -110,6 +171,80 @@ def build_server(root: Path):
         """
         code, obj = ws.api_run(root, {"case": case, "serial": serial, "platform": platform})
         return obj if code == 200 else {"error": obj}
+
+    @mcp.tool()
+    def mat_verify(case: str | None = None, subset: str | None = None,
+                   serial: str | None = None, platform: str = "android",
+                   timeout_s: float | None = 180, apk: str | None = None,
+                   package: str | None = None,
+                   max_duration: float | None = 300) -> dict:
+        """验证用例并**直接返回结论**（不返回 job_id）——给编码 agent 的自检门面。
+
+        两种模式（二选一，同时给会报错）：
+        - 单条：`case="登录.json"`；
+        - 批量：`subset="smoke"|"last-failed"|"changed"` + `package="com.x"`，
+          返回聚合结论（`summary` 计数 + `next_actions` 按失败频次给出先修哪个）。
+
+        何时用它而不是 mat_run_case：你要的是「改完代码后，这次改动是否通过」的判定，
+        不是过程事件流。返回 `mat.verify/1`：
+        - `ok` / `verdict`（pass/fail/blocked/incomplete/error）/ `exit_code`
+        - `failed_steps`：每一步的失败分类 + 证据相对路径（截图 / 控件树 / logcat）
+        - `next_actions`：按分类给出的**下一步该做什么**（先看哪份证据、修代码还是修用例）
+        ⚠️ 同步阻塞（单次执行时长 = 用例时长），设备被占用时会排队而不是并发跑。
+        ⚠️ 批量只跑 `target.package` 与 `package` 相同的用例；子集为空 ⇒ `blocked`，
+        绝不报 pass。
+        """
+        from . import verify as verify_mod
+
+        if case and subset:
+            return {"error": "case 与 subset 互斥：单条给 case，批量给 subset"}
+        if not case and not subset:
+            return {"error": "缺少参数：单条给 case，批量给 subset=smoke|last-failed|changed"}
+
+        if subset:
+            from . import verify_subset as subset_mod
+            from .pkgname import safe_package_name
+
+            if not (package or "").strip():
+                return {"error": "subset 需要 package（如 com.example.app）——"
+                                 "子集按「包名 + 模式」分键，缺包名无法确定用例范围"}
+            try:
+                pkg = safe_package_name(package)
+            except ValueError as exc:
+                return {"error": f"包名不合法：{exc}"}
+            return subset_mod.run_subset(
+                root, subset_mod.collect_cases(root), mode=subset, package=pkg,
+                serial=serial, platform=platform, timeout_s=timeout_s,
+                apk=Path(apk) if apk else None,
+                max_duration=max_duration,
+                artifacts=root / "artifacts" / "verify")
+
+        case_path = root / "cases" / case
+        if "/" in case or ".." in case or not case_path.exists():
+            return {"error": f"用例不存在: {case}"}
+        _code, verdict = verify_mod.run_verify(root, case_path, serial=serial,
+                                               platform=platform, timeout_s=timeout_s,
+                                               apk=Path(apk) if apk else None,
+                                               package=package)
+        # 不额外塞 `mcp_exit_code`：`exit_code` 已在 verdict 里，而 schema 是
+        # `additionalProperties: false`（2026-10-31 评审 P1-3）——多一个键，agent 拿
+        # 我们**自己发布**的 schema 校验 MCP 响应就会判非法。协议之外的字段一律不加。
+        return verdict
+
+    @mcp.tool()
+    def mat_screenshot(serial: str | None = None, include_image: bool = True,
+                       max_edge: int = 1280) -> list:
+        """截当前屏幕"看一眼现场"：返回 1 个元数据 + 1 张缩略图（JPEG，最长边 ≤ max_edge）。
+
+        为什么返回图而不只是路径：agent 读不了本地文件，只给路径等于没给。
+        原图落盘 `artifacts/verify/_screens/`（保留最近 200 张 / 7 天），
+        内联的是缩略图（默认 1280，`include_image=False` 时只返回元数据）。
+        只读：不点击、不改 App 状态；无设备时返回 ok=false 而不抛。
+        """
+        from . import verify as verify_mod
+
+        result = verify_mod.capture_screen(root, serial=serial, max_edge=max_edge)
+        return verify_mod.build_screenshot_content(result, include_image=include_image)
 
     @mcp.tool()
     def mat_run_app(app: str, serial: str | None = None,

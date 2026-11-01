@@ -119,10 +119,11 @@ GEN_PROMPT_MODE=server
 ## AI 编程助手接入
 
 - **skill**（教助手何时跑用例、何时探索、怎么读结果）：`mat skill install` —— 把随包的 `mobileapp-testing` 装进 AI 助手的 skill 目录（默认 `~/.claude/skills/`；WorkBuddy 用 `--target workbuddy`，其他助手用 `--dir <目录>`）；`mat skill path` 打印包内位置供手动复制。装完开新会话才会加载。助手不能执行终端命令时，从 [mat-skill](https://github.com/vlmpilot/mat-skill) 取 `mobileapp-testing/` 目录直接导入（手动拷贝的副本不会自动更新）
-- **MCP**（让 Cursor / Codex / WorkBuddy 等直接驱动 `mat`）：装带 `[mcp]` extra 的包，再把 `mat mcp` 配进助手的 MCP 配置
+- **MCP**（让 Cursor / Codex / WorkBuddy 等直接驱动 `mat`）：装带 `[mcp]` extra 的包，再一条命令注册进助手
   - Windows：`py -m pip install --user "mat-uitest[mcp]"`
   - macOS / Linux：`uv tool install 'mat-uitest[mcp]'`（已装过普通版再跑这条即可带上 MCP 依赖；pipx 用户等价写法 `pipx install 'mat-uitest[mcp]'`）
-  - 配置片段（Cursor / CodeBuddy / Trae 通用）：`{"mcpServers": {"mat": {"type": "stdio", "command": "mat", "args": ["mcp"]}}}`；先手动跑一次 `mat mcp`，看到 `MAT MCP 就绪` 再填进 IDE
+  - 注册：`mat mcp install` —— **不用说你用的是哪个助手**，它自己检测本机装的是 Cursor / Trae / Claude Desktop / WorkBuddy，写进对应配置并告诉你写到了哪、旧文件备份在哪、怎么撤销（`mat mcp uninstall`）。装了多个会列出可选的 `--target`；一个都没检测到说明客户端还没装或没启动过
+  - 想看要写什么再动手：`mat mcp show`（打印可粘贴片段）；支持哪些客户端：`mat mcp targets`
 
 ## 开发
 

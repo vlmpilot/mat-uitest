@@ -204,3 +204,30 @@ def test_cmd_skill_install_then_conflict_exit_codes(tmp_path, capsys):
 def test_cmd_skill_install_rejects_unknown_target(capsys):
     assert cmd_skill(_args(skill_cmd="install", target="cursor")) == 1
     assert "--target" in capsys.readouterr().out
+
+
+# -- 默认落点提醒（2026-10-31 一致性巡检）---------------------------------------
+
+def test_default_target_hint_when_other_clients_exist(tmp_path, monkeypatch):
+    """默认装 claude 时，若本机还有别的助手，要给出重跑命令。
+
+    动机：`mat mcp install` 会自动检测客户端，skill 这条保留 claude 默认；沉默地把 skill
+    装进用户不用的目录，比报错更难发现（人以为装好了，助手永远读不到）。
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".workbuddy").mkdir()
+
+    hint = skill.default_target_hint(None)
+    assert hint and "workbuddy" in hint and "--target" in hint
+
+    # 显式指定了落点就不要再唠叨
+    assert skill.default_target_hint("claude") is None
+    assert skill.default_target_hint(None, str(tmp_path / "custom")) is None
+
+
+def test_default_target_hint_silent_when_only_claude(tmp_path, monkeypatch):
+    """只有 claude 时不该多话——提醒太多等于噪音。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude").mkdir()
+
+    assert skill.default_target_hint(None) is None

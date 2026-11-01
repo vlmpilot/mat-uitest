@@ -15,10 +15,15 @@ from typing import Any
 from .driver_base import BaseDriver
 from .dsl import VISION_LLM_MISUSE_HINT, Locator, LocatorStrategy
 
+#: 密码框回读的掩码字符：Android 标准 `PasswordTransformationMethod` 用的是 `•`（U+2022），
+#: 少数自绘 UI 用 `●`。用途见 `Element._is_password`（u2 的 `info` 不带 `password` 键）。
+#: ⚠️ **刻意不收 `*`**：`test_locator_index` 里有个真实现场——金额字段回读被 App 写成
+#: `***`（变了但不含目标），那条要记 `note` 交给人判；把 `*` 算成掩码会把它静默放过。
+_MASK_CHARS = frozenset("•●")
+
 
 class LocatorNotSupported(RuntimeError):
     """策略未实现或属闭源边界。"""
-
 
 class LocateFailed(RuntimeError):
     """策略链全部未命中。"""
@@ -135,7 +140,17 @@ class Element:
 
     def _is_password(self) -> bool:
         info = getattr(self.node, "info", None)
-        return isinstance(info, dict) and bool(info.get("password"))
+        if isinstance(info, dict) and info.get("password"):
+            return True
+        # ⚠️ **u2 的 `info` 里没有 `password` 这个键**（2026-10-31 实测：XML 上写着
+        # `password="true"`，而 `info` 的 17 个键里没有它）⇒ 上面那条判据**永远不成立**，
+        # 于是 `_input_landed` 拿掩码「••••」去比明文「pass1234」⇒ 判"未生效"⇒ 走二级
+        # 通道**把文本打两遍**（InstaDemo 密码框实测 8 字符变 16 字符 ⇒ 登录必报
+        # 「账号或密码错误（1）」⇒ 冒烟② 稳定红 3/3）。
+        # 补一条按**回读形态**判：整段都是掩码字符 ⇒ 密码框。
+        # 代价：字段内容真的只有 `*`/`•` 时会被误判成密码框（那时不校验回读），可接受。
+        readback, known = self._read_text()
+        return bool(known and readback) and all(ch in _MASK_CHARS for ch in readback.strip())
 
     def _read_text(self) -> tuple[str | None, bool]:
         """回读文本：`(text, known)`。**`known=False` 表示读不到**，不是空。
