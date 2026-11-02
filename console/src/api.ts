@@ -27,7 +27,7 @@ export type StateResp = {
     calibrated?: boolean; finished_at?: string }[];
   indexes: { package: string; pages: number; generated_at?: string }[];
   usage: { gen_count: number; gen_limit: number | null; vision_count: number; vision_limit: number | null };
-  /** AI 接入方式：server=官方代理（体验模式）/ local=自带 Key（标准模式） */
+  /** AI 接入方式：server=官方代理 / local=自带 Key（**不是**使用方式，后者看 license.plan） */
   ai_mode?: "server" | "local";
   // 使用方式页「套餐」行展示到期日：plan=pro 时有 expires_at（Unix 秒）；free/过期时为 null。
   // 激活/续期（含时长卡核销换码）写盘 license.json 后，重拉 state 自然拿到新日期。

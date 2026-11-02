@@ -47,8 +47,10 @@ def __getattr__(name: str):
 BETA_PUBLIC_SIGNING_KEY = "mat-beta-public-2026"
 
 #: 档位显示名——**用户可见文案的唯一映射**。内部标识（free/pro/team/private）不变，
-#: 只在打印时翻译；否则 CLI 会直接吐 `已激活 pro`，而手册写的是「标准版」。
-PLAN_LABELS = {"free": "体验版", "pro": "标准版", "team": "团队版", "private": "私有化"}
+#: 只在打印时翻译；否则 CLI 会直接吐 `已激活 pro`。
+#: 2026-11-02 起只有两种使用方式：体验并入单人（装完即用、不需要激活码），
+#: 标准更名为单人。所以 free 与 pro 打印**同一个**「单人版」——它们是同一档。
+PLAN_LABELS = {"free": "单人版", "pro": "单人版", "team": "团队版", "private": "私有化"}
 
 
 def plan_label(plan: str) -> str:

@@ -42,14 +42,14 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
     <>
       <Descriptions size="small" column={1} bordered>
         {/* 两个独立维度（2026-10-24 修正）：此前把「模式」和「AI 接入」压成一维，
-            让「标准模式」看起来只能自带 API Key。实际标准模式走官方代理也合法。
+            让「单人模式」看起来只能自带 API Key。实际单人模式走官方代理也合法。
             功能不分档全员一致，商业化只控官方代理额度与团队人数——不裸露 free/pro */}
         <Descriptions.Item label="使用方式">
           <Tag color={state.license?.plan === "free" || !state.license?.plan ? "default" : "gold"}
             style={{ marginInlineEnd: 0 }}>
             {usageModeLabel(state.license?.plan)}
           </Tag>
-          {/* 到期日（2026-10-13）：标准模式才显示，绿色强调；激活/续期（含时长卡核销
+          {/* 到期日（2026-10-13）：有激活码授权才显示，绿色强调；激活/续期（含时长卡核销
               换码）写盘后 onRefresh 重拉 state，这里自然更新 */}
           {state.license?.plan === "pro" && state.license?.expires_at ? (
             <Typography.Text style={{ color: "#389e0d", fontWeight: 600, marginLeft: 8 }}>
@@ -68,7 +68,8 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
           </Typography.Text>
         </Descriptions.Item>
         <Descriptions.Item label="激活/续期">
-          标准模式凭激活码开启（官方代理：生成 300 次/月、视觉 100 次/月）；
+          单人模式装完即用，不需要激活码（官方代理：生成 300 次/月、视觉 100 次/月）；
+          早期购买的激活码仍可在这里激活，额度相同。
           获取方式见<a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">官网联系</a>。
           <Space.Compact style={{ marginTop: 8, display: "flex" }}>
             <Input placeholder="MAT2-…" value={code}
@@ -181,20 +182,19 @@ function ExportTab() {
 // 所以不限制"只能删自己"。
 // 「联系客服」跳官网联系区（发起人 2026-10-15）：二维码素材不随包分发（PyPI/公开仓均不含），
 // 官网 #contact 联系区有公众号二维码，点击跳转扫码即可。
-/** 使用方式（与「AI 接入」是两个维度）：free=体验模式、pro=标准模式、team/private=团队模式 */
+/** 使用方式（与「AI 接入」是两个维度）：单人=free/pro、团队=team/private
+ *  （2026-11-02：体验并入单人、标准更名为单人，free 与 pro 打印同一个名字） */
 function planLabel(plan?: string): string {
   const p = (plan || "free").toLowerCase();
-  if (p === "free") return "体验版";
   if (p === "team") return "团队版";
   if (p === "private") return "私有化";
-  return "标准版";
+  return "单人版";
 }
 
 function usageModeLabel(plan?: string): string {
   const p = (plan || "free").toLowerCase();
-  if (p === "free") return "体验模式";
   if (p === "team" || p === "private") return "团队模式";
-  return "标准模式";
+  return "单人模式";
 }
 
 function WxContact() {

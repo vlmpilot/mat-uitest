@@ -412,6 +412,42 @@ def test_install_apk_rejects_outside_workspace(tmp_path):
     assert fake.calls == [], "拒绝路径不得执行任何 adb"
 
 
+def test_install_apk_rejects_sibling_dir_with_shared_prefix(tmp_path):
+    """工作区 `<root>-evil` 与 root 共享字符串前缀——必须按路径语义拒绝。
+
+    回归锁（2026-11-02 复核）：原实现用 `str(resolved).startswith(str(root))`，
+    `/tmp/ws-evil/a.apk` 会通过校验（它以 `/tmp/ws` 开头）。
+    """
+    root = tmp_path / "ws"
+    root.mkdir()
+    sibling = tmp_path / "ws-evil"
+    sibling.mkdir()
+    apk = sibling / "evil.apk"
+    apk.write_bytes(b"PK")
+    fake = _FakeAdb()
+    with pytest.raises(ValueError, match="工作区外"):
+        v.install_apk(root, fake, "serial-a", apk, "com.x")
+    assert fake.calls == [], "兄弟目录同样不得执行任何 adb"
+
+
+def test_apk_package_name_tolerates_truncated_axml(tmp_path):
+    """畸形 AXML 必须收敛成 None（走装后兜底），不能让 struct.error 冒到顶层。
+
+    回归锁（2026-11-02 复核）：截断的字符串池会让 `struct.unpack_from` 抛
+    `struct.error`，而调用方只处理 `ValueError` ⇒ verify 变 traceback、没有 JSON 结论。
+    """
+    import struct
+    import zipfile
+
+    from insta_engine.apkmeta import read_package_name
+
+    bad = tmp_path / "bad.apk"
+    xml = struct.pack("<HHI", 3, 8, 16) + struct.pack("<HHI", 1, 28, 8)
+    with zipfile.ZipFile(bad, "w") as zf:
+        zf.writestr("AndroidManifest.xml", xml)
+    assert read_package_name(bad) is None
+
+
 def test_install_apk_rejects_non_apk(tmp_path):
     from insta_engine import verify as v
 
@@ -603,6 +639,53 @@ def test_run_subset_aggregates_pass(tmp_path, monkeypatch):
     assert out["verdict"] == "pass" and out["exit_code"] == 0
     assert out["summary"]["selected"] == 2 and out["summary"]["passed"] == 2
     assert [c["case_id"] for c in out["cases"]] == ["a", "b"]
+
+
+def test_run_subset_passes_remaining_budget_as_execute_timeout(tmp_path, monkeypatch):
+    """批量预算必须变成**执行**上限，而不是只在事后扣减（2026-11-02 复核）。
+
+    回归锁：一条卡死的用例会拖死整批，`max_duration` 对 agent 就没意义了。
+    """
+    from insta_engine import verify_subset as vs
+
+    seen: dict = {}
+
+    def fake(root, path, **kwargs):
+        seen.update(kwargs)
+        return 0, {"case_id": path.stem, "verdict": "pass", "duration_ms": 1,
+                   "failed_categories": {}, "artifacts": {}}
+
+    monkeypatch.setattr(v, "run_verify", fake)
+    c1 = _mk_case_file(tmp_path, "a", "case_a")
+    vs.run_subset(tmp_path, [c1], mode="smoke", package="com.real.app",
+                  max_duration=42)
+    assert seen["execute_timeout_s"] == 42
+
+
+def test_run_verify_cancelled_is_incomplete_not_fail(tmp_path, monkeypatch):
+    """执行被中止（超时/调用方取消）⇒ incomplete(4)，不能谎报成用例失败(2)。"""
+    from insta_engine.runner import RunResult
+
+    class Drv:
+        serial = "TEST-SERIAL-A"
+        platform = "android"
+
+    class FakeRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, case, cancel_event=None):
+            assert cancel_event is not None, "execution timeout must hand an Event to Runner"
+            return RunResult(case_id="c1", case_name="n", status="cancelled")
+
+    monkeypatch.setattr("insta_engine.__main__._connect_driver", lambda *a, **k: Drv())
+    monkeypatch.setattr("insta_engine.runner.Runner", FakeRunner)
+    monkeypatch.setattr(v, "_console_busy", lambda *a, **k: None)
+    monkeypatch.setattr("insta_engine.report.render_html", lambda *a, **k: None)
+    code, out = v.run_verify(tmp_path, _write_case(tmp_path), serial="TEST-SERIAL-A",
+                             execute_timeout_s=0.01)
+    assert code == 4 and out["verdict"] == "incomplete"
+    assert any("中止" in n for n in out["notes"])
 
 
 def test_run_subset_empty_selection_is_blocked(tmp_path):
@@ -876,6 +959,54 @@ def test_aggregate_carries_next_actions_and_subset_mode():
     from insta_engine.verify_models import VerifyVerdict
 
     VerifyVerdict.model_validate(out)
+
+
+def test_aggregate_counts_error_and_keeps_blocked_reason():
+    """summary 必须有 error 计数，cases[] 必须带 blocked_reason（2026-11-02 复核）。
+
+    回归锁：全序里有 error，summary 却没有它 ⇒ 批量里出现「没跑成」时
+    `selected != passed+failed+blocked+incomplete`，agent 无法核对谁没跑；
+    `cases[]` 丢掉 blocked_reason 后，agent 也看不出该等设备还是改用例。
+    """
+    from insta_engine import verify_subset as vs
+
+    results = [
+        {"case_id": "a", "verdict": "error", "duration_ms": 0,
+         "failed_categories": {}, "artifacts": {}},
+        {"case_id": "b", "verdict": "blocked", "blocked_reason": "device_busy",
+         "duration_ms": 0, "failed_categories": {}, "artifacts": {}},
+    ]
+    out = vs.aggregate("smoke", results, {"mode": "smoke", "considered": 2, "selected": 2})
+    sm = out["summary"]
+    assert sm["error"] == 1 and sm["blocked"] == 1
+    assert sm["selected"] == (sm["passed"] + sm["failed"] + sm["blocked"]
+                              + sm["incomplete"] + sm["error"])
+    blocked = next(c for c in out["cases"] if c["case_id"] == "b")
+    assert blocked["blocked_reason"] == "device_busy"
+
+
+def test_history_drops_orphan_entries_after_run_deleted(tmp_path):
+    """run.json 被删后，索引不能继续用它驱动 last-failed（2026-11-02 复核）。
+
+    回归锁：`build_history` 原先把历史 entries 只增不减地累加——产物目录清理过，
+    一条已经不存在的 run 仍会让 `last-failed` 选中对应用例（运行时再失败一次）。
+    """
+    from insta_engine import verify_subset as vs
+
+    run_dir = tmp_path / "artifacts" / "r-orphan"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "case": {"caseId": "c-orphan"}, "run": {"status": "failed"},
+        "finished_at": "2026-10-01T00:00:00Z"}), encoding="utf-8")
+    first = vs.build_history(tmp_path, force=True)
+    assert "c-orphan" in first
+
+    (run_dir / "run.json").unlink()
+    second = vs.build_history(tmp_path)
+    assert "c-orphan" not in second
+    index = json.loads((tmp_path / "artifacts" / "verify" / "_history.json")
+                       .read_text(encoding="utf-8"))
+    assert index["__meta__"]["mtimes"] == {}, "失效的 mtime 也要回收，索引不能只增不减"
 
 
 def test_history_excludes_date_named_batch_runs(tmp_path):

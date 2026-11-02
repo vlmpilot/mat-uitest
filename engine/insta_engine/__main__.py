@@ -396,7 +396,7 @@ def cmd_verify(args) -> int:
             print(f"=== 子集 {args.subset}: {agg['verdict']} ===")
             print(f"  选中 {sm.get('selected', 0)} · 通过 {sm.get('passed', 0)} · "
                   f"失败 {sm.get('failed', 0)} · 拒跑 {sm.get('blocked', 0)} · "
-                  f"未跑完 {sm.get('incomplete', 0)}")
+                  f"未跑完 {sm.get('incomplete', 0)} · 错误 {sm.get('error', 0)}")
             for note in agg.get("notes") or []:
                 print(f"  ⚠️ {note}")
         return agg["exit_code"]
@@ -1940,19 +1940,20 @@ def _byok_note(usage: dict, kind: str) -> str:
 def _usage_mode_label(plan: str | None) -> str:
     """**使用方式**（与「AI 接入」是两个独立维度，2026-10-24）。
 
-    - `free`（未激活）⇒ 体验模式
-    - `pro`（激活的标准授权）⇒ 标准模式 —— 它**既能**走官方代理，**也能**自带 API Key
+    - `free`（未激活）/ `pro`（早期激活码）⇒ **单人模式**
     - `team` / `private`（团队授权）⇒ 团队模式
 
-    ⚠️ 别把「模式」和「AI 接入」压成一维：标准模式 + 自带 API Key 是合法组合，
+    2026-11-02 起只有这两种：体验模式并入单人模式（装完即用、不需要激活码），
+    标准模式更名为单人模式（两者额度相同，都是 300/100）。所以 `free` 与 `pro`
+    必须打印**同一个词**——它们已经是同一档。
+
+    ⚠️ 别把「模式」和「AI 接入」压成一维：单人模式 + 自带 API Key 是合法组合，
     它不该被显示成「自带 API Key 模式」。AI 接入由调用方单独打印。
     """
     p = (plan or "free").lower()
-    if p == "free":
-        return "体验模式"
     if p in ("team", "private"):
         return "团队模式"
-    return "标准模式"
+    return "单人模式"
 
 
 def _license_status_lines() -> list[str]:
@@ -1978,8 +1979,13 @@ def _license_status_lines() -> list[str]:
 
 
 def _entitlement_status_line() -> str | None:
-    """`mat status` 里的授权行（P0-3）：v2 显示套餐/席位/功能；v2 坏档给可行动提示。"""
+    """`mat status` 里的授权行（P0-3）：v2 显示套餐/席位/功能；v2 坏档给可行动提示。
+
+    档位用 `plan_label` 翻译成「单人版 / 团队版 / 私有化」——这里原来直接打内部标识
+    （`team` / `private`），用户看到的是代码里的名字（2026-11-02 统一口径）。
+    """
     from .entitlements import current as _cur
+    from .licensing import plan_label
 
     ent = _cur()
     if ent.error:
@@ -1988,8 +1994,8 @@ def _entitlement_status_line() -> str | None:
     if ent.source == "v2":
         feats = "、".join(sorted(ent.features)) or "—"
         seats = ent.seats if ent.seats is not None else "—"
-        return (f"授权: {ent.plan}（v2 · {ent.license_id or '—'} · {ent.customer or '未署名'}）"
-                f"· 席位 {seats} · 功能 {feats}")
+        return (f"授权: {plan_label(ent.plan)}（v2 · {ent.license_id or '—'} · "
+                f"{ent.customer or '未署名'}）· 席位 {seats} · 功能 {feats}")
     return None
 
 
@@ -2809,6 +2815,11 @@ def cmd_console(args) -> int:
     except (CloudError, OSError):
         pass
     url = f"http://127.0.0.1:{args.port}"
+    # 冷启动预热（2026-11-02）：首个 /api/state 要解析全部 run.json（现网 2479 份实测
+    # 7–11 秒），而前端每 5s 轮询一次——不预热的话第一屏永远在追。失败静默。
+    from .web_api.workspace import warm_runs_cache
+
+    threading.Thread(target=warm_runs_cache, args=(root,), daemon=True).start()
     print(f"控制台: {url}  （Ctrl+C 退出）")
     if getattr(args, "share", False):
         # T55 P0：局域网分享——报告/执行页可从同网段浏览器直开，数据零出域。
@@ -2831,8 +2842,8 @@ def cmd_console(args) -> int:
         access_code = None
     print("下一步: 手机插上 → 用例工作台运行 → 执行页看事件流 → 报告页看结果")
     if not args.no_open:
-        import threading
         import webbrowser
+
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     serve_kwargs = {"root": root,
                     "host": "0.0.0.0" if getattr(args, "share", False) else "127.0.0.1"}

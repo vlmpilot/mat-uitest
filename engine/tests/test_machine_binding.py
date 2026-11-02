@@ -126,7 +126,7 @@ def test_activate_registers_on_server_and_prints_the_env_hint(monkeypatch, capsy
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
-    assert "已激活 标准版" in out
+    assert "已激活 单人版" in out
     assert "1/2 台机器" in out
     assert "GEN_API_KEY=srv-tok" in out
 
@@ -149,7 +149,7 @@ def test_local_activation_succeeds_when_the_server_is_unreachable(monkeypatch, c
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
-    assert "已激活 标准版" in out, "本地激活必须成功"
+    assert "已激活 单人版" in out, "本地激活必须成功"
     assert licensing.read_license()["plan"] == "pro"
     assert "服务端登记未完成" in out
     assert "本地授权已生效" in out
@@ -175,7 +175,7 @@ def test_activate_reports_the_machine_limit_rejection(monkeypatch, capsys):
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
-    assert "已激活 标准版" in out
+    assert "已激活 单人版" in out
     assert "409" in out and "已绑定 2 台机器" in out
     assert licensing.read_license()["plan"] == "pro"
 
@@ -420,10 +420,10 @@ def test_cloudapi_is_not_imported_by_other_cli_modules():
 
 
 def test_status_server_line_uses_the_token_plan(monkeypatch, tmp_path, capsys):
-    """团队凭证不能显示成「服务端授权（标准版）」——同一屏两个档位自相矛盾。
+    """团队凭证不能显示成「服务端授权（单人版）」——同一屏两个档位自相矛盾。
 
     回归锁（2026-11-01 复核）：这行原来写死 `plan_label('pro')`。团队客户激活后，
-    上面一行是「本机授权: 团队版」，下面一行却是「服务端授权（标准版）」。
+    上面一行是「本机授权: 团队版」，下面一行却是「服务端授权（单人版）」。
     """
     from insta_engine import __main__ as cli
 
@@ -435,7 +435,7 @@ def test_status_server_line_uses_the_token_plan(monkeypatch, tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "服务端授权（团队版）" in out
-    assert "服务端授权（标准版）" not in out
+    assert "服务端授权（单人版）" not in out
 
 
 def _fake_usage(plan: str) -> dict:
@@ -467,11 +467,15 @@ def test_status_mode_follows_license_not_the_token(monkeypatch, tmp_path, capsys
 
     out = capsys.readouterr().out
     assert "团队模式" in out, out
-    assert "体验模式" not in out
+    assert "单人模式" not in out, "不能因为 .env 里是 free 凭证就把团队授权显示成单人"
 
 
 def test_status_mode_falls_back_to_token_when_no_license(monkeypatch, tmp_path, capsys):
-    """没有本地授权（free）时仍按凭证的 plan 显示——纯 token 用户不能变成「体验模式」。"""
+    """没有本地授权（free）时仍按凭证的 plan 显示——纯 token 用户不该被显示成单人档。
+
+    用 **team** 凭证验证：free 与 pro 现在都叫「单人模式」，用 pro 已经区分不出
+    "回落生效"和"授权就是 free"了。
+    """
     from insta_engine import __main__ as cli
     from insta_engine import promptstore
 
@@ -479,13 +483,13 @@ def test_status_mode_falls_back_to_token_when_no_license(monkeypatch, tmp_path, 
     monkeypatch.setattr("requests.request", Recorder())
     monkeypatch.setattr(promptstore, "is_server", lambda: True)
     monkeypatch.setattr(cli, "_server_usage", lambda: {
-        "month": "2026-11", "plan": "pro",
-        "gen": {"used": 0, "limit": 2000}, "vision": {"used": 0, "limit": 300}})
+        "month": "2026-11", "plan": "team",
+        "gen": {"used": 0, "limit": 10000}, "vision": {"used": 0, "limit": 1000}})
     monkeypatch.setattr(cli.UsageStore, "snapshot", lambda self: _fake_usage("free"))
 
     cli.cmd_status(None)
 
-    assert "标准模式" in capsys.readouterr().out
+    assert "团队模式" in capsys.readouterr().out
 
 
 def test_status_warns_when_token_plan_differs_from_license(monkeypatch, tmp_path, capsys):

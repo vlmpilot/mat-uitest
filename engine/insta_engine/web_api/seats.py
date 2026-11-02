@@ -104,14 +104,18 @@ def _seats_payload(root: Path, seats: list[dict], shared: bool, **extra) -> dict
 
 
 def _unauthorized_plan_label() -> str:
-    """未授权共享时告诉用户"你当前是哪档"——体验/标准（失效授权按体验）。"""
+    """未授权共享时告诉用户"你当前是哪档"——单人 / 团队（失效授权按单人）。
+
+    2026-11-02 起只有两种模式：体验并入单人（装完即用），标准更名为单人。
+    所以 free 与 pro 都打印「单人模式」——同一档不该有两个名字。
+    """
     from ..licensing import read_license
 
     try:
         plan = str(read_license().get("plan") or "free").lower()
     except Exception:  # noqa: BLE001 —— 读不到按未激活
         plan = "free"
-    return "标准模式" if plan == "pro" else "体验模式"
+    return "团队模式" if plan in ("team", "private") else "单人模式"
 
 
 def _full_message(shared: bool, used: int, limit: int) -> str:

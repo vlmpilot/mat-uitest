@@ -42,8 +42,9 @@ def api_state(root: Path, usage: dict | None = None) -> tuple[int, dict]:
         "indexes": list_indexes(root),
         "explores": list_explores(root),
         "usage": usage or UsageStore().snapshot(),
-        # AI 接入方式（2026-10-23）：server=官方代理（体验模式）/ local=自带 Key（标准模式）。
-        # 前端据此显示模式标签，不再靠 gen_limit 是否为 null 猜档位。
+        # AI 接入方式（2026-10-23）：server=官方代理 / local=自带 Key。
+        # ⚠️ 它**不是**使用方式（单人/团队由 license.plan 决定，2026-11-02 起只有这两种）。
+        # 前端据此显示接入标签，不再靠 gen_limit 是否为 null 猜档位。
         "ai_mode": "server" if promptstore.is_server() else "local",
         "license": {"plan": lic["plan"], "expires_at": lic.get("expires_at")},
         "code_stale": source_staleness(),

@@ -2013,3 +2013,30 @@ def test_list_runs_cache_still_sees_new_files(tmp_path):
     # 目录删掉后缓存条目要被清掉（长驻进程不能只增不减）
     shutil.rmtree(d)
     assert list_runs(tmp_path) == []
+
+
+def test_warm_runs_cache_and_rows_are_copies(tmp_path):
+    """预热要真的填上缓存；返回的行必须是**副本**（下游改写不能污染缓存）。
+
+    回归锁（2026-11-02 复核）：命中缓存时原先直接 `runs.append(hit[1])`，
+    任何下游对行对象的一次改写都会影响之后所有 `/api/state` 请求。
+    """
+    import json
+
+    from insta_engine.web_api import workspace as ws
+
+    d = tmp_path / "artifacts" / "warm-1"
+    d.mkdir(parents=True)
+    (d / "run.json").write_text(json.dumps({
+        "case": {"caseId": "c1"},
+        "run": {"case_id": "c1", "case_name": "A", "status": "passed", "steps": []},
+        "finished_at": "2026-11-01T00:00:00+00:00"}), encoding="utf-8")
+    ws._RUN_ROW_CACHE.clear()
+    try:
+        ws.warm_runs_cache(tmp_path)
+        assert str(d / "run.json") in ws._RUN_ROW_CACHE, "预热必须把行塞进缓存"
+        first = ws.list_runs(tmp_path)[0]
+        first["status"] = "tampered"
+        assert ws.list_runs(tmp_path)[0]["status"] == "passed", "缓存行不能被调用方改写"
+    finally:
+        ws._RUN_ROW_CACHE.clear()

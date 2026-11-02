@@ -150,7 +150,7 @@ class UsageStore:
             plan = self.plan()
             if plan == "pro":
                 raise QuotaExceeded(
-                    f"本月视觉兜底额度（标准版 {limit:g} 次/月）已用完，次月自动恢复。"
+                    f"本月视觉兜底额度（单人版 {limit:g} 次/月）已用完，次月自动恢复。"
                     "本次定位退回普通失败（等同未启用视觉兜底）；同屏缓存命中不计费，"
                     "如需更高额度请通过 mobileaitest.com 联系我们。"
                 )

@@ -127,7 +127,7 @@ def test_shared_console_single_seat_without_team_authorization(tmp_path):
     assert code == 403 and payload["seats_full"] is True
     assert payload["shared"] is True
     assert "团队授权" in payload["error"]
-    assert "体验模式" in payload["error"] or "标准模式" in payload["error"]
+    assert "单人模式" in payload["error"]
 
 
 def test_write_gate_full_under_team_authorization(tmp_path):

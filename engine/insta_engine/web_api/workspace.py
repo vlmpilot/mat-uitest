@@ -18,6 +18,8 @@ import sys
 import threading
 from pathlib import Path
 
+from ..run_index import iter_run_json
+
 #: 用例展示编号分配锁（case_meta 可能被并发 state 请求调用，编号不能重发）
 _CASE_NO_LOCK = threading.Lock()
 
@@ -230,12 +232,29 @@ def _verify_summary(run_dir: Path, case_id: str | None = None) -> dict | None:
 #: 这样「跑完一次诊断/校准」也能立刻反映，不会因为 run.json 没动就显示旧状态。
 _RUN_ROW_CACHE: dict[str, tuple[tuple[float, float, float, float], dict]] = {}
 
+#: 行缓存的并发保护（2026-11-02）：控制台是 ThreadingHTTPServer，多个 `/api/state`
+#: 请求会并发进 `list_runs`；命中行还要 **复制** 后再交给调用方，避免下游改写缓存。
+_RUN_ROW_CACHE_LOCK = threading.Lock()
+
 
 def _mtime_or_zero(path: Path) -> float:
     try:
         return path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def warm_runs_cache(root: Path) -> None:
+    """后台预热 `list_runs` 的行缓存（冷启动首屏用）。
+
+    冷启动第一个 `/api/state` 要解析全部 run.json（现网 2479 份实测 7.2s，加设备
+    枚举合计 11.8s），而前端每 5s 轮询一次——不预热的话第一屏永远在追。预热失败
+    静默：它是优化，不是启动前置条件。
+    """
+    try:
+        list_runs(root)
+    except Exception:  # noqa: BLE001 —— 预热失败不影响控制台启动
+        pass
 
 
 def list_runs(root: Path) -> list[dict]:
@@ -249,16 +268,19 @@ def list_runs(root: Path) -> list[dict]:
         # 改为 artifacts 相对 posix 路径（一层时与旧值相同 ⇒ 向后兼容，
         # 前端 `/artifacts/${dir}/report.html` 与 diagnose/calibrate 的
         # `root/"artifacts"/run` 都天然支持子路径）。
-        for run_json in artifacts.rglob("run.json"):
+        for run_json in iter_run_json(root, include_batch=True):
             run_dir = run_json.parent
             cache_key = str(run_json)
             stamp = (_mtime_or_zero(run_json),
                      _mtime_or_zero(run_dir / "verify.json"),
                      _mtime_or_zero(run_dir / "diagnose.json"),
                      _mtime_or_zero(run_dir / "calibration.json"))
-            hit = _RUN_ROW_CACHE.get(cache_key)
+            with _RUN_ROW_CACHE_LOCK:
+                hit = _RUN_ROW_CACHE.get(cache_key)
             if hit is not None and hit[0] == stamp:
-                runs.append(hit[1])
+                # 复制行：缓存是进程级共享对象，下游（排序/裁剪/前端序列化）万一改写
+                # 会污染后续所有请求（2026-11-02 复核）。
+                runs.append(dict(hit[1]))
                 seen_keys.add(cache_key)
                 continue
             try:
@@ -291,14 +313,16 @@ def list_runs(root: Path) -> list[dict]:
                 }
             except (OSError, ValueError):
                 continue
-            _RUN_ROW_CACHE[cache_key] = (stamp, row)
+            with _RUN_ROW_CACHE_LOCK:
+                _RUN_ROW_CACHE[cache_key] = (stamp, row)
             seen_keys.add(cache_key)
             runs.append(row)
         # 清掉本 root 下已消失的条目：长驻进程不能只增不减（删产物目录很常见）
         prefix = str(artifacts) + os.sep
-        for stale_key in [k for k in _RUN_ROW_CACHE
-                          if k.startswith(prefix) and k not in seen_keys]:
-            _RUN_ROW_CACHE.pop(stale_key, None)
+        with _RUN_ROW_CACHE_LOCK:
+            for stale_key in [k for k in _RUN_ROW_CACHE
+                              if k.startswith(prefix) and k not in seen_keys]:
+                _RUN_ROW_CACHE.pop(stale_key, None)
     # 按 finished_at 倒序——原「glob 字典序 ≈ 时间序」的假设被批量执行产物目录的
     # 「01_ 前缀」打破（2026-10-13 实测：最新批次排第 51 位，[:50] 裁掉导致新报告不显示）
     runs.sort(key=lambda r: r["finished_at"] or "", reverse=True)

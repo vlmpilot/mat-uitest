@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -307,7 +308,10 @@ def install_apk(root: Path, adb, serial: str, apk: Path, expected_pkg: str,
     apk = Path(apk)
     resolved = apk.resolve()
     root_res = Path(root).resolve()
-    if not str(resolved).startswith(str(root_res)):
+    # 用路径语义判断包含关系，**不能用字符串前缀**：
+    # `/Users/x/proj-evil/a.apk` 以 `/Users/x/proj` 开头，str.startswith 会放行
+    # （2026-11-02 复核）。`is_relative_to` 按路径分量比较，兄弟目录会被正确拒绝。
+    if not resolved.is_relative_to(root_res):
         raise ValueError(
             f"APK 在工作区外({apk})——MAT 工作区应开在被测 App 仓库根:"
             "把 APK 拷进工作区,或在 App 仓库根重新 `mat init`")
@@ -400,8 +404,14 @@ def run_verify(root: Path, case_path: Path, *, serial: str | None = None,
                platform: str = "android", artifacts: Path | None = None,
                allow_unmet: bool = False, quality_gate: bool = True,
                timeout_s: float | None = 180, apk: Path | None = None,
-               package: str | None = None, reinstall: bool = False) -> tuple[int, dict]:
+               package: str | None = None, reinstall: bool = False,
+               execute_timeout_s: float | None = None) -> tuple[int, dict]:
     """跑一条用例并返回 `(exit_code, verdict)`；判定同时落盘 `verify.json`。
+
+    `timeout_s` 是**排队**上限（等设备锁）；`execute_timeout_s` 是**执行**上限
+    （2026-11-02 复核）：此前批量预算只能事后扣减，一条卡死的用例会拖死整批。
+    执行超时走 Runner 既有的 `cancel_event`——在**下一步开始前**安全退出，当前步
+    证据保留，status="cancelled" ⇒ `incomplete`(4)，不能谎报成用例失败(2)。
 
     刻意复用 `cmd_run` 的**同一批**私有辅助（连设备、前置条件判据）：验证与执行必须是
     同一套语义，否则 agent 会看到「run 说环境错、verify 说定位失败」这种互相矛盾的结果。
@@ -411,7 +421,8 @@ def run_verify(root: Path, case_path: Path, *, serial: str | None = None,
     code, verdict = _run_verify(root, case_path, serial=serial, platform=platform,
                                 artifacts=artifacts, allow_unmet=allow_unmet,
                                 quality_gate=quality_gate, timeout_s=timeout_s,
-                                apk=apk, package=package, reinstall=reinstall)
+                                apk=apk, package=package, reinstall=reinstall,
+                                execute_timeout_s=execute_timeout_s)
     _persist_verdict(verdict)
     return code, verdict
 
@@ -420,7 +431,8 @@ def _run_verify(root: Path, case_path: Path, *, serial: str | None = None,
                 platform: str = "android", artifacts: Path | None = None,
                 allow_unmet: bool = False, quality_gate: bool = True,
                 timeout_s: float | None = 180, apk: Path | None = None,
-                package: str | None = None, reinstall: bool = False) -> tuple[int, dict]:
+                package: str | None = None, reinstall: bool = False,
+                execute_timeout_s: float | None = None) -> tuple[int, dict]:
     """`run_verify` 的实现体（不落盘）；外部一律走 `run_verify`。"""
     from .__main__ import _blocked_preconditions, _connect_driver
     from .dsl import TestCase
@@ -521,12 +533,41 @@ def _run_verify(root: Path, case_path: Path, *, serial: str | None = None,
             verdict["notes"].append("设备连接失败：先 `mat doctor` 确认设备在线与授权，再重跑")
             return EXIT_ERROR, verdict
 
-        run = Runner(drv, art, quality_gate=quality_gate).run(case)
+        # 执行超时（2026-11-02）：复用 Runner 的 cancel_event（下一步开始前退出），
+        # 不新造一套中断机制。Timer 是 daemon，run 结束/异常都会 cancel。
+        runner = Runner(drv, art, quality_gate=quality_gate)
+        cancel = None
+        timer = None
+        if execute_timeout_s is not None:
+            cancel = threading.Event()
+            timer = threading.Timer(max(0.0, float(execute_timeout_s)), cancel.set)
+            timer.daemon = True
+            timer.start()
+        try:
+            # 不在默认路径上传 `cancel_event=None`：它是可选参数，但测试/旧驱动的
+            # Runner 替身可能没有这个形参——保持原调用签名（2026-11-02 实测踩中）。
+            if cancel is not None:
+                run = runner.run(case, cancel_event=cancel)
+            else:
+                run = runner.run(case)
+        finally:
+            if timer is not None:
+                timer.cancel()
     finally:
         lock.release()
     report = render_html(run, art)
-    code = EXIT_PASS if run.status == "passed" else EXIT_FAIL
+    if run.status == "passed":
+        code = EXIT_PASS
+    elif run.status == "cancelled":
+        # 超时/调用方取消：当前步跑完后退出，证据保留 —— 这是"没跑完"，不是用例失败。
+        code = EXIT_INCOMPLETE
+    else:
+        code = EXIT_FAIL
     verdict = build_verdict(run.model_dump(), code, art, report)
+    if run.status == "cancelled":
+        verdict["notes"].append(
+            "执行被中止（超出 execute_timeout 或调用方取消）——已完成的步骤证据保留，"
+            "不是用例失败")
     verdict["queued"] = queued
     verdict["wait_ms"] = wait_ms
     if install_info is not None:

@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+
+from .run_index import HISTORY_KEEP, build_history
 
 SCHEMA = "mat.verify/1"
 
@@ -34,9 +35,10 @@ SELECTION_FILE = "_selection.json"
 
 def _load_json(path: Path) -> dict:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def case_priority(case: dict) -> int | None:
@@ -53,70 +55,11 @@ def case_is_smoke(case: dict) -> bool:
     return prio is not None and prio <= 1
 
 
-# -- _history.json:每个 caseId 最近 3 条执行(增量,排除评测跑批) -----------------
-
-HISTORY_FILE = "_history.json"
-HISTORY_KEEP = 3
-
-
-#: 评测跑批的目录前缀：`artifacts/eval/` 与**日期命名**的跑批目录
-#: （`2026-10-25-d3-r1/` 这类，是我们自己跑评测的惯例命名）。
-#: 2026-10-31 评审实测：2479 份 run.json 里只有 64 份在 `eval/`，日期命名的另有 798
-#: 份 ⇒ 只挡 3%。约定：批量跑评测时把输出放进 `eval/` 或日期目录，日常用例不进这两类。
-_BATCH_DIR_RE = r"^\d{4}-\d{2}-\d{2}"
-
-
-def _is_batch_run(rel: str) -> bool:
-    """`rel` 是相对 `artifacts/` 的路径；判断它是不是评测跑批（不该进日常索引）。"""
-    if rel.startswith("eval/"):
-        return True
-    return bool(re.match(_BATCH_DIR_RE, rel.split("/", 1)[0]))
-
-
-def build_history(root: Path, force: bool = False) -> dict:
-    """扫描 artifacts/**/run.json,产出 {caseId: [最近 3 条]} 的持久索引。
-
-    - **排除评测跑批**（2026-10-31 评审 P2-a）：评测与日常用例同 caseId,受控跑批的
-      失败不该驱动日常 smoke/last-failed 的选择。判据见 `_is_batch_run`——只排
-      `eval/` 不够（实测只挡 3%）;
-    - 增量:按 run 目录 mtime 判断是否需要解析(现网 2479 份 run.json 全解析
-      5.62s,不能每次付);索引文件记录已覆盖的 mtime 集合;
-    - 每条只留 {status, finished_at, run_json}——last-failed 只需要这三个。
-    """
-    hist_path = Path(root) / "artifacts" / "verify" / HISTORY_FILE
-    hist_path.parent.mkdir(parents=True, exist_ok=True)
-    hist = _load_json(hist_path) if not force else {}
-    meta = hist.get("__meta__") or {}
-    seen: dict[str, float] = {k: float(v) for k, v in (meta.get("mtimes") or {}).items()}
-    out: dict[str, list[dict]] = hist.get("cases") or {}
-
-    for run_json in sorted((Path(root) / "artifacts").rglob("run.json")):
-        rel = run_json.relative_to(Path(root) / "artifacts").as_posix()
-        if _is_batch_run(rel):
-            continue  # 评测跑批不进日常索引(见上)
-        mtime = run_json.stat().st_mtime
-        if not force and seen.get(rel) == mtime:
-            continue
-        try:
-            data = json.loads(run_json.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        case_id = str((data.get("case") or {}).get("caseId") or "")
-        if not case_id:
-            continue
-        entry = {"status": (data.get("run") or {}).get("status") or "?",
-                 "finished_at": data.get("finished_at") or "",
-                 "run_json": str(run_json)}
-        bucket = [e for e in out.get(case_id, []) if e["run_json"] != entry["run_json"]]
-        bucket.append(entry)
-        bucket.sort(key=lambda e: e["finished_at"], reverse=True)
-        out[case_id] = bucket[:HISTORY_KEEP]
-        seen[rel] = mtime
-
-    result = {"__meta__": {"built_at": datetime.now(UTC).isoformat(timespec="seconds"),
-                           "mtimes": seen}, "cases": out}
-    hist_path.write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
-    return out
+# -- 历史索引（`_history.json`）------------------------------------------------
+#
+# 扫描/过滤/增量/孤儿回收统一在 `run_index`（2026-11-02 复核）：此前它与
+# `web_api.workspace.list_runs` 各自 rglob、各自判断「哪些算日常运行」，两套判据
+# 迟早分叉。`build_history` 在这里 re-export，调用方与既有测试不用改。
 
 
 def last_failed(history: dict, case_ids: list[str]) -> list[str]:
@@ -313,21 +256,23 @@ def aggregate(mode: str, results: list[dict], selection: dict) -> dict:
         return {"schema": SCHEMA, "mode": "subset", "verdict": "blocked",
                 "ok": False, "exit_code": 3,
                 "summary": {"selected": 0, "passed": 0, "failed": 0, "blocked": 0,
-                            "incomplete": 0},
+                            "incomplete": 0, "error": 0},
                 "selection": {**selection, "considered": selection.get("considered", 0)},
                 "cases": [], "next_actions": [],
                 "notes": [_empty_note(selection)]}
     counts = {v: sum(1 for r in results if r["verdict"] == v) for v in _ORDER}
     verdict = next((v for v in _ORDER if counts[v] > 0), "pass")
     cases = [{k: r.get(k) for k in ("case_id", "verdict", "duration_ms",
-                                    "failed_categories", "artifacts")}
+                                    "failed_categories", "artifacts", "blocked_reason")}
              for r in results]
     out = {"schema": SCHEMA, "mode": "subset",
            "verdict": verdict, "ok": verdict == "pass",
            "exit_code": _EXIT_BY_VERDICT[verdict],
+           # error 必须单列（2026-11-02 复核）：全序里有 error，summary 却没有，
+           # 批量出现「没跑成」时 selected ≠ 四项之和，agent 无法核对谁没跑。
            "summary": {"selected": len(results), "passed": counts["pass"],
                        "failed": counts["fail"], "blocked": counts["blocked"],
-                       "incomplete": counts["incomplete"]},
+                       "incomplete": counts["incomplete"], "error": counts["error"]},
            "selection": selection, "cases": cases,
            "next_actions": _aggregate_actions(results),
            "queued": any(r.get("queued") for r in results),
@@ -431,6 +376,9 @@ def run_subset(root: Path, cases: list[Path], *, mode: str, package: str,
             root, path, serial=serial, platform=platform,
             allow_unmet=allow_unmet, quality_gate=quality_gate,
             timeout_s=timeout_s,
+            # 剩余预算同时是**执行**上限（2026-11-02）：只事后扣减的话，一条卡死的
+            # 用例会把整批拖死——批量预算对 agent 就没意义了。
+            execute_timeout_s=budget_left,
             artifacts=(Path(artifacts) / path.stem) if artifacts else None)
         spent = time.perf_counter() - t0
         if budget_left is not None:

@@ -551,16 +551,15 @@ export default function App() {
               <span style={{ fontWeight: 700, fontSize: 15, lineHeight: "20px",
                 whiteSpace: "nowrap" }}>MAT 控制台</span>
               {/* AI 接入标签（2026-10-24：此前把「模式」和「AI 接入」混成一维，
-                  误导出「标准模式只能自带 API Key」的观感）——
-                  使用方式（体验/标准/团队）由授权与 --share 决定，AI 接入选代理还是自带 API Key
-                  是另一维：标准模式走代理、也没问题。 */}
+                  误导出「单人模式只能自带 API Key」的观感）——
+                  使用方式（单人/团队）由授权与 --share 决定，AI 接入选代理还是自带 API Key
+                  是另一维：单人模式走代理、也没问题。 */}
               {state && (() => {
                 // 左上角徽标 = **当前的模式名称**（2026-10-25 用户要求）：使用方式档位
-                // （体验/标准/团队，只由授权决定，与 __main__._usage_mode_label 同映射）；
+                // （单人/团队，只由授权决定，与 __main__._usage_mode_label 同映射）；
                 // AI 接入（官方代理/自带 Key）是另一维，挪进 Tooltip 保留——额度行为不同。
                 const plan = (state.license?.plan || "free").toLowerCase();
-                const mode = plan === "free" ? "体验模式"
-                  : (plan === "team" || plan === "private") ? "团队模式" : "标准模式";
+                const mode = (plan === "team" || plan === "private") ? "团队模式" : "单人模式";
                 return (
                   <Tooltip title={`${mode} · AI 接入：${state.ai_mode === "server"
                     ? "官方代理（有月度上限）"

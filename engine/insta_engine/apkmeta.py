@@ -59,12 +59,23 @@ def _string_pool(buf: bytes, off: int) -> list[str]:
 
 
 def read_package_name(apk: Path) -> str | None:
-    """返回 APK 的包名；解析不了（非 AXML / 格式异常 / 无 package 属性）返回 None。"""
+    """返回 APK 的包名；解析不了（非 AXML / 格式异常 / 无 package 属性）返回 None。
+
+    **任何解析异常都必须收敛成 None**（2026-11-02 复核）：AXML 是二进制格式，
+    截断/畸形文件会让 `struct.unpack_from` 抛 `struct.error`（实测），而调用方只把
+    `ValueError` 当「参数不合法」——`struct.error` 会冒到 verify 顶层变成 traceback，
+    破坏「所有失败都给 JSON 结论」的协议。这里整体兜底，交给调用方走装后校验。
+    """
     try:
-        with zipfile.ZipFile(apk) as zf:
-            data = zf.read("AndroidManifest.xml")
-    except (OSError, KeyError, zipfile.BadZipFile):
+        return _parse_package_name(Path(apk))
+    except (OSError, KeyError, ValueError, IndexError, struct.error, zipfile.BadZipFile):
         return None
+
+
+def _parse_package_name(apk: Path) -> str | None:
+    """解析本体（异常由 `read_package_name` 统一收敛）。"""
+    with zipfile.ZipFile(apk) as zf:
+        data = zf.read("AndroidManifest.xml")
     if len(data) < 16:
         return None
     typ = struct.unpack_from("<H", data, 0)[0]
