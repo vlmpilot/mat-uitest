@@ -12,32 +12,11 @@ import {
 import PageHeader from "../components/PageHeader";
 
 // 设置页：顶部切 tab（2026-10-12 发起人要求改回 Tabs），四个标签页：
-// 使用方式（套餐+团队成员+激活/续期）→ 用例凭据 → 本地数据导出 → 关于。
+// 使用方式（使用方式+团队成员）→ 用例凭据 → 本地数据导出 → 关于。
 // 移除的 tab：AI（与概览重复——额度/就绪概览统计卡已有，GEN_* .env 配置指引 EnvDoctor 已覆盖）、
 // 设备（只读 serial/型号/状态清单，概览设备卡片已有实时画面与在线状态，纯冗余）。
 
-function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () => void }) {
-  const [code, setCode] = useState("");
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const activate = async () => {
-    if (!code.trim()) return;
-    try {
-      const resp = await fetch("/api/activate", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      });
-      const data = await resp.json();
-      if (resp.ok) {
-        setMsg({ ok: true, text: `已激活 ${planLabel(data.plan)},有效期至 ${new Date(data.expires_at * 1000).toLocaleDateString()}` });
-        setCode("");
-        onRefresh?.();  // 只重拉 state（套餐/额度随 props 更新），不再整页 reload（发起人 2026-10-12）
-      } else {
-        setMsg({ ok: false, text: data.error || "激活失败" });
-      }
-    } catch (e) {
-      setMsg({ ok: false, text: String(e) });
-    }
-  };
+function SubscribeTab({ state }: { state: StateResp }) {
   return (
     <>
       <Descriptions size="small" column={1} bordered>
@@ -49,8 +28,8 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
             style={{ marginInlineEnd: 0 }}>
             {usageModeLabel(state.license?.plan)}
           </Tag>
-          {/* 到期日（2026-10-13）：有激活码授权才显示，绿色强调；激活/续期（含时长卡核销
-              换码）写盘后 onRefresh 重拉 state，这里自然更新 */}
+          {/* 到期日（2026-10-13）：团队/私有化合同授权才显示；2026-11-02 起
+              控制台不再提供激活码输入（早期码用 `mat activate <码>` 离线激活）。 */}
           {state.license?.plan === "pro" && state.license?.expires_at ? (
             <Typography.Text style={{ color: "#389e0d", fontWeight: 600, marginLeft: 8 }}>
               有效期至 {new Date(state.license.expires_at * 1000).toLocaleDateString()}
@@ -66,18 +45,6 @@ function SubscribeTab({ state, onRefresh }: { state: StateResp; onRefresh?: () =
               ? "有月度上限；切自带 API Key 就不设上限"
               : "本站不设上限，请求直连你选的服务商"}
           </Typography.Text>
-        </Descriptions.Item>
-        <Descriptions.Item label="激活/续期">
-          单人模式装完即用，不需要激活码（官方代理：生成 300 次/月、视觉 100 次/月）；
-          早期购买的激活码仍可在这里激活，额度相同。
-          获取方式见<a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">官网联系</a>。
-          <Space.Compact style={{ marginTop: 8, display: "flex" }}>
-            <Input placeholder="MAT2-…" value={code}
-                   onChange={(e) => setCode(e.target.value)}
-                   onPressEnter={activate} />
-            <Button type="primary" onClick={activate}>激活</Button>
-          </Space.Compact>
-          {msg && <div style={{ marginTop: 6, color: msg.ok ? "#389e0d" : "#cf1322" }}>{msg.text}</div>}
         </Descriptions.Item>
       </Descriptions>
       {/* 团队成员并入使用方式 tab（2026-10-12 发起人）：商业化只控额度+人数，看套餐就该看到成员名额 */}
@@ -184,13 +151,6 @@ function ExportTab() {
 // 官网 #contact 联系区有公众号二维码，点击跳转扫码即可。
 /** 使用方式（与「AI 接入」是两个维度）：单人=free/pro、团队=team/private
  *  （2026-11-02：体验并入单人、标准更名为单人，free 与 pro 打印同一个名字） */
-function planLabel(plan?: string): string {
-  const p = (plan || "free").toLowerCase();
-  if (p === "team") return "团队版";
-  if (p === "private") return "私有化";
-  return "单人版";
-}
-
 function usageModeLabel(plan?: string): string {
   const p = (plan || "free").toLowerCase();
   if (p === "team" || p === "private") return "团队模式";
@@ -308,11 +268,10 @@ function SeatsCard() {
   );
 }
 
-export default function Settings({ state, onRefresh }: {
-  state: StateResp; onRefresh?: () => void }) {
+export default function Settings({ state }: { state: StateResp }) {
   const items = [
     { key: "subscribe", label: <span><SafetyOutlined style={{ color: "#4F5BFF", marginRight: 6 }} />使用方式</span>,
-      children: <SubscribeTab state={state} onRefresh={onRefresh} /> },
+      children: <SubscribeTab state={state} /> },
     { key: "creds", label: <span><KeyOutlined style={{ color: "#4F5BFF", marginRight: 6 }} />用例凭据</span>,
       children: <CredsTab /> },
     { key: "export", label: <span><CloudDownloadOutlined style={{ color: "#4F5BFF", marginRight: 6 }} />本地数据导出</span>,

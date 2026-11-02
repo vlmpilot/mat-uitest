@@ -177,7 +177,7 @@ def test_status_without_token_tells_how_to_fix(home, keypair, monkeypatch, capsy
     out = capsys.readouterr().out
 
     assert rc == 1
-    assert "mat activate --file" in out
+    assert "mat license import" in out
 
 
 def test_expired_license_does_not_use_team_token(home, keypair):
@@ -246,12 +246,58 @@ def test_cli_warns_when_downgrade_revokes_team_token(home, keypair, monkeypatch,
     _attach_ok(monkeypatch)
     licensing.activate_license_file(_write(home, "team.json", _license(pem)))
     assert licensing.read_server_token() == "team-token"
-    monkeypatch.setattr(licensing, "activate_on_server",
-                        lambda code: {"token": "new-token", "machines": 1, "max_machines": 2})
 
-    cli.cmd_activate(argparse.Namespace(code=_v1("pro", 500), force=True, file=None,
-                                        machines=False, unbind=None))
+    cli.cmd_activate(argparse.Namespace(code=_v1("pro", 500), force=True))
 
     out = capsys.readouterr().out
     assert "团队协作能力已失效" in out
     assert licensing.read_server_token() == "", "降级后不该还留着团队凭证"
+
+
+# -- `mat license import`：现行唯一合同入口（2026-11-02 起兼旧 `activate --file` 的角色）
+
+def test_license_import_cli_prints_usage_for_unknown_action(capsys):
+    """命令层第一道闸：`mat license xxx` 不能静默退出 0。
+
+    subparser 声明了 `required=True`，正常路径进不来；但控制台/脚本可能直接调用
+    `cmd_license`，那时必须兜住，否则会一路读到 `args.file` 抛 AttributeError。
+    """
+    import argparse
+
+    from insta_engine import __main__ as cli
+
+    rc = cli.cmd_license(argparse.Namespace(license_action=None, file="x.json", force=False))
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "mat license import" in err
+
+
+def test_license_import_cli_reports_success_and_keeps_longer(home, keypair, monkeypatch, capsys):
+    """成功要说清「离线验签 + 团队库连通」；再导入更短的要说「未改动 + 怎么强制」。
+
+    `activate_license_file` 的语义（续费不砍短、拒绝降级团队）由 test_license_renewal
+    与上面几条覆盖；这里钉的是 **CLI 把结果讲清楚**——它是现行唯一合同入口，输出含糊
+    客户会以为没生效，然后反复重装。
+    """
+    import argparse
+
+    from insta_engine import __main__ as cli
+
+    pem, _pub = keypair
+    _attach_ok(monkeypatch)
+
+    rc = cli.cmd_license(argparse.Namespace(
+        license_action="import",
+        file=str(_write(home, "team.json", _license(pem, days=30))), force=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "已导入 团队版" in out
+    assert "已连通" in out
+
+    rc = cli.cmd_license(argparse.Namespace(
+        license_action="import",
+        file=str(_write(home, "short.json", _license(pem, days=5))), force=False))
+    out = capsys.readouterr().out
+    assert rc == 0, "保留更长的授权不是失败"
+    assert "已有更长的授权" in out
+    assert "--force" in out

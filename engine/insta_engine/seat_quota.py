@@ -172,13 +172,14 @@ def team_authorized() -> bool:
     """本机授权是否开放**团队共享**（`--share` 下的成员名额，2026-10-25 起的唯一入口）。
 
     产品规则（发起人 2026-10-25 定）：**标准/体验授权面向单人使用**——只有
-    team/private 授权、或 license v2 明写的合同席位，才开放共享；其余档位在
-    `--share` 下成员上限恒为 1，第二位同事由 `web_api/seats._full_message`
-    给「团队共享随团队授权提供」的可行动提示。
+    team/private 授权才开放共享；其余档位在 `--share` 下成员上限恒为 1，第二位同事由
+    `web_api/seats._full_message` 给「团队共享随团队授权提供」的可行动提示。
 
-    v2 的 `seats` **优先于 plan 判定**：合同里签了席位就是买了协作，不管那本书
-    签的是 pro 还是 team（`scripts/issue_license_v2.py --plan pro --seats 7`
-    是合法组合）。读不到授权/坏档一律按未激活处理（fail-closed 到单人）。
+    🔴 2026-11-02 收紧：此前还允许「license 里的 `seats >= 1` 也算授权」，于是
+    `--plan pro --seats N` 能开出本地共享——但 pro 的功能集不含 `team_share`，
+    服务端 `/license/attach` 会 403，结果是**半开通**：控制台能拉人、团队库一个都打不开。
+    **席位只是 team/private 合同里的数量字段，不构成授权类型**，所以判定只看 plan。
+    读不到授权/坏档一律按未激活处理（fail-closed 到单人）。
 
     ⚠️ 本地规则、不是 DRM（与成员名额同哲学）：改 `.env`、删名单、改源码都能绕。
     对外说「团队共享随团队授权提供」，不说「标准版锁死」。
@@ -189,14 +190,7 @@ def team_authorized() -> bool:
         lic = read_license()
     except Exception:  # noqa: BLE001 —— 读不到授权按未激活（落到单人）
         return False
-    plan = str(lic.get("plan") or "free").lower()
-    if plan in ("team", "private"):
-        return True
-    try:
-        n = int(lic.get("seats")) if lic.get("seats") is not None else None
-    except (TypeError, ValueError):
-        n = None
-    return bool(n and n >= 1)
+    return str(lic.get("plan") or "free").lower() in ("team", "private")
 
 
 def base_for_plan(plan: str | None = None) -> int:

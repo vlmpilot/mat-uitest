@@ -47,7 +47,7 @@ def _bearer() -> str:
     token = bearer()
     if not token:
         raise SystemExit(
-            "缺少云端凭据：团队授权请先 `mat activate --file <license.json>`"
+            "缺少云端凭据：团队授权请先 `mat license import <license.json>`"
             "（会换发团队凭证）；没有授权时再用 `mat token` 换一张匿名凭证。")
     return token
 
@@ -282,7 +282,7 @@ def status() -> int:
         if stale:
             print("云端身份: ⚠️ 本机仍留有云端凭证，但当前授权不含团队协作。")
             print(f"  该凭证不会自己失效（服务端按凭证判档位）：{licensing.server_token_path()}")
-            print("  要用回团队库：mat activate --file <license.json>；"
+            print("  要用回团队库：mat license import <license.json>；"
                   "要彻底清掉：删掉上面这个文件")
         else:
             print("云端身份: —（当前档位不含团队协作，服务端会拒绝这类请求）")
@@ -291,7 +291,7 @@ def status() -> int:
     token = bearer()
     if not token:
         print("云端身份: 未连接（本机没有云端凭证）")
-        print("  团队授权：mat activate --file <license.json>   # 会换发团队凭证")
+        print("  团队授权：mat license import <license.json>   # 会换发团队凭证")
         print("  无授权时：mat token --new")
         return 1
     try:

@@ -227,9 +227,9 @@ def test_baseline_depends_on_plan():
 
 # -- 团队共享只随团队授权（2026-10-25 产品定位调整）-------------------------------
 
-def test_team_authorized_only_for_team_private_or_contract_seats():
-    """🔴 授权判定：team/private 授权、或 v2 明写的合同席位 ⇒ 开放共享；
-    体验/标准（v1 激活码）/ 未激活/坏档 ⇒ 不开放（fail-closed 到单人）。"""
+def test_team_authorized_only_for_team_and_private():
+    """🔴 授权判定：只有 team/private ⇒ 开放共享；体验/标准/未激活/坏档 ⇒ 不开放
+    （fail-closed 到单人）。v2 合同里的 `seats` 字段不构成授权，见下一条。"""
     assert seat_quota.team_authorized() is False          # 未激活
     _set_plan("pro")
     assert seat_quota.team_authorized() is False          # 标准授权面向单人
@@ -241,12 +241,16 @@ def test_team_authorized_only_for_team_private_or_contract_seats():
     assert seat_quota.team_authorized() is True
 
 
-def test_v2_contract_seats_open_sharing_even_on_pro_plan(monkeypatch):
-    """v2 的 `seats` **优先于 plan**：合同签了席位就是买了协作
-    （`issue_license_v2 --plan pro --seats 7` 是合法组合）。
+def test_pro_contract_seats_do_not_open_sharing(monkeypatch):
+    """v2 合同里的 `seats` **不构成授权类型**：`--plan pro --seats 7` 曾经能开出本地
+    共享，但 pro 的功能集不含 `team_share` ⇒ 服务端 `/license/attach` 403，是半开通
+    状态（控制台能拉人、团队库一个都打不开）。2026-11-02 起判定只看 plan。
+
+    席位字段本身照旧读得到（`licensed_seats()` = 7，用于展示与 team/private 的
+    基线算术），只是**不再等价于"买了协作"**。
 
     ⚠️ v1 路径的 license.json 即使手写 seats 也不认（`read_license` 对 v1 恒填
-    `seats=None`）——只有验签过的 v2 合同席位才算数，这里用真 Ed25519 签一份。
+    `seats=None`）；这里用真 Ed25519 签一份 v2，证明"验签通过也不等于授权团队共享"。
     """
     key = Ed25519PrivateKey.generate()
     monkeypatch.setenv("MAT_LICENSE_PUBKEY_B64", base64.b64encode(
@@ -262,9 +266,9 @@ def test_v2_contract_seats_open_sharing_even_on_pro_plan(monkeypatch):
     licensing.license_path().write_text(
         json.dumps(licensing.sign_license_v2(data, pem), ensure_ascii=False), encoding="utf-8")
 
-    assert seat_quota.licensed_seats() == 7
-    assert seat_quota.team_authorized() is True
-    assert seats.seat_limit(shared=True) == 7, "合同席位覆盖档位基线"
+    assert seat_quota.licensed_seats() == 7, "席位字段仍在，只是不构成授权"
+    assert seat_quota.team_authorized() is False, "pro 不因 seats 开通团队共享"
+    assert seats.seat_limit(shared=True) == seats.SINGLE_SEAT_LIMIT
 
 
 def test_shared_uses_plan_baseline_when_authorized(tmp_path):

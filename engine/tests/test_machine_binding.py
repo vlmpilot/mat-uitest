@@ -1,8 +1,8 @@
-"""Pro 激活登记与机器绑定（T17）客户端侧 —— / §6。
+"""本机标识与早期激活码的**离线**激活（2026-11-02 起不再服务端登记/绑定机器）。
 
-🔴 最要紧的一条：**服务端登记失败绝不阻断本地激活**。
-本地 `license.json` 是离线验签写盘的，BYOK 用户不该因为断网就用不了；
-服务端那一步换来的是**服务端额度**（300 次/月真实计量）与机器绑定。
+🔴 两条纪律：
+- 早期激活码只做本地验签，**一个网络请求都不发**；
+- `~/.mat/machine_id` 仍要稳定缓存（团队授权 `/license/attach` 用它归属云端用量）。
 """
 
 from __future__ import annotations
@@ -28,28 +28,17 @@ def isolated_home(tmp_path, monkeypatch):
     # 🔴 **必须 chdir 到临时目录**：`cli.main()` 会把 **cwd 的 `.env`** 载入 `os.environ`
     # 且不还原（CLI 进程本来就会退出，不算 bug）。在仓库根跑的话，仓库 `.env` 里的
     # `GEN_VL_FALLBACK=1` 之类会**泄漏给后面所有测试** —— 表现为"单独跑绿、全量跑红"的假 flake
-    # （实测：`test_v1.py::test_vision_fallback_is_opt_in` 就是这么被带红的）。
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
 
-class FakeResponse:
-    def __init__(self, status_code=200, payload=None):
-        self.status_code = status_code
-        self._payload = payload or {}
-
-    def json(self):
-        return self._payload
-
-
 class Recorder:
-    def __init__(self, response=None):
+    def __init__(self):
         self.calls: list[dict] = []
-        self.response = response or FakeResponse()
 
     def __call__(self, method, url, json=None, headers=None, timeout=None):
         self.calls.append({"method": method, "url": url, "json": json, "headers": headers or {}})
-        return self.response
+        raise AssertionError(f"早期激活码不该出网：{url}")
 
 
 def _code(expires: int | None = None, key: str = "mat-beta-public-2026",
@@ -80,10 +69,7 @@ def test_machine_id_is_a_cached_hash():
 
 
 def test_machine_id_survives_hardware_changes_once_cached(monkeypatch):
-    """🔴 缓存的意义：派生源（网卡 / 主机名）变了，**已绑定的机器不能跟着变**。
-
-    否则换网卡 / 容器重建后 `machine_id` 变新 ⇒ 用户会瞬间用光名额被锁在外面。
-    """
+    """🔴 缓存的意义：派生源（网卡 / 主机名）变了，**已登记的机器不能跟着变**。"""
     import uuid as _uuid
 
     mid = licensing.machine_id()
@@ -114,46 +100,21 @@ def test_machine_id_is_not_the_raw_hardware_string():
     assert raw not in licensing.machine_id()
 
 
-# -- mat activate ------------------------------------------------------------
+# -- mat activate（纯离线）----------------------------------------------------
 
 
-def test_activate_registers_on_server_and_prints_the_env_hint(monkeypatch, capsys):
-    rec = Recorder(FakeResponse(payload={"ok": True, "plan": "pro", "expires_at": 2000000000,
-                                         "machines": 1, "max_machines": 2, "reused": False,
-                                         "token": "srv-tok"}))
+def test_activate_is_purely_offline(monkeypatch, capsys):
+    """2026-11-02：激活码不再向服务端登记 —— 一个请求都不发。"""
+    rec = Recorder()
     monkeypatch.setattr("requests.request", rec)
 
     assert _run(["activate", _code()]) == 0
 
     out = capsys.readouterr().out
     assert "已激活 单人版" in out
-    assert "1/2 台机器" in out
-    assert "GEN_API_KEY=srv-tok" in out
-
-    sent = rec.calls[0]["json"]
-    assert set(sent) == {"code", "machine_id"}
-    assert sent["machine_id"] == licensing.machine_id()
-    assert licensing.read_server_token() == "srv-tok"
-
-
-def test_local_activation_succeeds_when_the_server_is_unreachable(monkeypatch, capsys):
-    """🔴 服务端不通**不阻断**本地激活 —— 断网不该让 BYOK 用户用不了。
-
-    只是拿不到服务端额度，且必须**明说**这一点（不能让用户以为已经开通了）。
-    """
-    def boom(*_a, **_k):
-        raise OSError("offline")
-
-    monkeypatch.setattr("requests.request", boom)
-
-    assert _run(["activate", _code()]) == 0
-
-    out = capsys.readouterr().out
-    assert "已激活 单人版" in out, "本地激活必须成功"
+    assert rec.calls == [], "早期码激活不该出网"
     assert licensing.read_license()["plan"] == "pro"
-    assert "服务端登记未完成" in out
-    assert "本地授权已生效" in out
-    assert licensing.read_server_token() == "", "没登记成功就不该存凭证"
+    assert licensing.read_server_token() == "", "不再由激活码领取服务端凭证"
 
 
 def test_activate_rejects_a_bad_code_without_any_network(monkeypatch, capsys):
@@ -162,25 +123,11 @@ def test_activate_rejects_a_bad_code_without_any_network(monkeypatch, capsys):
 
     assert _run(["activate", "MAT-not-a-real-code"]) == 1
 
-    assert rec.calls == [], "本地就验不过的码，不该往服务端发"
+    assert rec.calls == []
     assert "❌" in capsys.readouterr().out
 
 
-def test_activate_reports_the_machine_limit_rejection(monkeypatch, capsys):
-    """超限是 **409 软拒**：本地照旧激活成功，但要说清"服务端额度没开通"和怎么办。"""
-    rec = Recorder(FakeResponse(status_code=409,
-                                payload={"detail": "该激活码已绑定 2 台机器（上限 2 台）。"}))
-    monkeypatch.setattr("requests.request", rec)
-
-    assert _run(["activate", _code()]) == 0
-
-    out = capsys.readouterr().out
-    assert "已激活 单人版" in out
-    assert "409" in out and "已绑定 2 台机器" in out
-    assert licensing.read_license()["plan"] == "pro"
-
-
-def test_activate_requires_a_code_when_not_managing(monkeypatch, capsys):
+def test_activate_requires_a_code(monkeypatch, capsys):
     assert _run(["activate"]) == 1
     assert "用法" in capsys.readouterr().err
 
@@ -191,16 +138,8 @@ def test_activate_requires_a_code_when_not_managing(monkeypatch, capsys):
 # 而它们的下一步动作完全不同 —— 重抄一遍 / 换新码 / 什么都不用做。用户拿着同一句话无从下手。
 
 
-def test_activating_the_same_code_twice_says_already_activated(monkeypatch, capsys):
-    """同一张码在本机再来一次：**不是**"又激活了一次"，要如实说"你已经用过了、没改动"。
-
-    打 "✅ 已激活" 会让用户以为自己又续上了一次（这正是要修的表达缺陷）。
-    """
-    monkeypatch.setattr("requests.request",
-                        Recorder(FakeResponse(payload={"ok": True, "plan": "pro",
-                                                       "expires_at": 2000000000, "machines": 1,
-                                                       "max_machines": 2, "reused": True,
-                                                       "token": "srv-tok"})))
+def test_activating_the_same_code_twice_says_already_activated(capsys):
+    """同一张码在本机再来一次：**不是**"又激活了一次"，要如实说"你已经用过了、没改动"。"""
     code = _code()
 
     assert _run(["activate", code]) == 0
@@ -213,13 +152,8 @@ def test_activating_the_same_code_twice_says_already_activated(monkeypatch, caps
     assert "✅ 已激活" not in out, "重复激活不得再说一遍「已激活」（会让人以为又续上了）"
 
 
-def test_activating_a_shorter_code_says_it_kept_the_longer_one(monkeypatch, capsys):
+def test_activating_a_shorter_code_says_it_kept_the_longer_one(capsys):
     """更短的码进来：**一个字节都没改**，要说清是"保留了更长的"，而不是"已激活"。"""
-    monkeypatch.setattr("requests.request",
-                        Recorder(FakeResponse(payload={"ok": True, "plan": "pro",
-                                                       "expires_at": 2000000000, "machines": 1,
-                                                       "max_machines": 2, "reused": True,
-                                                       "token": "srv-tok"})))
     now = int(time.time())
 
     assert _run(["activate", _code(expires=now + 86400 * 365)]) == 0
@@ -231,18 +165,13 @@ def test_activating_a_shorter_code_says_it_kept_the_longer_one(monkeypatch, caps
     assert "✅ 已激活" not in out
 
 
-def test_a_second_code_with_the_same_expiry_says_nothing_changed(monkeypatch, capsys):
-    """🔴 活动码用户的**高频真实处境**：两枚**不同**的码、**同一个**截止日（都 `--until` 同一天）。
+def test_a_second_code_with_the_same_expiry_says_nothing_changed(capsys):
+    """🔴 活动码用户的**高频真实处境**：两枚**不同**的码、**同一个**截止日。
 
     第二枚写不进去（谁长用谁，相等也不覆盖）——但此时**不能说**"已保留更长的那个"：
     两枚一样长。也不能说"你已经用这张码激活过了"（不是同一张）。得如实说
     "本机已有同等有效期的授权，这张码不必再用"。
     """
-    monkeypatch.setattr("requests.request",
-                        Recorder(FakeResponse(payload={"ok": True, "plan": "pro",
-                                                       "expires_at": 2000000000, "machines": 1,
-                                                       "max_machines": 2, "reused": True,
-                                                       "token": "srv-tok"})))
     same_day = int(time.time()) + 86400 * 90
 
     assert _run(["activate", _code(expires=same_day, nonce="aaaaaa")]) == 0
@@ -257,11 +186,7 @@ def test_a_second_code_with_the_same_expiry_says_nothing_changed(monkeypatch, ca
 
 
 def test_expired_code_says_the_exact_date_and_stays_offline(monkeypatch, capsys):
-    """过期 ≠ 抄错了：过期必须把**是哪天过期**说清楚，并与"签名不通过"分开。
-
-    原先两者都只得到「激活码无效或已过期」—— 用户既不知道自己抄错没抄错，
-    也不知道这码是"坏了"还是"到期了"。
-    """
+    """过期 ≠ 抄错了：过期必须把**是哪天过期**说清楚，并与"签名不通过"分开。"""
     rec = Recorder()
     monkeypatch.setattr("requests.request", rec)
     past = int(time.time()) - 86400 * 30
@@ -272,7 +197,7 @@ def test_expired_code_says_the_exact_date_and_stays_offline(monkeypatch, capsys)
     assert "已于" in out and "过期" in out
     assert time.strftime("%Y-%m-%d", time.localtime(past)) in out
     assert "签名" not in out, "过期不是签名问题，别把两种原因混在一句里"
-    assert rec.calls == [], "本地就验不过的码不该往服务端发"
+    assert rec.calls == []
 
 
 def test_broken_code_tells_the_user_to_copy_the_whole_thing(monkeypatch, capsys):
@@ -288,91 +213,6 @@ def test_broken_code_tells_the_user_to_copy_the_whole_thing(monkeypatch, capsys)
     assert "过期" not in out
 
 
-def test_server_rejection_does_not_tell_the_user_to_retry(monkeypatch, capsys):
-    """🔴 回归门禁：服务端**明确拒绝**（409 超限）时，不得再劝用户"之后重跑即可"。
-
-    重跑一百次结果都一样 —— 那句话说错了方向，用户会陷在重试里。只有**网络没通**
-    才值得说"联网后重跑"。
-    """
-    monkeypatch.setattr("requests.request",
-                        Recorder(FakeResponse(status_code=409,
-                                              payload={"detail": "该激活码已绑定 2 台机器（上限 2 台）。"})))
-
-    assert _run(["activate", _code()]) == 0
-
-    out = capsys.readouterr().out
-    assert "重跑这条命令结果不变" in out
-    assert "该激活码已绑定 2 台机器" in out
-    assert "之后重跑 `mat activate <激活码>` 即可" not in out
-
-
-def test_cloud_error_carries_the_http_status(monkeypatch):
-    """`CloudError.status` 必须是**结构化字段**：调用方不能靠 `"409" in str(exc)` 猜
-    —— 那种写法一改文案就静默失效（本次修的就是被它藏起来的错文案）。"""
-    from insta_engine import cloudapi
-
-    monkeypatch.setattr("requests.request",
-                        Recorder(FakeResponse(status_code=409, payload={"detail": "x"})))
-    with pytest.raises(cloudapi.CloudError) as exc:
-        cloudapi.post("/license/activate", {"code": "x"})
-    assert exc.value.status == 409
-
-
-def test_cloud_error_status_is_none_when_the_network_is_down(monkeypatch):
-    """网络层失败没有状态码 ⇒ `status is None`，调用方据此说"联网后重跑"。"""
-    from insta_engine import cloudapi
-
-    def boom(*_a, **_k):
-        raise OSError("offline")
-
-    monkeypatch.setattr("requests.request", boom)
-    with pytest.raises(cloudapi.CloudError) as exc:
-        cloudapi.post("/license/activate", {"code": "x"})
-    assert exc.value.status is None
-
-
-# -- --machines / --unbind ---------------------------------------------------
-
-
-def test_machines_lists_and_marks_this_machine(monkeypatch, capsys):
-    licensing.save_server_token("tok", {"machines": 2, "max_machines": 2})
-    mine = licensing.machine_id()
-    rec = Recorder(FakeResponse(payload={
-        "code_nonce": "abc123", "self": mine, "max_machines": 2,
-        "machines": [{"machine_id": mine, "created_at": "2026-10-12T00:00:00+00:00"},
-                     {"machine_id": "b" * 64, "created_at": "2026-10-11T00:00:00+00:00"}]}))
-    monkeypatch.setattr("requests.request", rec)
-
-    assert _run(["activate", "--machines"]) == 0
-
-    out = capsys.readouterr().out
-    assert "已绑定 2/2 台机器" in out
-    assert "← 本机" in out
-    assert rec.calls[0]["headers"]["Authorization"] == "Bearer tok"
-
-
-def test_unbind_calls_the_server_with_the_token(monkeypatch, capsys):
-    licensing.save_server_token("tok", {})
-    rec = Recorder(FakeResponse(payload={"ok": True, "unbound": "c" * 64}))
-    monkeypatch.setattr("requests.request", rec)
-
-    assert _run(["activate", "--unbind", "c" * 64]) == 0
-
-    assert rec.calls[0]["url"].endswith("/license/unbind")
-    assert rec.calls[0]["json"] == {"machine_id": "c" * 64}
-    assert "已解绑" in capsys.readouterr().out
-
-
-def test_unbind_surfaces_server_errors(monkeypatch, capsys):
-    licensing.save_server_token("tok", {})
-    monkeypatch.setattr("requests.request",
-                        Recorder(FakeResponse(status_code=401, payload={"detail": "凭证无效"})))
-
-    assert _run(["activate", "--unbind", "c" * 64]) == 1
-
-    assert "凭证无效" in capsys.readouterr().err
-
-
 # -- mat status --------------------------------------------------------------
 
 
@@ -382,16 +222,16 @@ def test_status_shows_server_authorization_and_stays_offline(monkeypatch, tmp_pa
     rec = Recorder()
     monkeypatch.setattr("requests.request", rec)
     monkeypatch.chdir(tmp_path)
-    licensing.save_server_token("tok", {"machines": 1, "max_machines": 2})
+    licensing.save_server_token("tok", {"plan": "team", "team_id": "lic_x"})
 
     cli.cmd_status(None)
 
     out = capsys.readouterr().out
-    assert "服务端授权" in out and "1/2 台机器" in out
+    assert "服务端授权（团队版）" in out
     assert rec.calls == [], "mat status 绝不许联网"
 
 
-def test_status_hides_the_line_before_server_registration(monkeypatch, tmp_path, capsys):
+def test_status_hides_the_line_before_team_attach(monkeypatch, tmp_path, capsys):
     from insta_engine import __main__ as cli
 
     monkeypatch.chdir(tmp_path)
@@ -399,7 +239,7 @@ def test_status_hides_the_line_before_server_registration(monkeypatch, tmp_path,
 
     cli.cmd_status(None)
 
-    assert "Pro 服务端授权" not in capsys.readouterr().out
+    assert "服务端授权" not in capsys.readouterr().out
 
 
 def test_server_token_file_is_private():
@@ -410,7 +250,7 @@ def test_server_token_file_is_private():
 
 
 def test_cloudapi_is_not_imported_by_other_cli_modules():
-    """与邀请同一条纪律：**顶层不许导入**网络客户端 —— 否则任何命令都可能出网。"""
+    """底层纪律：**顶层不许导入**网络客户端 —— 否则任何命令都可能出网。"""
     import subprocess
 
     code = ("import sys, insta_engine.__main__; print('insta_engine.cloudapi' in sys.modules)")
@@ -420,16 +260,12 @@ def test_cloudapi_is_not_imported_by_other_cli_modules():
 
 
 def test_status_server_line_uses_the_token_plan(monkeypatch, tmp_path, capsys):
-    """团队凭证不能显示成「服务端授权（单人版）」——同一屏两个档位自相矛盾。
-
-    回归锁（2026-11-01 复核）：这行原来写死 `plan_label('pro')`。团队客户激活后，
-    上面一行是「本机授权: 团队版」，下面一行却是「服务端授权（单人版）」。
-    """
+    """团队凭证不能显示成「服务端授权（单人版）」——同一屏两个档位自相矛盾。"""
     from insta_engine import __main__ as cli
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("requests.request", Recorder())
-    licensing.save_server_token("tok", {"plan": "team", "machines": 1, "max_machines": 5})
+    licensing.save_server_token("tok", {"plan": "team", "team_id": "lic_x"})
 
     cli.cmd_status(None)
 
@@ -445,13 +281,7 @@ def _fake_usage(plan: str) -> dict:
 
 
 def test_status_mode_follows_license_not_the_token(monkeypatch, tmp_path, capsys):
-    """「使用方式」只由**授权**决定：官方代理下不能因为 .env 里是 free key 就显示体验模式。
-
-    回归锁（2026-11-01 复核）：原来写 `(remote or usage).get("plan")`，官方代理下
-    `remote` 恒有值 ⇒ 档位取的是**凭证**的 plan。而"先体验、后来买团队授权"是最常见的
-    升级路径（.env 里还留着早期 `mat token` 换的 free key）⇒ 客户看到「体验模式」，
-    同一屏下面却写着「授权: team」。付了钱显示成未激活。
-    """
+    """「使用方式」只由**授权**决定：官方代理下不能因为 .env 里是 free key 就显示体验模式。"""
     from insta_engine import __main__ as cli
     from insta_engine import promptstore
 
@@ -471,11 +301,7 @@ def test_status_mode_follows_license_not_the_token(monkeypatch, tmp_path, capsys
 
 
 def test_status_mode_falls_back_to_token_when_no_license(monkeypatch, tmp_path, capsys):
-    """没有本地授权（free）时仍按凭证的 plan 显示——纯 token 用户不该被显示成单人档。
-
-    用 **team** 凭证验证：free 与 pro 现在都叫「单人模式」，用 pro 已经区分不出
-    "回落生效"和"授权就是 free"了。
-    """
+    """没有本地授权（free）时仍按凭证的 plan 显示——纯 token 用户不该被显示成单人档。"""
     from insta_engine import __main__ as cli
     from insta_engine import promptstore
 
@@ -493,11 +319,7 @@ def test_status_mode_falls_back_to_token_when_no_license(monkeypatch, tmp_path, 
 
 
 def test_status_warns_when_token_plan_differs_from_license(monkeypatch, tmp_path, capsys):
-    """授权是团队、凭证还是 free ⇒ 额度按凭证算，必须说出来。
-
-    不说的话，界面是「团队模式 · 本月生成 0/60」，看起来像团队版只给 60 次。
-    这条是"使用方式改成按授权"之后必须补的另一半：两个档位不一致时要解释清楚。
-    """
+    """授权是团队、凭证还是 free ⇒ 额度按凭证算，必须说出来。"""
     from insta_engine import __main__ as cli
     from insta_engine import promptstore
 

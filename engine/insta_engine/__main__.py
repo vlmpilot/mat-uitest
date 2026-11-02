@@ -534,7 +534,14 @@ def cmd_run(args) -> int:
 
     if kind == "case":
         _print_preconditions(payload)
-        root_art = Path(args.artifacts) if args.artifacts else Path("artifacts") / Path(args.case).stem
+        if args.artifacts:
+            root_art = Path(args.artifacts)
+        else:
+            # 单条运行独立目录（2026-11-02 统一）：不再固定 `artifacts/<stem>` 覆盖，
+            # 否则 run.json / verify.json 的两个写入时刻会让状态与结论自相矛盾。
+            from .artifact_paths import new_run_dir
+
+            root_art = new_run_dir(Path("."), Path(args.case).stem)
         if payload.datasets:  # 数据驱动（CASE-06）：每组独立执行一轮
             total = len(payload.datasets)
             selected = _select_datasets(payload.datasets, args.dataset)
@@ -1616,50 +1623,6 @@ def cmd_ios_setup(args) -> int:
                          renew=getattr(args, "renew", False),
                          force=getattr(args, "force", False))
 
-def _register_activation(licensing, code: str) -> None:
-    """把激活登记到服务端（T17）—— **best-effort，绝不阻断本地激活**。
-
-    本地 `license.json` 是离线验签写盘的；服务端那一步换来的是**服务端额度**
-    （300 次/月真实计量）与机器绑定。断网时本地照旧可用（BYOK 零成本），只是拿不到
-    服务端额度 —— 这正是 红线的形态：本地码不兑服务端额度，服务端额度只跟 token 走。
-    """
-    try:
-        out = licensing.activate_on_server(code)
-    except licensing.CloudError as exc:
-        if getattr(exc, "status", None) and 400 <= exc.status < 500:
-            # 🔴 服务端**明确判定**（典型是超限 409）：重跑同一条命令结果**不会变**。
-            # 原先这里一律说"之后重跑即可" —— 对超限是**错的方向**，用户会一直重试。
-            print(f"⚠️ 本地授权已生效（有效期见上），但服务端额度**没开通**：{exc}")
-            print("  这是服务端的判定，重跑这条命令结果不变 —— "
-                  "换机请先在原机器上执行 `mat activate --unbind`，或联系我们处理。")
-        else:
-            print(f"（服务端登记未完成：{exc}）")
-            print("  本地授权已生效、不影响使用；服务端额度需要联网登记，"
-                  "之后重跑 `mat activate <激活码>` 即可。")
-        return
-    print(f"✅ 服务端额度已开通（本码已绑定 {out.get('machines')}/{out.get('max_machines')} 台机器）")
-    if out.get("reused"):
-        print("  （本机此前激活过，凭证已重新签发）")
-    print("  用官方代理：把下面一行加进工作区 .env"
-          "（另需 GEN_BASE_URL / GEN_PROMPT_MODE=server）：")
-    print("    " + _env_kv("GEN_" "API_KEY", str(out["token"])))
-    print("  换机/重装：`mat activate --machines` 看已绑机器，"
-          "`mat activate --unbind <机器标识>` 解绑")
-
-
-def _print_bound_machines(licensing) -> int:
-    try:
-        out = licensing.list_server_machines()
-    except licensing.CloudError as exc:
-        print(f"查询失败：{exc}", file=sys.stderr)
-        return 1
-    machines = out.get("machines", [])
-    print(f"本激活码已绑定 {len(machines)}/{out.get('max_machines')} 台机器：")
-    for m in machines:
-        mark = "   ← 本机" if m.get("machine_id") == out.get("self") else ""
-        print(f"  {m.get('machine_id')}  （{m.get('created_at', '')}）{mark}")
-    return 0
-
 
 def cmd_seat(args) -> int:
     """团队成员：本机标识 / 同步配额 / 查看现状（2026-10-14）。
@@ -1706,75 +1669,17 @@ def cmd_seat(args) -> int:
     return 0
 
 
-def cmd_upgrade(args) -> int:
-    """下单 → 打开支付页 → 轮询 → 领码 → 自动激活（跨设备用 --claim）。"""
-    from . import upgrade
-
-    return upgrade.run(plan=args.plan, claim=args.claim, token=args.token,
-                       open_browser=not args.no_open, timeout=args.timeout)
-
-
-def cmd_team(args) -> int:
-    """团队协作：共享用例库 / 云端报告分享 / 审计（Team/Private）。"""
-    from . import team as team_mod
-
-    root = Path.cwd()
-    if args.team_cmd == "status":
-        return team_mod.status()
-    if args.team_cmd == "push":
-        return team_mod.push(root, app=args.app)
-    if args.team_cmd == "pull":
-        return team_mod.pull(root, app=args.app, force=args.force)
-    if args.team_cmd == "share":
-        return team_mod.share_report(Path(args.report), title=args.title, ttl_days=args.days)
-    return team_mod.audit(limit=args.limit, action=args.action or "")
-
-
 def cmd_activate(args) -> int:
+    """激活**早期购买**的激活码 —— 纯离线验签，不再向服务端登记（2026-11-02）。
+
+    团队/私有化授权走 `mat license import <license.json>`（同一套离线验签，成功后
+    额外换团队云端凭证）。两个入口刻意分开：一个是历史兼容，一个是现行合同授权。
+    """
     from . import licensing
 
-    if getattr(args, "machines", False):
-        return _print_bound_machines(licensing)
-    if getattr(args, "unbind", None):
-        try:
-            out = licensing.unbind_on_server(args.unbind)
-        except licensing.CloudError as exc:
-            print(f"解绑失败：{exc}", file=sys.stderr)
-            return 1
-        print(f"✅ 已解绑 {out.get('unbound')} —— 那台机器现在可以重新激活了。")
-        return 0
-
-    if getattr(args, "file", None):
-        try:
-            info = licensing.activate_license_file(args.file, force=args.force)
-        except ValueError as exc:
-            print(f"❌ {exc}")
-            return 1
-        import time as _t2
-        if info.get("kept_existing"):
-            cur = int(info.get("current_expires_at") or 0)
-            print(f"ℹ️ 本机已有更长的授权（至 {_t2.strftime('%Y-%m-%d', _t2.localtime(cur))}）"
-                  "——本次未做任何改动；确认要用这份更短的合同覆盖，加 --force 重跑。")
-            return 0
-        cust = f" · {info['customer']}" if info.get("customer") else ""
-        print(f"✅ 已激活 {licensing.plan_label(info['plan'])} 授权（离线验签{cust}）")
-        print(f"   功能: {', '.join(sorted(info.get('features') or [])) or '—'}")
-        seats = info.get("seats")
-        print(f"   席位: {seats if seats is not None else '—'}"
-              f" · 有效期至 {_t2.strftime('%Y-%m-%d', _t2.localtime(info['expires_at']))}")
-        srv = info.get("server") or {}
-        if srv.get("ok"):
-            print(f"   团队库: 已连通（团队 {srv.get('team_id')} · {srv.get('seats')} 席"
-                  f" · 合同 {srv.get('license_id')}）")
-            print("   验证: mat team status   # 确认同事看到的是同一个库")
-        else:
-            print(f"   ⚠️ 团队库未连通：{srv.get('error') or '未知原因'}")
-            print("      本地授权已生效，不影响生成/执行；联网后重跑同一条命令即可补上（幂等）。")
-        return 0
-
     if not getattr(args, "code", None):
-        print("用法：mat activate <激活码> ｜ mat activate --file license.json ｜ "
-              "mat activate --machines ｜ mat activate --unbind <标识>",
+        print("用法：mat activate <早期激活码>"
+              "（团队/私有化授权请用 mat license import <license.json>）",
               file=sys.stderr)
         return 1
     try:
@@ -1810,21 +1715,62 @@ def cmd_activate(args) -> int:
             # 这件事必须说出来：不说的话，用户下一次 `mat team pull` 才发现库没了。
             print("   ⚠️ 团队协作能力已失效：席位、团队库、报告链接与审计都不可用；"
                   "本机的团队凭证已作废。")
-            print("      要用回团队版：mat activate --file <license.json>")
-    if info.get("redeemed"):
-        # 时长卡：核销已在 activate() 内完成（服务端登记 + 重签普通码写盘），无需再登记
-        token = licensing.read_server_token()
-        print("✅ 时长卡已在服务端核销，有效期以核销结果为准（本机已换发普通激活码）。")
-        if token:
-            print("  用官方代理：把下面一行加进工作区 .env"
-                  "（另需 GEN_BASE_URL / GEN_PROMPT_MODE=server）：")
-            print("    " + _env_kv("GEN_" "API_KEY", str(token)))
-        return 0
-    if info.get("offline_fallback"):
-        print(f"（{info.get('note', '')}）")
-        return 0
-    _register_activation(licensing, args.code)
+            print("      要用回团队版：mat license import <license.json>")
+    if not licensing.read_server_token():
+        print("  官方代理凭证：`mat token --new` 领一张（免费档额度与早期激活码相同）")
     return 0
+
+
+def cmd_license(args) -> int:
+    """`mat license import`：导入团队/私有化 license v2 文件（现行合同授权入口）。"""
+    from . import licensing
+
+    action = getattr(args, "license_action", None) or ""
+    if action != "import":
+        print("用法：mat license import <license.json> [--force]", file=sys.stderr)
+        return 1
+    try:
+        info = licensing.activate_license_file(args.file, force=args.force)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return 1
+    import time as _t
+    if info.get("kept_existing"):
+        cur = int(info.get("current_expires_at") or 0)
+        print(f"ℹ️ 本机已有更长的授权（至 {_t.strftime('%Y-%m-%d', _t.localtime(cur))}）"
+              "——本次未做任何改动；确认要用这份更短的合同覆盖，加 --force 重跑。")
+        return 0
+    cust = f" · {info['customer']}" if info.get("customer") else ""
+    print(f"✅ 已导入 {licensing.plan_label(info['plan'])} 授权（离线验签{cust}）")
+    print(f"   功能: {', '.join(sorted(info.get('features') or [])) or '—'}")
+    seats = info.get("seats")
+    print(f"   席位: {seats if seats is not None else '—'}"
+          f" · 有效期至 {_t.strftime('%Y-%m-%d', _t.localtime(info['expires_at']))}")
+    srv = info.get("server") or {}
+    if srv.get("ok"):
+        print(f"   团队库: 已连通（团队 {srv.get('team_id')} · {srv.get('seats')} 席"
+              f" · 合同 {srv.get('license_id')}）")
+        print("   验证: mat team status   # 确认同事看到的是同一个库")
+    else:
+        print(f"   ⚠️ 团队库未连通：{srv.get('error') or '未知原因'}")
+        print("      本地授权已生效，不影响生成/执行；联网后重跑同一条命令即可补上（幂等）。")
+    return 0
+
+
+def cmd_team(args) -> int:
+    """团队协作：共享用例库 / 云端报告分享 / 审计（Team/Private）。"""
+    from . import team as team_mod
+
+    root = Path.cwd()
+    if args.team_cmd == "status":
+        return team_mod.status()
+    if args.team_cmd == "push":
+        return team_mod.push(root, app=args.app)
+    if args.team_cmd == "pull":
+        return team_mod.pull(root, app=args.app, force=args.force)
+    if args.team_cmd == "share":
+        return team_mod.share_report(Path(args.report), title=args.title, ttl_days=args.days)
+    return team_mod.audit(limit=args.limit, action=args.action or "")
 
 
 def _export_case_to_maestro(args) -> int:
@@ -1957,7 +1903,7 @@ def _usage_mode_label(plan: str | None) -> str:
 
 
 def _license_status_lines() -> list[str]:
-    """`mat status` 里的服务端授权行（T17）。**只读本地，不联网。**"""
+    """`mat status` 里的服务端授权行（团队/私有化）。**只读本地，不联网。**"""
     from . import licensing
 
     if not licensing.read_server_token():
@@ -1970,12 +1916,7 @@ def _license_status_lines() -> list[str]:
     # 这行却写「标准版」——同一屏两个档位。凭证自己的 plan 优先，旧文件没这个键才回落。
     label = licensing.plan_label(str(meta.get("plan")
                                      or licensing.read_license().get("plan") or "pro"))
-    if meta.get("machines"):
-        return [f"服务端授权（{label}）: 已登记，本机绑定 "
-                f"{meta['machines']}/{meta.get('max_machines', '?')} 台机器"
-                "（`mat activate --machines` 查看，`--unbind` 解绑）"]
-    return [f"服务端授权（{label}）: 已登记"
-            "（`mat activate --machines` 查看绑定）"]
+    return [f"服务端授权（{label}）: 已登记（团队库/团队额度凭证）"]
 
 
 def _entitlement_status_line() -> str | None:
@@ -2056,22 +1997,6 @@ def _print_ledger(led: dict, synced_at: str) -> None:
     if capped:
         print(f"  ⚠️ 超额未计酬  {capped} 人  ← 已达标，但本月已达上限，不再计酬")
     print(f"  每次奖励      {kind} {led.get('reward_amount', 0):g} {unit}")
-
-
-def _report_pro_reward(claim: dict | None, led: dict) -> None:
-    """把邀请挣来的 Pro 时长落到本机。`claim` 由 `invite.sync_ledger` 给。
-
-    ⚠️ 只在**比本机现有有效期更晚**时才激活（判断在 `invite.claim_pro_reward` 里）：
-    服务端签的是「现在 + 累计天数」，用户自己买的年付可能更长，直接覆盖会把有效期**改短**。
-    """
-    if claim and claim.get("activated"):
-        until = datetime.fromtimestamp(claim["expires_at"]).strftime("%Y-%m-%d")
-        print(f"🎁 已自动激活邀请奖励：Pro 有效期至 {until}")
-    elif claim and claim.get("reason"):
-        print(f"（邀请奖励未改动本机授权：{claim['reason']}）")
-    elif (led.get("pro_code") or {}).get("status") == "pending_sign":
-        print("🎁 邀请奖励已记账（Pro 时长），但服务端还没签发激活码 ——"
-              "等运营配好签名密钥后重跑本命令即可领取。")
 
 
 def cmd_invite(args) -> int:
@@ -2156,7 +2081,6 @@ def cmd_invite(args) -> int:
 
     led = out["ledger"]
     _print_ledger(led, str(inv.load_state().get("ledger_synced_at", "")))
-    _report_pro_reward(out.get("claim"), led)
     return 0
 
 
@@ -3116,27 +3040,19 @@ def main(argv: list[str] | None = None) -> None:
                        help="配合 --renew：强制换新 profile（删本地旧 profile 再签，失败自动回滚）。"
                             "Apple 在旧 profile 仍有效时不会重发，所以提前续期必须加它")
     iosup.set_defaults(func=cmd_ios_setup)
-    act = sub.add_parser("activate", help="激活 Pro（用户）；--machines/--unbind 管理机器绑定")
-    act.add_argument("code", nargs="?", help="激活码（用 --machines / --unbind 时可省略）")
-    act.add_argument("--machines", action="store_true", help="查看本激活码已绑定的机器（T17）")
-    act.add_argument("--unbind", metavar="机器标识", help="解绑一台机器（换机/重装场景）")
-    act.add_argument("--file", metavar="license.json",
-                     help="用 license v2 文件激活（Team/Private 签发的 JSON，离线验签）")
+    act = sub.add_parser("activate",
+                         help="激活早期购买的激活码（纯离线验签；不再签发新码）")
+    act.add_argument("code", nargs="?", help="早期激活码（MAT-… / MAT2-…）")
     act.add_argument("--force", action="store_true",
-                     help="允许更短期限覆盖现有授权 / 允许标准码把团队授权降级")
+                     help="允许更短期限覆盖现有授权 / 允许早期码把团队授权降级")
     act.set_defaults(func=cmd_activate)
-    upg = sub.add_parser("upgrade",
-                         help="标准版支持卡（3 个月）下单并自动激活（下单→支付→领码→激活）")
-    upg.add_argument("plan", nargs="?", default="pro_quarter",
-                     choices=("pro_quarter", "pro_year", "pro_month"),
-                     help="档位：pro_quarter=3 个月卡（默认）/ 年付 / 月付（后两者缺省未开售）")
-    upg.add_argument("--claim", metavar="订单号",
-                     help="已付款订单：只领码并激活（跨设备用，需配 --token）")
-    upg.add_argument("--token", metavar="领取令牌", help="与 --claim 搭配的领取令牌")
-    upg.add_argument("--no-open", action="store_true",
-                     help="不自动打开浏览器，只打印支付页路径")
-    upg.add_argument("--timeout", type=int, default=900, help="等待付款的秒数（默认 900）")
-    upg.set_defaults(func=cmd_upgrade)
+    lic = sub.add_parser("license", help="合同授权：导入团队/私有化 license v2 文件")
+    lic_sub = lic.add_subparsers(dest="license_action", required=True)
+    lic_imp = lic_sub.add_parser("import", help="导入 license.json（离线验签 + 接团队云端）")
+    lic_imp.add_argument("file", metavar="license.json", help="签发端交付的整份 JSON")
+    lic_imp.add_argument("--force", action="store_true",
+                         help="允许更短期限覆盖现有授权")
+    lic_imp.set_defaults(func=cmd_license)
     team_p = sub.add_parser(
         "team", help="团队协作：共享用例库 / 云端报告 / 审计（Team/Private 档）")
     team_sub = team_p.add_subparsers(dest="team_cmd", required=True)

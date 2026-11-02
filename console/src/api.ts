@@ -29,8 +29,7 @@ export type StateResp = {
   usage: { gen_count: number; gen_limit: number | null; vision_count: number; vision_limit: number | null };
   /** AI 接入方式：server=官方代理 / local=自带 Key（**不是**使用方式，后者看 license.plan） */
   ai_mode?: "server" | "local";
-  // 使用方式页「套餐」行展示到期日：plan=pro 时有 expires_at（Unix 秒）；free/过期时为 null。
-  // 激活/续期（含时长卡核销换码）写盘 license.json 后，重拉 state 自然拿到新日期。
+  // 使用方式页展示到期日：团队/私有化合同授权才可能有 expires_at（Unix 秒）。
   license?: { plan: string; expires_at: number | null };
   code_stale: { stale: boolean; file?: string; behind_seconds?: number }; gen_ready: boolean;
   devices: Device[]; console?: "pro" | "legacy"; prompt_mode?: "server" | "local";

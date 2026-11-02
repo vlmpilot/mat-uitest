@@ -2,6 +2,30 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号规则：向后兼容修复升 patch，新增用户可见能力升 minor。
 
+## [0.7.13] - 2026-11-02
+
+> 激活码停发：单人档装完即用，团队授权改用一份 license 文件。
+
+### Breaking
+
+- **激活码不再签发**。单人档（free/pro）权益本就相同（300 次生成 / 100 次视觉），
+  激活码不再带来额外能力。
+  - `mat activate <码>` 改为**纯离线验签**：不登记、不绑机、不出网。旧码仍能激活，
+    但只证明「曾经买过」，权益与单人档一致。
+  - 团队/私有化授权改用 `mat license import <license.json>`。
+  - 移除 `mat upgrade`、`mat activate --machines`、`mat activate --unbind`。
+
+### Changed
+
+- **个人档不再能开 `--share` 席位**：席位随团队授权提供，合同里的 `seats` 只是数量
+  字段，不构成授权类型。
+- **运行目录统一**：`artifacts/<stem>-<UTC戳>` 成为唯一运行目录，旧固定目录只读兼容。
+
+### Fixed
+
+- 修「状态 failed 但结论 pass」：run.json 与 verify.json 曾写在不同时刻、共用固定
+  目录，后者会覆盖前者。
+
 ## [0.7.12] - 2026-11-02
 
 > 只剩「单人 / 团队」两种模式；验证的执行超时与并发额度闸补上。

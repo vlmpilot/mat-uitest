@@ -265,7 +265,7 @@ function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => voi
       </Row>
       <NextStepCard state={state} onNav={onNav} />
       <QualityMetricsCard />
-      <EnvDoctor state={state} onGoSettings={() => onNav({ view: "settings" })} />
+      <EnvDoctor state={state} />
     </>
   );
 }
@@ -665,8 +665,7 @@ export default function App() {
           {view === "reports" && state && <Reports state={state} onLaunched={onLaunched} />}
           {view === "heals" && state && <Heals state={state} />}
           {view === "review" && state && <Review state={state} />}
-          {view === "settings" && state && <Settings state={state}
-            onRefresh={() => getState().then(setState)} />}
+          {view === "settings" && state && <Settings state={state} />}
           {view === "audit" && <Audit />}
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)}
             state={state} onNav={navigate} />

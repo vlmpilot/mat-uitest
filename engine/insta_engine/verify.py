@@ -32,6 +32,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .artifact_paths import new_run_dir
+
 SCHEMA = "mat.verify/1"
 
 #: 退出码（与 `mat run` 同一套，勿另立）
@@ -444,9 +446,13 @@ def _run_verify(root: Path, case_path: Path, *, serial: str | None = None,
     case_path = Path(case_path)
     raw = json.loads(case_path.read_text(encoding="utf-8"))
     case = TestCase.model_validate(raw)
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    art = Path(artifacts) if artifacts else Path(root) / "artifacts" / "verify" / f"{case_path.stem}-{stamp}"
-    art.mkdir(parents=True, exist_ok=True)
+    # 产物目录统一走 `artifact_paths`（2026-11-02）：不再落 `artifacts/verify/` 子层，
+    # 与 CLI/控制台单条同层、同命名，避免"两套产物模型"再各写一套链接/stale 特判。
+    if artifacts:
+        art = Path(artifacts)
+        art.mkdir(parents=True, exist_ok=True)
+    else:
+        art = new_run_dir(root, case_path.stem)
 
     busy = _console_busy(serial)
     if busy is not None:

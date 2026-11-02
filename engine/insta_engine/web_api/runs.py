@@ -113,7 +113,11 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
     # 09-16 的前置页面全部不可达、雪崩连锁失败）。cold = 每条开始前 force-stop
     # 目标 App，冷启动交给用例自身的 launch 前置（导入转换产物已自动注入）。
     reset_mode = str(body.get("reset") or "cold")
-    artifacts = root / "artifacts" / case_path.stem
+    # 每次运行独立目录（2026-11-02 统一）：固定 `artifacts/<stem>` 会被重跑覆盖，
+    # 而 verify.json 与 run.json 是两个时刻写的 ⇒ 会出现「状态 failed + 结论 pass」。
+    from ..artifact_paths import new_run_dir
+
+    artifacts = new_run_dir(root, case_path.stem)
 
     def job(emit, cancel):
         _require_fresh_code()

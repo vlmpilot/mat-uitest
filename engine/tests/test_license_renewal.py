@@ -14,15 +14,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import sys
 import time
 import uuid
-from pathlib import Path
 
 import pytest
 
 from insta_engine import licensing
-from insta_engine.cloudapi import CloudError
 
 # 与 test_v1.py 同源的测试专用密钥（真实环境无效；变量名刻意不叫 *_SECRET，
 # 免得触发导出脚本的"疑似密钥"自查）
@@ -106,47 +103,6 @@ def test_first_activation_uses_code_expiry():
     assert _expiry() == licensing.verify_code(code)["expires_at"]
 
 
-# -- 累加发生在签发端 --------------------------------------------------------
-
-def _issue_license():
-    """取签发端模块。
-
-    ⚠️ 签发端**不随本仓库分发** ⇒ 这个模块在本仓库里**不存在**。用 `importorskip`
-    而不是删测试：**有签发端的开发环境**必须真跑，**没有的环境**只能跳过。
-    **不这样处理就是「开发环境全绿、发布产物 CI 红」**——实测过：`import` 在收集期
-    就炸，`pytest engine/tests` 整个中断、一条都不跑。
-    """
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-    return pytest.importorskip("issue_license", reason="签发端不在本仓库内")
-
-
-def test_renewal_code_from_original_expiry_extends(tmp_path):
-    """续费码按「原到期日 + N 个月」签发 ⇒ 激活后真的往后加。
-
-    这正是签发端 `--from <原到期日>` 的语义。
-    """
-    issue_license = _issue_license()
-
-    licensing.activate(mint(months=1))
-    current = _expiry()
-
-    renewal = issue_license.generate(TEST_LICENSE_KEY, "pro", 12, start_at=current)
-    info = licensing.activate(renewal)
-
-    assert info["kept_existing"] is False
-    assert info["expires_at"] == current + 12 * MONTH
-    assert _expiry() - current == 12 * MONTH, "续费必须在原到期日之上累加"
-
-
-def test_issue_license_from_flag_parses_date():
-    issue_license = _issue_license()
-
-    start = issue_license.parse_start("2027-10-07")
-    assert time.strftime("%Y-%m-%d", time.localtime(start)) == "2027-10-07"
-    years_after = start + 12 * MONTH
-    assert years_after > start
-
-
 # -- 边界：不能因为"保留现有"而放松验签 --------------------------------------
 
 def test_expired_code_still_rejected_by_default():
@@ -166,7 +122,7 @@ def test_tampered_license_file_is_ignored():
     assert licensing.read_license()["plan"] == "free"
 
 
-# -- 时长卡（2026-10-13）：真到期在服务端核销 --------------------------------
+# -- 时长卡（2026-11-02 起纯离线）--------------------------------------------
 
 def test_verify_code_parses_duration_card_months():
     """plan 段 `pro+N` ⇒ plan 还是 pro、months=N；畸形后缀按普通码（months=0）。"""
@@ -176,61 +132,27 @@ def test_verify_code_parses_duration_card_months():
     assert licensing.verify_code(mint(months=1))["months"] == 0
 
 
-def test_duration_card_redeems_online_and_writes_reissued_plain_code(monkeypatch):
-    """在线核销：写盘的是服务端**重签的普通码**（final 日期），本地验签通过才采用。"""
-    final = int(time.time()) + 400 * 86400
-    reissued = mint(months=12, start_at=final - 12 * MONTH)
-    assert licensing.verify_code(reissued)["expires_at"] == final
-
-    def fake_redeem(code, old_code=None):
-        licensing.save_server_token("srv-token",
-                                    {"plan": "pro", "machines": 1, "max_machines": 3})
-        return {"token": "srv-token", "new_code": reissued, "expires_at": final,
-                "plan": "pro", "machines": 1, "max_machines": 3}
-
-    monkeypatch.setattr(licensing, "redeem_on_server", fake_redeem)
-
-    card = mint(plan="pro+12", months=12)
-    info = licensing.activate(card)
-
-    assert info["redeemed"] is True and info["expires_at"] == final
-    on_disk = json.loads(licensing.license_path().read_text(encoding="utf-8"))
-    assert on_disk["code"] == reissued, "写盘的必须是重签普通码，不是时长卡原码"
-    assert licensing.read_license()["expires_at"] == final
-    assert licensing.read_server_token() == "srv-token"
-
-
-def test_duration_card_offline_falls_back_to_builtin_expiry(monkeypatch):
-    """离线兜底：核销失败 ⇒ 按码内兜底日期本地激活（时长卡原码写盘），如实标注。"""
-    def boom(*a, **k):
-        raise CloudError("连不上轻云")
-
-    monkeypatch.setattr(licensing, "redeem_on_server", boom)
-
+def test_duration_card_uses_its_builtin_expiry_offline():
+    """不再在线核销：时长卡按码内兜底到期日离线生效（与普通码同路径）。"""
     card = mint(plan="pro+6", months=6)
     info = licensing.activate(card)
 
-    assert info["offline_fallback"] is True and info["kept_existing"] is False
+    assert info["kept_existing"] is False
     assert info["expires_at"] == licensing.verify_code(card)["expires_at"]
     on_disk = json.loads(licensing.license_path().read_text(encoding="utf-8"))
-    assert on_disk["code"] == card, "离线兜底写盘的是时长卡原码（联网后重跑完成核销）"
-    assert "核销未完成" in info["note"]
+    assert on_disk["code"] == card
+    assert licensing.read_server_token() == "", "不再发生服务端登记"
 
 
-def test_duration_card_offline_never_shortens_existing(monkeypatch):
-    """离线兜底也要**谁长用谁**：现有授权更长时保持不变、不写盘。"""
-    def boom(*a, **k):
-        raise CloudError("服务端拒绝（HTTP 409）：机器超限")
-
-    monkeypatch.setattr(licensing, "redeem_on_server", boom)
-
+def test_duration_card_never_shortens_existing():
+    """谁长用谁：现有授权更长时保持不变、不写盘。"""
     licensing.activate(mint(months=12))
     long_exp = _expiry()
     before = licensing.license_path().read_bytes()
 
     info = licensing.activate(mint(plan="pro+1", months=1))
 
-    assert info["offline_fallback"] is True and info["kept_existing"] is True
+    assert info["kept_existing"] is True
     assert _expiry() == long_exp
     assert licensing.license_path().read_bytes() == before
 

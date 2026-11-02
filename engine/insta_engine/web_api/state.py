@@ -98,24 +98,3 @@ def api_doctor_fix(host: str, root: Path, body: dict) -> tuple[int, dict]:
     命令本体在 doctor.FIX_ACTIONS 白名单里，前端传不进任意命令；仅本机模式可用。"""
     from .. import doctor
     return doctor.run_fix(str(body.get("action") or ""), root, host)
-
-
-def api_activate(body: dict) -> tuple[int, dict]:
-    """Pro 激活码激活（控制台账号页入口）：验签 + 写 license.json，成功返回套餐信息。
-
-    与 CLI `mat activate` 同一实现（licensing.activate）；失败返回 400 与原因。
-    """
-    code = str(body.get("code", "")).strip()
-    if not code:
-        return 400, {"error": "缺少激活码"}
-    try:
-        from ..licensing import activate
-        info = activate(code)
-    except Exception as exc:
-        return 400, {"error": str(exc)}
-    out = {"ok": True, "plan": info["plan"], "expires_at": info["expires_at"]}
-    if info.get("redeemed"):
-        out["note"] = "时长卡已在服务端核销，有效期以核销结果为准"
-    elif info.get("offline_fallback"):
-        out["note"] = str(info.get("note") or "")
-    return 200, out

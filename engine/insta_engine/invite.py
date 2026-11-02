@@ -171,10 +171,12 @@ _LEDGER_KEYS = ("invited", "qualified", "pending", "credited_this_month",
 
 
 def sync_ledger() -> dict:
-    """拉台账 → 写本地快照 → 尝试领取 Pro 奖励。返回 `{ledger, claim}`。
+    """拉台账 → 写本地快照。返回 `{ledger}`。
 
-    **这是唯一拉台账的地方**（CLI 与配置台共用）：快照格式与领奖纪律只有一份实现，
+    **这是唯一拉台账的地方**（CLI 与配置台共用）：快照格式只有一份实现，
     不会出现"CLI 存了 8 个键、配置台存了 5 个"这种静默分叉。
+
+    2026-11-02 起不再领 Pro 激活码：单人档免费且额度相同，奖励统一发服务端生成次数。
     """
     from datetime import datetime
 
@@ -183,12 +185,7 @@ def sync_ledger() -> dict:
     state["ledger_synced_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     state["ledger_cache"] = {k: led.get(k) for k in _LEDGER_KEYS}
     save_state(state)
-    claim = None
-    try:
-        claim = claim_pro_reward(led)
-    except (InviteError, ValueError):
-        claim = None      # 激活码用不了不影响看台账
-    return {"ledger": led, "claim": claim}
+    return {"ledger": led}
 
 
 # -- 里程碑与领奖 -----------------------------------------------------------
@@ -222,17 +219,7 @@ def notice(state: dict | None = None) -> str | None:
 
     只读本地快照 ⇒ 概览页不会因此联网（§6.4 同一纪律）。
     """
-    from datetime import datetime
-
     st = state if state is not None else load_state()
-    claim = st.get("pro_claim") or {}
-    if claim.get("activated") and not st.get("pro_claim_acked"):
-        try:
-            until = datetime.fromtimestamp(int(claim["expires_at"])).strftime("%Y-%m-%d")
-        except (KeyError, TypeError, ValueError, OSError):
-            until = "（时间未知）"
-        return f"邀请奖励已到账：Pro 有效期延长至 {until}"
-
     led = st.get("ledger_cache") or {}
     credited = int(led.get("credited_this_month") or 0)
     seen = int(st.get("notice_acked_credited") or 0)
@@ -249,30 +236,6 @@ def ack_notice() -> None:
     （常驻提示会变成噪音，用户很快就不看了）。
     """
     st = load_state()
-    st["pro_claim_acked"] = True
     led = st.get("ledger_cache") or {}
     st["notice_acked_credited"] = int(led.get("credited_this_month") or 0)
     save_state(st)
-
-
-def claim_pro_reward(ledger_data: dict | None = None) -> dict | None:
-    """把邀请挣来的 Pro 时长激活到本机。**只在比当前更晚时才激活。**
-
-    ⚠️ 「只在更晚时激活」这句判断不能省：服务端签的码是 `现在 + 累计天数`。
-    如果用户本来就有更长的 Pro（例如自己买了年付），直接 `activate()` 会**把有效期改短**。
-
-    返回 `None` = 没有 Pro 奖励；否则 `{activated: bool, ...}`。
-    """
-    from .licensing import activate, read_license
-
-    data = ledger_data if ledger_data is not None else ledger()
-    grant = data.get("pro_code") or {}
-    code = grant.get("code")
-    if not code:
-        return None
-    new_expires = int(grant.get("expires_at") or 0)
-    current = int(read_license().get("expires_at") or 0)
-    if new_expires <= current:
-        return {"activated": False, "reason": "本机已有更长的有效期", "expires_at": current}
-    activate(code)
-    return {"activated": True, "expires_at": new_expires}

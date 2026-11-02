@@ -258,60 +258,6 @@ def test_run_command_never_qualifies_without_invite(monkeypatch, tmp_path):
     assert rec.calls == []
 
 
-# -- 领奖：不许把有效期改短（§4）--------------------------------------------
-
-
-def _sign(expires: int, key: str = "mat-beta-public-2026") -> str:
-    """签一张能被 `licensing.verify_code` 验过的码（测试专用，与引擎口径一致）。"""
-    import hashlib
-    import hmac
-
-    body = f"pro.{expires}.abc123"
-    raw = f"{body}." + hmac.new(key.encode(), body.encode(), hashlib.sha256).hexdigest()[:16]
-    return "MAT-" + "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
-
-
-def _install_license(code: str) -> None:
-    from insta_engine import licensing
-
-    licensing.license_path().parent.mkdir(parents=True, exist_ok=True)
-    licensing.license_path().write_text(json.dumps({"code": code}), encoding="utf-8")
-
-
-def test_claim_pro_reward_does_not_shorten_a_longer_local_license():
-    """🔴 服务端签的是「现在 + 累计天数」；用户自己买的年付可能更长。
-
-    直接 `activate()` 会把有效期**改短** —— "好心办坏事"的典型，
-    所以只在**比本机更晚**时才激活。
-    """
-    far_future = 4102444800          # 2100-01-01
-    _install_license(_sign(far_future))
-
-    out = inv.claim_pro_reward({"pro_code": {"code": _sign(2000000000),
-                                             "expires_at": 2000000000}})
-
-    assert out == {"activated": False, "reason": "本机已有更长的有效期",
-                   "expires_at": far_future}
-
-
-def test_claim_pro_reward_activates_when_it_extends():
-    """比本机晚 ⇒ 真的激活（阳性对照，证明上一条不是在测"什么都不做"）。"""
-    from insta_engine import licensing
-
-    _install_license(_sign(1900000000))
-    future = 2000000000
-
-    out = inv.claim_pro_reward({"pro_code": {"code": _sign(future), "expires_at": future}})
-
-    assert out == {"activated": True, "expires_at": future}
-    assert licensing.read_license()["plan"] == "pro"
-
-
-def test_claim_pro_reward_returns_none_without_a_code():
-    assert inv.claim_pro_reward({"pro_code": None}) is None
-    assert inv.claim_pro_reward({"pro_code": {"status": "pending_sign"}}) is None
-
-
 def test_invite_command_is_the_only_one_that_registers(monkeypatch, tmp_path, capsys):
     """阳性对照：`mat invite --yes` **应该**发起注册 —— 证明上一条护栏不是空转的。"""
     rec = Recorder(FakeResponse(payload={"user_id": "inv_1", "invite_code": "ABCD2345",
@@ -542,26 +488,6 @@ def test_notice_reports_new_credited_count_then_goes_quiet():
 
     inv.ack_notice()
     assert inv.notice() is None, "点过「知道了」就不该再冒 —— 不常驻是设计要求"
-
-
-def test_notice_reports_pro_extension_once():
-    inv.save_state({"invite_code": "ABCD2345",
-                    "pro_claim": {"activated": True, "expires_at": 2000000000},
-                    "ledger_cache": {"credited_this_month": 0, "monthly_cap": 3}})
-
-    assert "Pro 有效期延长至" in (inv.notice() or "")
-
-    inv.ack_notice()
-    assert inv.notice() is None
-
-
-def test_notice_is_silent_for_a_pending_or_skipped_claim():
-    """没真的到账就不许报喜：`pending_sign`（没配签名密钥）与"本机已有更长期限"都不是到账。"""
-    for claim in ({"activated": False, "reason": "本机已有更长的有效期"},
-                  {"kind": "pro_days", "amount": 3, "status": "pending_sign"}):
-        inv.save_state({"invite_code": "ABCD2345", "pro_claim": claim,
-                        "ledger_cache": {"credited_this_month": 0}})
-        assert inv.notice() is None, f"{claim} 不该被当成到账"
 
 
 def test_quota_exceeded_message_points_to_invite():

@@ -99,7 +99,6 @@ from .web_api.seats import api_seat_check, api_seat_remove, api_seats
 from .web_api.seats import enforce as seat_enforce
 from .web_api.share import api_share
 from .web_api.state import (  # noqa: F401
-    api_activate,
     api_doctor,
     api_doctor_fix,
     api_metrics,
@@ -481,7 +480,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/ios/sim/boot": lambda: api_ios_sim_boot(self.body),
             "/api/screenshots/capture": lambda: api_screenshot_capture(
                 self.root, str(self.server.server_address[:2][0]), self.body),
-            "/api/activate": lambda: api_activate(self.body),
             "/api/heals/apply": lambda: api_heal_apply(self.root, self.body),
             "/api/workspace/switch": lambda: api_workspace_switch(
                 self.server, self.root, str(self.client_address[0]), self.body),
@@ -579,8 +577,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             route = self._post_routes().get(path)
             if route is not None:
                 # 人数闸（2026-10-12 补洞）：写操作必须带已登记的执行人名字——匿名/未登记
-                # 一律拒绝，堵死「先匿名绕过名额」。豁免登记入口自身与机器级激活。
-                if path not in ("/api/seats/check", "/api/activate"):
+                # 一律拒绝，堵死「先匿名绕过名额」。豁免登记入口自身。
+                if path not in ("/api/seats/check",):
                     gate = seat_enforce(self.root, self.body, self._shared())
                     if gate is not None:
                         return self._json(*gate)

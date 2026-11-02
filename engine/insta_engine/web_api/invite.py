@@ -14,8 +14,9 @@
 
 from __future__ import annotations
 
-#: 报文里**永不出现在浏览器侧**的字段：
-#: `token` = 匿名身份凭证；`pro_code` = 邀请奖励的**激活码**（它也是一张凭证）。
+#: 报文里**永不出现在浏览器侧**的字段：`token` = 匿名身份凭证。
+#: `pro_code` 是历史服务端仍可能返回的邀请奖励码字段——签发已下线，但剥除逻辑保留，
+#: 避免任何旧响应/中间层把一张凭据带进浏览器。
 _CREDENTIAL_KEYS = ("token", "pro_code")
 
 
@@ -27,8 +28,7 @@ def _scrub_credentials(value):
     （当前前端确实没有消费它们的地方，但"现在没人用"正是"以后有人顺手用一下"的温床。）
 
     剥掉不影响取用：`join` / `accept` 已经把凭证**落盘**到 `~/.mat/invite.json`，
-    客户端要用时自己读本地；`pro_code` 的核销也在 `sync_ledger()` 内**服务端侧**完成，
-    不需要经过浏览器。
+    客户端要用时自己读本地。
     """
     if isinstance(value, dict):
         return {k: _scrub_credentials(v) for k, v in value.items() if k not in _CREDENTIAL_KEYS}
@@ -54,7 +54,6 @@ def api_invite_status() -> tuple[int, dict]:
         "accepted": state.get("accepted"),
         "ledger": state.get("ledger_cache") or None,
         "synced_at": state.get("ledger_synced_at"),
-        "pro_claim": state.get("pro_claim"),
         # 概览页的「奖励到账」提示（不常驻；用户点"知道了"后由 action=ack 清掉）
         "notice": invite.notice(state),
     })

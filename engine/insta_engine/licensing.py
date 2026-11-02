@@ -1,13 +1,15 @@
-"""Pro 激活码校验与本地激活：HMAC-SHA256 签名 + 过期校验。
+"""授权校验与本地激活。
 
-**本模块只做校验，不含签发**——签发工具不随开源包分发。理由：签发能力若随包分发，
-等于把「一条命令造出可用 Pro 码」交给每一个用户——而普通用户的校验端用的正是
-下面的公开兜底密钥。
+两条完全独立的授权路径：
 
-诚实边界：校验端必须持有密钥才能验签，所以兜底密钥是公开的，签名算法也可由校验逻辑复现。
-这套机制只用于**提高门槛**，不是安全边界；真正的边界在服务端校验（既定路线）。
+- **早期激活码**（`MAT-` / `MAT2-`）：只做 HMAC/Ed25519 **离线验签** + 写本机
+  `license.json`。2026-11-02 起**不再签发新码、不再向服务端登记/核销/绑定机器**；
+  已发出的码继续可用（单人版权益与免费档相同）。校验只用于兼容历史授权。
+- **团队/私有化 license 文件**（v2，Ed25519 离线验签）：`mat license import` 导入，
+  成功后 best-effort 调 `/license/attach` 换团队云端凭证。
 
-用户侧：`mat activate <激活码>` 写入 ~/.mat/license.json。
+**本模块不含签发**——签发能力不随开源包分发。早期激活码的校验密钥必须随包分发，
+所以那套机制只用于**提高门槛**，不是安全边界；真正的边界是服务端 token。
 """
 
 from __future__ import annotations
@@ -21,24 +23,6 @@ import time
 from pathlib import Path
 
 from .state import state_home
-
-
-def __getattr__(name: str):
-    """`CloudError` 延迟暴露（PEP 562）—— **顶层不许导入网络客户端**。
-
-    纪律见 `tests/test_machine_binding.py::test_cloudapi_is_not_imported_by_other_cli_modules`：
-    导入 CLI 时不得把 `cloudapi`（连带 `requests`）拉进 `sys.modules`，否则任何命令都可能出网。
-
-    原先这里是**模块级** `from .cloudapi import CloudError`，一直没被发现——因为 `__main__`
-    只在函数内导入 `licensing`。直到 `quota.py` 开始模块级导入 `seat_quota`（而后者模块级
-    导入本模块），这条链才接通并把 `cloudapi` 拉进了 CLI 的导入图。
-    调用方照旧写 `except licensing.CloudError`（`from .licensing import CloudError` 也走这里）。
-    """
-    if name == "CloudError":
-        from .cloudapi import CloudError
-
-        return CloudError
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Beta 激活码的**公开兜底签名密钥**。它不是秘密，也不该被当成秘密：
 # 校验端（用户机器）必须持有同一密钥才能验签，所以它**必须随开源包分发**。
@@ -441,13 +425,11 @@ def _free_license() -> dict:
             "features": sorted(plan_features("free")), "seats": None, "source": "none"}
 
 
-# -- 服务端登记与机器绑定（T17）----------------------------------------------
+# -- 本机标识与云端凭证 ------------------------------------------------------
 #
-# 本地闸门与**服务端额度**是两件事（红线：本地码永不直接兑服务端额度）：
-#   · 本地 `license.json` —— HMAC 验签、**离线可用**、不绑机器（BYOK 零成本，共享无所谓）
-#   · 服务端凭证         —— 绑定机器、可吊销、有 300 次/月**真实计量**
-# 所以 `mat activate` 在本地写盘之后**额外**做一次服务端登记；那一步失败**不阻断**本地激活
-# （BYOK 用户不该因为断网就用不了）。
+# 2026-11-02 起激活码不再向服务端登记；这里只剩团队/私有化授权需要的能力：
+#   · `machine_id`  —— `/license/attach` 用它生成按机器区分的 user_id（用量按机器记）
+#   · 云端凭证文件  —— 团队库/团队额度/审计的 Bearer（`team.bearer()` 读它）
 
 
 def machine_id() -> str:
@@ -456,12 +438,11 @@ def machine_id() -> str:
     首次调用时由硬件信息派生并**落盘缓存**（`~/.mat/machine_id`）。为什么要缓存：
 
     - 派生源可能取不到（容器里没有稳定网卡）⇒ `uuid.getnode()` 会**每个进程都随机**，
-      不缓存的话每跑一次 `mat activate` 就是一个"新机器"，用户会瞬间用光名额被锁在外面；
+      不缓存的话每次客户端启动都是"新机器"，服务端用量会被拆成多份；
     - 缓存后天然稳定：重装 MAT、换网卡、改主机名都不会变。
 
     代价（**有意的取舍**）：把 `~/.mat/machine_id` 复制到别的机器就能冒充同一台。
-    绑定要防的是"20 人共享一个码"这种顺手行为，不是有组织的绕过；
-    而把真用户锁在门外（换机 / 重装 / 容器重建）比少收一份糟得多。
+    它只用于按机器归属用量，不是安全边界。
     """
     import platform
     import socket
@@ -532,44 +513,6 @@ def clear_server_token() -> bool:
         return False
 
 
-def activate_on_server(code: str) -> dict:
-    """把这次激活登记到服务端，并保存它签发的**绑机器凭证**。
-
-    ⚠️ 调用方必须**容忍它失败**（网络不通是常态）—— 本地授权已经生效了。
-    """
-    from .cloudapi import post
-
-    out = post("/license/activate", {"code": code, "machine_id": machine_id()})
-    save_server_token(str(out["token"]), out)
-    return out
-
-
-def redeem_on_server(code: str, old_code: str | None = None) -> dict:
-    """时长卡核销：服务端拿**旧授权原码**自己验签算 base（不信客户端报数），
-    返回最终到期日 + **重签的普通固定码** + 绑机器凭证，并保存凭证。
-
-    ⚠️ 调用方必须容忍 `CloudError`（断网 / 服务端拒绝都走它）—— 失败时降级本地兜底。
-    """
-    from .cloudapi import post
-
-    out = post("/license/redeem", {"code": code, "machine_id": machine_id(),
-                                   "old_code": old_code or None})
-    save_server_token(str(out["token"]), out)
-    return out
-
-
-def list_server_machines() -> dict:
-    from .cloudapi import get
-
-    return get("/license/machines", bearer=read_server_token())
-
-
-def unbind_on_server(machine: str) -> dict:
-    from .cloudapi import post
-
-    return post("/license/unbind", {"machine_id": machine}, bearer=read_server_token())
-
-
 def activate(code: str, *, force: bool = False) -> dict:
     """激活一张激活码。**续费不砍短**：新码到期日早于本机现有有效期时，保留较长的那个。
 
@@ -584,23 +527,18 @@ def activate(code: str, *, force: bool = False) -> dict:
       `kept_existing`   —— True = 本机原有授权更长，本次**没有改动任何东西**
       `same_code`       —— 仅在 `kept_existing` 时非 False：True = 本机存的就是**同一张码**
                            （⇒ CLI 能说"你已经用这张码激活过了"，而不是含糊的"保留现有授权"）
-      `redeemed`        —— True = 时长卡已在线核销，写盘的是服务端重签的普通码
-      `offline_fallback`/`note` —— 时长卡核销失败时的本地兜底说明
 
     这样调用方（`mat activate`）无论走哪个分支，打印的都是**用户真实的到期日**，
     不需要自己判断分支。
 
-    ⚠️ **普通码的到期日唯一事实来源是码本身**（HMAC 签名里带着它）——固定码路径**不做**
-    "把时长加到现有到期日上"的累加，因为那样 `license.json` 就变成一个可被手工改长的
-    授权来源。时长累加只存在于两条受控路径：签发端 `--from <原到期日>`（普通码续费）、
-    服务端核销（时长卡，见 `_activate_duration_card`）。
+    ⚠️ **到期日唯一事实来源是码本身**（签名里带着它）——本地**不做**"把时长加到现有
+    到期日上"的累加，因为那样 `license.json` 就变成一个可被手工改长的授权来源。
+    时长卡（`plan=pro+N`）2026-11-02 起不再在线核销：按码内到期日离线生效（与普通码同路径）。
     """
     verified, reason = verify_code_detailed(code)
     if verified is None:
         # 具体原因（格式 / 签名 / 过期）由 explain_code_failure 统一给，别再写死一句话
         raise ValueError(explain_code_failure(code, reason))
-    if verified.get("months"):
-        return _activate_duration_card(code, verified)
     return _write_local(code, verified, force=force)
 
 
@@ -625,7 +563,7 @@ def _write_local(code: str, verified: dict, *, force: bool = False) -> dict:
         raise ValueError(
             "本机现有的是团队/私有化授权（含团队协作能力），这张标准码会把它降级："
             "席位、团队库与审计授权都会失效。确认要降级请加 --force 重跑；"
-            "只是想续期请用团队授权文件（mat activate --file）。")
+            "只是想续期请用团队授权文件（`mat license import <license.json>`）。")
     current = int(lic.get("expires_at") or 0)
     if current and code_expires <= current:
         return {"plan": verified["plan"], "expires_at": current,
@@ -649,47 +587,3 @@ def _write_local(code: str, verified: dict, *, force: bool = False) -> dict:
     return {"plan": verified["plan"], "expires_at": code_expires,
             "code_expires_at": code_expires, "kept_existing": False, "same_code": False,
             "downgraded": downgraded, "cleared_server_token": cleared}
-
-
-def _activate_duration_card(code: str, verified: dict) -> dict:
-    """时长卡（plan 段 `pro+N`）激活：**真到期在服务端核销**，失败降级本地兜底。
-
-    - 在线：`/license/redeem` —— 服务端拿本机旧授权**原码**自己验签算 base
-      （谎报无效：伪造就不了真码，而真码受核销幂等约束），返回最终到期日与
-      **重签的普通固定码**；写盘 new_code 后 `read_license`/`status`/额度判定
-      全走既有固定码路径，**零特判**。核销在服务端按 (码, 机器) 幂等锁定，
-      重装/重复激活都只会得到同一个 final。
-    - 离线/失败：按码内兜底到期日（签发日 + N 月）本地激活，**谁长用谁**；
-      联网后重跑 `mat activate <此码>` 仍可核销（幂等，final 只算一次）。
-    """
-    current_code = str(read_license().get("code") or "")
-    from .cloudapi import CloudError  # 逐处延迟导入：顶层不许把 requests 拉进 CLI 的导入图
-    try:
-        resp = redeem_on_server(code, current_code)
-    except CloudError as exc:
-        out = _write_local(code, verified)
-        if out.get("kept_existing"):
-            note = (f"服务端核销未完成（{exc}）；本机现有授权更长、保持不变，"
-                    "联网后重跑 `mat activate <此码>` 可再核销")
-        else:
-            note = (f"服务端核销未完成（{exc}）；暂按码内兜底到期日生效，"
-                    "联网后重跑 `mat activate <此码>` 完成核销（服务端幂等，到期日只会核算一次）")
-        return {**out, "offline_fallback": True, "note": note}
-
-    new_code = str(resp.get("new_code") or "")
-    checked = verify_code(new_code)
-    if checked is None:
-        # 服务端已核销但本地验不过（正常情况下不可能：两边同一把密钥）——
-        # 如实报错而不是写进一个验证不了的码。
-        raise ValueError("服务端重签的激活码本地验签失败，请重试或联系官方")
-    path = license_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"plan": "pro", "expires_at": checked["expires_at"],
-                                "code": new_code}, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-    return {"plan": "pro", "expires_at": checked["expires_at"],
-            "code_expires_at": verified["expires_at"], "kept_existing": False,
-            "redeemed": True}

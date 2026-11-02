@@ -82,8 +82,8 @@ function FixButton({ fix, onDone }: { fix: NonNullable<DoctorCheck["fix"]>; onDo
   );
 }
 
-function CheckRow({ c, onRerun, onGoSettings, onManage }: { c: DoctorCheck; onRerun: () => void;
-  onGoSettings?: () => void; onManage?: () => void }) {
+function CheckRow({ c, onRerun, onManage }: { c: DoctorCheck; onRerun: () => void;
+  onManage?: () => void }) {
   const tip = [c.detail, c.hint].filter(Boolean).join("\n");
   const blocked = c.status !== "ok" && !!c.fix;
   return (
@@ -95,11 +95,7 @@ function CheckRow({ c, onRerun, onGoSettings, onManage }: { c: DoctorCheck; onRe
             background: STATUS_DOT[c.status] }} />
           <span style={{ wordBreak: "break-all", color: c.status === "ok" ? "inherit" : "#595959" }}>{c.label}</span>
           {blocked && c.fix && <FixButton fix={c.fix} onDone={onRerun} />}
-          {/* 套餐用尽需要输入激活码,不能一键修复——导航到设置页的激活表单 */}
-          {c.id === "quota" && c.status !== "ok" && onGoSettings && (
-            <Button size="small" type="link" style={{ flex: "none", padding: 0, height: "auto" }}
-              onClick={() => onGoSettings()}>去激活</Button>
-          )}
+          {/* 2026-11-02：额度触顶不再提供「去激活」——单人档免费，激活码已停止签发 */}
           {/* AI 卡两行各带常驻入口（发起人 2026-10-14）：「AI生成prompt」行→管理浮层；
               「AI模型配置」行→配置（打开 .env，任意状态可进，不只是未配置时） */}
           {c.id === "prompt" && onManage && (
@@ -141,10 +137,10 @@ function iosConclusion(checks: DoctorCheck[]): { color: string; text: string } {
   return { color: "green", text: "就绪" };
 }
 
-function DoctorCard({ title, loading, checks, resp, conclusion, onRerun, busy, onGoSettings, onManage }: {
+function DoctorCard({ title, loading, checks, resp, conclusion, onRerun, busy, onManage }: {
   title: string; loading: boolean; checks: DoctorCheck[]; resp: DoctorResp | null;
   conclusion: { color: string; text: string }; onRerun: () => void; busy: boolean;
-  onGoSettings?: () => void; onManage?: () => void }) {
+  onManage?: () => void }) {
   const age = resp ? Math.max(0, Math.round((Date.now() - Date.parse(resp.ran_at)) / 1000)) : 0;
   return (
     <Card size="small" loading={loading} style={{ height: "100%" }}
@@ -158,13 +154,12 @@ function DoctorCard({ title, loading, checks, resp, conclusion, onRerun, busy, o
         {age}s 前跑过 · {(resp.duration_ms / 1000).toFixed(1)}s
       </div>}
       {checks.map((c) => <CheckRow key={c.id} c={c} onRerun={onRerun}
-        onGoSettings={onGoSettings} onManage={onManage} />)}
+        onManage={onManage} />)}
     </Card>
   );
 }
 
-export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
-  onGoSettings?: () => void }) {
+export default function EnvDoctor({ state }: { state: StateResp }) {
   const iosSupported = state.ios_supported !== false;
   const [android, setAndroid] = useState<DoctorResp | null>(null);
   const [ios, setIos] = useState<DoctorResp | null>(null);
@@ -226,7 +221,6 @@ export default function EnvDoctor({ state, onGoSettings }: { state: StateResp;
             ? { color: "green", text: `已配置 · ${state.prompt_mode === "server" ? "server" : "自部署"}` }
             : { color: "orange", text: "未配置" }}
           onRerun={() => runOne("android")} busy={busyKey === "android"}
-          onGoSettings={onGoSettings}
           onManage={() => setManageOpen(true)} />
       </Col>
       {err && <Col span={24} style={{ marginTop: 8 }}>

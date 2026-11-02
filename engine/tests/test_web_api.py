@@ -138,11 +138,8 @@ def test_case_write_read_and_validation(server):
     assert requests.get(f"{base}/api/case?name=../x.json", timeout=3).status_code == 400
 
 
-def test_activate_and_jobs_routes(server):
+def test_jobs_routes(server):
     base, _ = server
-    assert requests.post(f"{base}/api/activate", timeout=3, json={"code": ""}).status_code == 400
-    bad = requests.post(f"{base}/api/activate", timeout=3, json={"code": "MAT-bogus.1.a.abcdefabcdef"})
-    assert bad.status_code == 400 and "error" in bad.json()
     assert requests.get(f"{base}/api/jobs", timeout=3).status_code == 200
     assert requests.get(f"{base}/api/job?id=nope", timeout=3).json() == {"status": "unknown"}
     assert requests.get(f"{base}/api/job/events?id=nope", timeout=3).status_code == 404
@@ -1631,7 +1628,9 @@ def test_api_run_refuses_unprovisionable_precondition(tmp_path, monkeypatch):
     assert job["status"] == "done", f"拒跑应正常完成，实际 {job['status']}"
     assert any(e.get("status") == "refused" or "拒跑" in str(e.get("detail", ""))
                for e in job["events"]), job["events"]
-    assert (root / "artifacts" / "perm" / "report.html").exists(), "最小报告必须落盘"
+    # 目录模型统一后是 `artifacts/perm-<stamp>/`（不再固定 `artifacts/perm`）
+    reports = list((root / "artifacts").glob("perm-*/report.html"))
+    assert reports, "最小报告必须落盘"
 
 
 def test_api_run_allow_unmet_preconditions_bypasses_refusal(tmp_path, monkeypatch):

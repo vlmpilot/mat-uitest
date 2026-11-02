@@ -2329,24 +2329,10 @@ def test_on_failure_heal_failure_does_not_abort(tmp_path):
         f"heal 失败不应中止，实际 {[s.status for s in run.steps]}"
 
 
-# -- 控制台激活入口（api/activate，与 mat activate 同实现） ----------------------
-
-def test_api_activate_roundtrip(tmp_path, monkeypatch):
-    """合法码 200 并落 license；非法码/缺参 400。"""
-    from insta_engine import licensing, web_server
-
-    monkeypatch.setenv("INSTA_HOME", str(tmp_path))
-    monkeypatch.setenv("MAT_LICENSE_SECRET", TEST_LICENSE_KEY)
-
-    code, obj = web_server.api_activate({"code": mint_test_code("pro")})
-    assert code == 200 and obj["ok"] and obj["plan"] == "pro"
-    assert licensing.read_license()["plan"] == "pro"
-
-    bad_code, bad = web_server.api_activate({"code": "MAT-bogus.123456.abcdef.0123456789abcdef"})
-    assert bad_code == 400 and "error" in bad
-    missing_code, _ = web_server.api_activate({})
-    assert missing_code == 400
-
+# -- 控制台激活入口已下线（2026-11-02）----------------------------------------
+#
+# 控制台不再提供激活码输入（`/api/activate` 已删除）：单人档免费、激活码停止签发。
+# 早期码仍可用 `mat activate <码>` 在命令行离线激活。
 
 
 def test_controls_context_rotates_across_pages():

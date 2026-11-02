@@ -12,7 +12,7 @@ const ACTION_LABEL: Record<string, string> = {
   "/api/explore": "启动探索", "/api/run": "执行用例/套件", "/api/job/cancel": "取消任务",
   "/api/index": "建索引", "/api/describe": "补标题", "/api/diagnose": "失败归因",
   "/api/export": "数据导出", "/api/apps/install": "安装应用", "/api/apps/uninstall": "卸载应用",
-  "/api/heals/apply": "应用自愈", "/api/calibrate/apply": "应用校准", "/api/activate": "激活",
+  "/api/heals/apply": "应用自愈", "/api/calibrate/apply": "应用校准",
   "/api/ios/sim/boot": "启动 iOS 模拟器", "/api/review": "复核页面标题",
   "/api/doctor/fix": "环境修复", "/api/workspace/switch": "更换工作区",
   "/api/device/key": "获取设备操控密钥", "/api/device/scrcpy": "发起投屏",
