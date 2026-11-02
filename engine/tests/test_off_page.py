@@ -14,7 +14,7 @@ from insta_engine.dsl import TestCase
 from insta_engine.off_page import LEFT_APP, WEBVIEW_PAGE, describe, off_page_kind
 from insta_engine.runner import Runner
 
-PKG = "com.tencent.news"
+PKG = "com.example.news"
 
 
 def _ctl(cls: str, text: str = "", desc: str = "") -> dict:
@@ -37,12 +37,12 @@ _AD_LANDING = [
 
 
 def test_left_app_when_foreground_is_another_package():
-    assert off_page_kind(PKG, [], "com.tencent.mm") == LEFT_APP
+    assert off_page_kind(PKG, [], "com.example.im") == LEFT_APP
 
 
 def test_left_app_wins_over_the_webview_signature():
     """微信小程序里也有 WebView —— 换了 App 时先说"换了 App"，别含糊成"App 内换页"。"""
-    assert off_page_kind(PKG, _AD_LANDING, "com.tencent.mm") == LEFT_APP
+    assert off_page_kind(PKG, _AD_LANDING, "com.example.im") == LEFT_APP
 
 
 def test_webview_page_when_only_one_webview_and_few_controls():
@@ -57,7 +57,7 @@ def test_webview_signature_does_not_depend_on_foreground():
     别为了对称把后者也砍掉——那会让「前台取不到」的批次白丢一条可用证据。
     """
     assert off_page_kind(PKG, _AD_LANDING, "") == WEBVIEW_PAGE
-    assert off_page_kind(PKG, _AD_LANDING, "com.tencent.mm") == LEFT_APP
+    assert off_page_kind(PKG, _AD_LANDING, "com.example.im") == LEFT_APP
 
 
 def test_no_flag_without_package():
@@ -106,9 +106,9 @@ def test_describe_is_empty_for_none():
 
 _AD_XML = (
     "<hierarchy>"
-    '<node class="android.widget.TextView" package="com.tencent.news" text="返回"'
-    ' resource-id="com.tencent.news:id/back" bounds="[46,138][115,207]" clickable="true"/>'
-    '<node class="android.webkit.WebView" package="com.tencent.news" text="腕表回收中心"'
+    '<node class="android.widget.TextView" package="com.example.news" text="返回"'
+    ' resource-id="com.example.news:id/back" bounds="[46,138][115,207]" clickable="true"/>'
+    '<node class="android.webkit.WebView" package="com.example.news" text="腕表回收中心"'
     ' bounds="[0,243][1080,2214]"/>'
     "</hierarchy>"
 )
@@ -164,14 +164,14 @@ class _AdDriver:
 def _case() -> TestCase:
     return TestCase.model_validate({
         "caseId": "r16", "name": "换页打标",
-        "target": {"package": "com.tencent.news"},
+        "target": {"package": "com.example.news"},
         "steps": [{"id": "s1", "action": "tap",
                    "target": {"strategy": "text", "value": "我的"}}],
     })
 
 
 def test_runner_records_webview_page(tmp_path):
-    run = Runner(_AdDriver(foreground="com.tencent.news"), tmp_path).run(_case())
+    run = Runner(_AdDriver(foreground="com.example.news"), tmp_path).run(_case())
     s1 = run.steps[0]
     assert s1.status == "failed"
     assert s1.off_page == WEBVIEW_PAGE
@@ -180,7 +180,7 @@ def test_runner_records_webview_page(tmp_path):
 
 
 def test_runner_records_left_app(tmp_path):
-    run = Runner(_AdDriver(foreground="com.tencent.mm"), tmp_path).run(_case())
+    run = Runner(_AdDriver(foreground="com.example.im"), tmp_path).run(_case())
     assert run.steps[0].off_page == LEFT_APP
 
 
@@ -189,9 +189,9 @@ def test_runner_leaves_off_page_empty_on_a_normal_page(tmp_path):
     class _Plain(_AdDriver):
         def dump(self):
             return ("<hierarchy>"
-                    '<node class="android.widget.TextView" package="com.tencent.news"'
+                    '<node class="android.widget.TextView" package="com.example.news"'
                     ' text="设置" bounds="[46,138][115,207]" clickable="true"/>'
                     "</hierarchy>")
 
-    run = Runner(_Plain(foreground="com.tencent.news"), tmp_path).run(_case())
+    run = Runner(_Plain(foreground="com.example.news"), tmp_path).run(_case())
     assert run.steps[0].off_page is None

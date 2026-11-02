@@ -199,7 +199,7 @@ def locate(client, screenshot_png: bytes, intent: str, target: str,
         "vision-llm 定位", images=[send_png],
     )
     parsed = parse_vision_response(
-        extract_fields(content), screenshot_png, tree_evidence=tree_evidence
+        extract_fields(content), screenshot_png, tree_evidence=tree_evidence, target=target
     )
     if parsed and cache_key:
         _CACHE[cache_key] = parsed
@@ -226,6 +226,11 @@ def extract_fields(text: str) -> dict:
     except ValueError:
         fields["confidence"] = 0.0
 
+    # desc 是**模型有没有真的读出控件**的唯一证据（坐标不可验证，文案可以）。
+    desc = re.search(r'"desc"\s*:\s*"([^"]*)"', text) or \
+        re.search(r"'desc'\s*:\s*'([^']*)'", text)
+    fields["desc"] = (desc.group(1) if desc else "").strip()
+
     x_match = re.search(r'"?x"?\s*:\s*\[?\s*([\d.]+)(?:\s*,\s*([\d.]+))?', text)
     y_match = re.search(r'"?y"?\s*:\s*\[?\s*([\d.]+)', text)
     fields["x"] = float(x_match.group(1)) if x_match else None
@@ -239,8 +244,36 @@ def extract_fields(text: str) -> dict:
     return fields
 
 
+#: 模型没真读控件时会吐回的占位词（prompt 里的示例值）。
+#: 2026-11-02 实测：目标在页面上不存在时，8B 仍会 found=true / confidence=0.95 /
+#: 坐标 (0.137,0.383) / desc 原样回显 "元素简述"——**置信度和坐标都不可信，文案才是破绽**。
+_PLACEHOLDER_DESCS = {
+    "元素简述", "元素描述", "简述", "描述", "说明", "示例", "无",
+    "desc", "description", "element", "text", "...", "…",
+}
+
+
+def desc_verdict(desc: str, target: str = "") -> tuple[bool, str]:
+    """模型给的 `desc` 可不可信：返回 `(ok, 原因)`。
+
+    **只观测、不拦截**（2026-11-02）：真实调用量还是 0，没法定阈值。先攒数据。
+    `ok=False` 里"占位词/空"是**硬证据**（它根本没看控件），"与目标无交集"只是弱信号
+    （模型完全可以说"齿轮图标"来指"设置"）。
+    """
+    d = (desc or "").strip()
+    if not d:
+        return False, "desc 为空"
+    if d.strip("。.… ") in _PLACEHOLDER_DESCS:
+        return False, "desc 是占位词"
+    t = (target or "").strip()
+    if t and t not in d and d not in t:
+        return False, "desc 与目标无交集"
+    return True, ""
+
+
 def parse_vision_response(data: dict, screenshot_png: bytes,
-                          tree_evidence: bool = True) -> tuple[int, int] | None:
+                          tree_evidence: bool = True,
+                          target: str = "") -> tuple[int, int] | None:
     """解析 VL 输出并按坐标契约换算像素；红线：低置信/未找到/缺坐标一律 None。
 
     每个拒绝分支都会在 `last_result()` 里留下可读原因——「拒绝」和「没调用」是
@@ -300,9 +333,20 @@ def parse_vision_response(data: dict, screenshot_png: bytes,
         })
         return None
     edge = min(pos[0], pos[1], screen_w - 1 - pos[0], screen_h - 1 - pos[1]) <= EDGE_MARGIN
+    # 文案审计（只观测不拦截）：模型说 found=true 时，它有没有真的读出控件？
+    # 坐标无法事后验证（除非有树），文案可以——占位词就是"它没看"的硬证据。
+    desc = str(data.get("desc") or "")
+    desc_ok, desc_reason = desc_verdict(desc, target)
     _LAST_RESULT.update({
         "ok": True, "found": True, "confidence": confidence, "threshold": threshold,
         "reason": "命中（贴屏幕边缘，注意坐标换算歧义）" if edge else "命中",
         "edge": edge,
+        "desc_ok": desc_ok, "desc_reason": desc_reason, "desc_len": len(desc.strip()),
     })
+    from . import ai_metrics
+
+    ai_metrics.record_vision_audit(
+        desc_ok=desc_ok, reason=desc_reason, confidence=confidence,
+        desc_len=len(desc.strip()), target_len=len((target or "").strip()),
+    )
     return pos

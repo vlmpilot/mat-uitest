@@ -512,6 +512,24 @@ def save_server_token(value: str, meta: dict) -> None:
         pass
 
 
+def clear_server_token() -> bool:
+    """删掉本机的服务端凭证；返回是否真的删掉了。
+
+    为什么需要（2026-11-01 复核）：凭证是**按身份**签的，档位却可以变。用标准码
+    `--force` 把团队授权降级后，`license_server.json` 里的 team token 仍然有效，
+    `team.bearer()` 会继续用它 ⇒ 服务端照旧按 team 档给额度（10,000 次/月），
+    而 `mat team status` 还在说「服务端会拒绝」。**降级必须把旧身份的凭证一起作废**，
+    否则"降级"只是本地少了个功能开关。
+    """
+    try:
+        server_token_path().unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
 def activate_on_server(code: str) -> dict:
     """把这次激活登记到服务端，并保存它签发的**绑机器凭证**。
 
@@ -621,8 +639,14 @@ def _write_local(code: str, verified: dict, *, force: bool = False) -> dict:
         path.chmod(0o600)
     except OSError:
         pass
+    # 降级（团队 → 标准）要把**旧身份的云端凭证**一起作废：否则 bearer 还会用它，
+    # 服务端照旧按 team 档给额度，降级等于没降（见 clear_server_token 的注释）。
+    team_feats = {"team_share", "report_share", "audit_log"}
+    downgraded = bool(team_feats & old_features) and not (team_feats & new_features)
+    cleared = clear_server_token() if downgraded else False
     return {"plan": verified["plan"], "expires_at": code_expires,
-            "code_expires_at": code_expires, "kept_existing": False, "same_code": False}
+            "code_expires_at": code_expires, "kept_existing": False, "same_code": False,
+            "downgraded": downgraded, "cleared_server_token": cleared}
 
 
 def _activate_duration_card(code: str, verified: dict) -> dict:

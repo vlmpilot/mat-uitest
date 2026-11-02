@@ -44,6 +44,8 @@ from .state import state_home
 
 #: 计量落盘的文件名（JSONL，一行一次调用）
 METRICS_FILE = "ai.jsonl"
+#: 视觉文案审计的落盘文件名（与调用计量分开：它是**质量观测**，不是调用记录）
+VISION_AUDIT_FILE = "vision_audit.jsonl"
 #: 内容留痕目录名（仅在 MAT_GEN_TRACE=1 时写入）
 TRACE_DIR = "trace"
 #: 默认轮转阈值（MB）
@@ -165,6 +167,55 @@ def _percentile(values: list[float], q: float) -> float:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, int(round((len(ordered) - 1) * q)))
     return ordered[idx]
+
+
+def vision_audit_path() -> Path:
+    return metrics_dir() / VISION_AUDIT_FILE
+
+
+def record_vision_audit(*, desc_ok: bool, reason: str = "", confidence: float | None = None,
+                        desc_len: int = 0, target_len: int = 0) -> None:
+    """记一次视觉结果的**文案可信度**（只记判定与长度，不记文案本身）。
+
+    为什么单独一个文件（2026-11-02）：视觉兜底的真实调用量目前是 0，没法定"要不要
+    拦截幻觉坐标"。先只观测：模型说 found=true 时，它给的 `desc` 到底有没有真的
+    读出控件？占位词/空 = 它其实没看。跑一段时间真实使用，再用数据决定。
+    不记 desc/target 文本，与 `ai.jsonl` 的"只记元数据"同一纪律。
+    """
+    if not enabled():
+        return
+    row = {"ts": round(time.time(), 3), "desc_ok": bool(desc_ok), "reason": reason,
+           "confidence": confidence, "desc_len": int(desc_len), "target_len": int(target_len)}
+    try:
+        path = vision_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - 计量坏掉不能影响定位
+        pass
+
+
+def summarize_vision_audit(hours: int = 24) -> dict:
+    """近 N 小时的视觉文案审计：总次数 / 可疑次数 / 按原因分组。"""
+    cutoff = time.time() - hours * 3600
+    total = bad = 0
+    by_reason: dict[str, int] = {}
+    path = vision_audit_path()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if float(row.get("ts") or 0) < cutoff:
+                continue
+            total += 1
+            if not row.get("desc_ok"):
+                bad += 1
+                reason = str(row.get("reason") or "其他")
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {"hours": hours, "total": total, "bad": bad,
+            "rate": (bad / total) if total else 0.0, "by_reason": by_reason}
 
 
 def summarize(hours: int = 24, path: Path | None = None) -> dict:

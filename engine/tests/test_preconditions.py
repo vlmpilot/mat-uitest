@@ -27,9 +27,9 @@ def _write_case(tmp_path, preconditions_list: list[str]):
     case = {
         "caseId": "case_pre",
         "name": "位置授权弹窗-点击同意",
-        "target": {"package": "com.tencent.news"},
+        "target": {"package": "com.example.news"},
         "preconditions": preconditions_list,
-        "steps": [{"id": "s1", "action": "launch", "params": {"package": "com.tencent.news"}}],
+        "steps": [{"id": "s1", "action": "launch", "params": {"package": "com.example.news"}}],
     }
     cases = tmp_path / "cases"
     cases.mkdir(exist_ok=True)

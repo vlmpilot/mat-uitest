@@ -230,11 +230,11 @@ def test_load_cases_finds_subdirectory_cases(tmp_path):
 
     (tmp_path / "cases" / "xhs").mkdir(parents=True)
     (tmp_path / "cases" / "xhs" / "a.json").write_text(json.dumps(
-        {"caseId": "a", "target": {"package": "com.xingin.xhs"}, "steps": []}), encoding="utf-8")
+        {"caseId": "a", "target": {"package": "com.example.gallery"}, "steps": []}), encoding="utf-8")
     (tmp_path / "cases" / "top.json").write_text(json.dumps(
-        {"caseId": "t", "target": {"package": "com.xingin.xhs"}, "steps": []}), encoding="utf-8")
+        {"caseId": "t", "target": {"package": "com.example.gallery"}, "steps": []}), encoding="utf-8")
     (tmp_path / "cases" / "xhs" / "other.json").write_text(json.dumps(
         {"caseId": "o", "target": {"package": "com.other"}, "steps": []}), encoding="utf-8")
 
-    cases, names = load_cases_for("com.xingin.xhs", tmp_path / "cases")
+    cases, names = load_cases_for("com.example.gallery", tmp_path / "cases")
     assert sorted(names) == ["a.json", "top.json"], names

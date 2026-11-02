@@ -33,7 +33,7 @@ from insta_engine.runner import Runner
 
 NO_LAUNCH = {
     "caseId": "no-launch", "name": "没 launch 的用例",
-    "target": {"package": "com.tencent.news"},
+    "target": {"package": "com.example.news"},
     "steps": [
         {"id": "s1", "action": "tap", "intent": "点第一条",
          "target": {"strategy": "text", "value": "某条新闻"}},
@@ -50,7 +50,7 @@ def test_gate_inserts_launch_and_records_the_issue(tmp_path: Path) -> None:
     out = _runner(tmp_path)._apply_run_gate(case)
 
     assert out.steps[0].action is Action.LAUNCH, [s.action for s in out.steps]
-    assert out.steps[0].params.get("package") == "com.tencent.news"
+    assert out.steps[0].params.get("package") == "com.example.news"
     issues = out.meta.get("quality_issues") or []
     assert any("[R6]" in i for i in issues), issues
     # step id 必须唯一（重复 id 会让重试时截图/证据互相覆盖）

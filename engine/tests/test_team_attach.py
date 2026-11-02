@@ -178,3 +178,80 @@ def test_status_without_token_tells_how_to_fix(home, keypair, monkeypatch, capsy
 
     assert rc == 1
     assert "mat activate --file" in out
+
+
+def test_expired_license_does_not_use_team_token(home, keypair):
+    """授权过期后，本机不再把「授权换来的凭证」当身份。
+
+    凭证在服务端仍有效（按身份签、不随授权过期而失效），所以真正的闸是服务端的
+    `expires_at` 401；这里钉的是**本机不装作用**——否则用户看到"到期了还在跑"，
+    等到服务端报错时已经不知道是哪一步的问题。
+    """
+    pem, _pub = keypair
+    (home / "license.json").write_text(
+        json.dumps(_license(pem, days=-1), ensure_ascii=False), encoding="utf-8")
+    (home / "license_server.json").write_text(
+        json.dumps({"token": "team-token", "team_id": "lic-LIC-T1"}), encoding="utf-8")
+
+    assert licensing.read_license()["plan"] == "free"
+    assert team_mod.bearer() == "", "授权过期后不该继续用授权凭证"
+
+
+def test_forced_downgrade_revokes_team_token(home, keypair, monkeypatch):
+    """强制降级到标准版：旧团队凭证必须**一起作废**。
+
+    回归锁（2026-11-01 复核）：降级只改了 `license.json`，`license_server.json` 里的
+    team token 还在，`bearer()` 继续用它 ⇒ 服务端照旧按 team 档给额度（10,000 次/月），
+    而 `mat team status` 还在说「服务端会拒绝」。等于**降级没生效**。
+    """
+    pem, _pub = keypair
+    _attach_ok(monkeypatch)
+    licensing.activate_license_file(_write(home, "team.json", _license(pem)))
+    assert licensing.read_server_token() == "team-token"
+
+    out = licensing.activate(_v1(plan="pro", days=500), force=True)
+
+    assert out["downgraded"] is True and out["cleared_server_token"] is True
+    assert licensing.read_server_token() == "", "降级后旧凭证不该还能被 bearer 取到"
+    monkeypatch.delenv("GEN_API_KEY", raising=False)
+    assert team_mod.bearer() == ""
+
+
+def test_team_status_tells_truth_about_leftover_token(home, keypair, monkeypatch, capsys):
+    """档位已不含团队协作、本机却还留着凭证 ⇒ 不能说「服务端会拒绝」（它不会）。
+
+    这张凭证可能来自历史残留或手工放置。说反了，人会以为"已经清干净了"。
+    """
+    monkeypatch.delenv("GEN_API_KEY", raising=False)
+    licensing.activate(_v1(plan="pro", days=200))
+    licensing.save_server_token("stale-team-token", {"plan": "team"})
+
+    team_mod.status()
+
+    out = capsys.readouterr().out
+    assert "仍留有云端凭证" in out
+    assert "服务端会拒绝" not in out
+
+
+def test_cli_warns_when_downgrade_revokes_team_token(home, keypair, monkeypatch, capsys):
+    """降级会顺手作废团队凭证——CLI 必须**说出来**。
+
+    不说的话，用户要到下一次 `mat team pull` 才发现库没了，而且会以为是网络问题。
+    """
+    import argparse
+
+    from insta_engine import __main__ as cli
+
+    pem, _pub = keypair
+    _attach_ok(monkeypatch)
+    licensing.activate_license_file(_write(home, "team.json", _license(pem)))
+    assert licensing.read_server_token() == "team-token"
+    monkeypatch.setattr(licensing, "activate_on_server",
+                        lambda code: {"token": "new-token", "machines": 1, "max_machines": 2})
+
+    cli.cmd_activate(argparse.Namespace(code=_v1("pro", 500), force=True, file=None,
+                                        machines=False, unbind=None))
+
+    out = capsys.readouterr().out
+    assert "团队协作能力已失效" in out
+    assert licensing.read_server_token() == "", "降级后不该还留着团队凭证"

@@ -152,7 +152,7 @@ def _dedup_seq(values: list) -> list:
 #: 「**退化 res-id**」——**零区分度**的资源名，不能当页面信号。
 #:
 #: 实测（2026-10-07，T71）：某 App 的 **143/144 页**都含
-#: `rid:com.xingin.xhs:id/0_resource_name_obfuscated`。它是 aapt2 在**资源名解析不出来时
+#: `rid:com.example.gallery:id/0_resource_name_obfuscated`。它是 aapt2 在**资源名解析不出来时
 #: 的占位名**——同一页面上多个不同控件都会叫这个。
 #:
 #: **它造成的危害是「指纹太弱」，不是「页数膨胀」**（⚠️ 我一开始写反了，实测纠正）：

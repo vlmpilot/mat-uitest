@@ -150,6 +150,9 @@ _FIX_TIMEOUT_S = 600
 _ENV_KEYS = ("GEN_BASE_URL", "GEN_API_KEY", "GEN_MODEL", "GEN_VL_MODEL",
              "GEN_VL_BASE_URL", "MAT_VL_MAX_EDGE",
              "GEN_PROMPT_MODE", "GEN_VL_FALLBACK", "MAT_WEBHOOK_URL",
+             # 生成走哪一侧（2026-11-02）：默认自部署，`cloud` 才走云端模型商。
+             # 不登记的话控制台改完 .env 不生效——reload_env 只清这份名单里的键。
+             "MAT_ROUTE",
              "GEN_DISABLE_THINKING")
 
 _RELOADED: dict = {"mtime": None, "path": ""}  # 上次重载的 .env mtime（节流标记）
@@ -398,6 +401,31 @@ def android_checks() -> list[Check]:
     checks.append(Check(
         id="gen", label=f"AI模型配置({gen_state})", ok=gen_ok, hint=gen_hint, detail=gen_missing,
     ))
+
+    # 数据路由（2026-11-02）：`MAT_ROUTE` 只影响**官方代理**下生成走哪一侧。
+    # 默认（不设）= 自部署，所以不设时不加这一项——否则每台机器都多一行噪音。
+    # 只在三种情况下报：取值不认识（拼错）、自带 Key 下设了也没用、显式选了云端。
+    from . import route as route_mod
+
+    bad_route = route_mod.unknown_value()
+    if bad_route:
+        checks.append(Check(
+            id="route", label=f"数据路由(取值不认识: {bad_route})", ok=False,
+            detail="MAT_ROUTE 只认 local / cloud / auto",
+            hint="要云端模型写 MAT_ROUTE=cloud；删掉这一行则默认走本站自部署模型",
+        ))
+    elif route_mod.is_local() and not server_mode:
+        checks.append(Check(
+            id="route", label="数据路由(自带 Key 下不生效)", ok=True,
+            detail="MAT_ROUTE 只在官方代理模式下起作用",
+            hint="自带 Key 时请求直连你配置的服务商；想用本站自部署模型请切官方代理",
+        ))
+    elif route_mod.is_cloud():
+        checks.append(Check(
+            id="route", label="数据路由(云端模型服务商)", ok=True,
+            detail="MAT_ROUTE=cloud：文本与截图都会发给模型服务商",
+            hint="改回自部署：删掉 MAT_ROUTE 这一行（或设成 local）",
+        ))
 
     # 视觉兜底三态（对齐 CLI vision_status_text 的核心提醒：「配了模型」≠「会触发」）：
     # 未配置=warn 引导配置；已配置未授权=warn 提示两条授权路径（不擅自断定该改哪边——

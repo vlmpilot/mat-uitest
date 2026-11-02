@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from insta_engine import promptstore
+from insta_engine import promptstore, quota_policy
 from insta_engine.quota import QuotaExceeded, UsageStore
 
 
@@ -87,17 +87,22 @@ def test_vision_byok_is_counted_but_not_enforced(tmp_path):
 
 
 def test_vision_official_still_enforced(tmp_path):
-    """官方代理的视觉调用保留原闸：超出 free 的 20 次即抛，且拦截后不再计数。"""
+    """官方代理的视觉调用保留原闸：超出 free 的额度即抛，且拦截后不再计数。
+
+    额度从策略文件读（2026-11-02：单人档视觉 20 → 100），别在这里写死数字——
+    写死会让"改额度"变成"改测试"，而测试改完就没人知道闸还在不在。
+    """
+    limit = int(quota_policy.plan_limits("free")["vision"])
     store = _store(tmp_path, source="official")
-    for _ in range(20):
+    for _ in range(limit):
         store.check_vision(enforce=True)
     with pytest.raises(QuotaExceeded):
         store.check_vision(enforce=True)
 
     snapshot = store.snapshot()
-    assert snapshot["vision_count"] == 20
+    assert snapshot["vision_count"] == limit
     assert snapshot["vision_byok"] == 0
-    assert snapshot["vision_official"] == 20
+    assert snapshot["vision_official"] == limit
 
 
 def test_auto_source_follows_prompt_mode(tmp_path, monkeypatch):

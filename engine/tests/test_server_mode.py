@@ -169,3 +169,131 @@ def test_local_mode_still_reads_workspace_prompt(tmp_path, monkeypatch):
     assert data == {"title": 0}
     sent = json.dumps(captured_payload[0], ensure_ascii=False)
     assert "LOCAL-MAP" in sent  # 本地 prompt 被拼进 messages
+
+
+# -- 路由偏好（MAT_ROUTE，2026-11-02）--------------------------------------
+#
+# 默认自部署；只在**显式**设过时才带 `X-Mat-Route`——不带 = 按服务端策略。
+# 老服务端不认识这个头，忽略即可（退化成本地优先，不是报错），所以不带也是兼容策略。
+
+
+def _one_call(captured):
+    client = GenClient("https://cloud.mat.test", "user-token", "", prompt_mode="server")
+    complete_task_raw(client, "gen", {"nl": "打开设置", "app_info": {"package": "com.x"}}, "生成")
+    return captured[0]
+
+
+def test_no_route_header_by_default(captured, monkeypatch):
+    monkeypatch.delenv("MAT_ROUTE", raising=False)
+    assert "X-Mat-Route" not in _one_call(captured)["headers"]
+
+
+def test_route_cloud_header_sent(captured, monkeypatch):
+    monkeypatch.setenv("MAT_ROUTE", "cloud")
+    assert _one_call(captured)["headers"]["X-Mat-Route"] == "cloud"
+
+
+def test_route_local_header_sent_and_normalized(captured, monkeypatch):
+    monkeypatch.setenv("MAT_ROUTE", " LOCAL ")
+    assert _one_call(captured)["headers"]["X-Mat-Route"] == "local"
+
+
+def test_unknown_route_value_sends_nothing(captured, monkeypatch):
+    """拼错（clod）按 auto 处理：不带头发的是安全方向（服务端本地优先），不猜成 cloud。"""
+    monkeypatch.setenv("MAT_ROUTE", "clod")
+    assert "X-Mat-Route" not in _one_call(captured)["headers"]
+
+
+# -- 失败要说人话（2026-11-02）----------------------------------------------
+#
+# 服务端在 503 里写了「本地不可用、不会改走云端 + 三条出路」，客户端原来只记
+# `HTTP 503` —— 这段可行动信息等于没写。用户看到的必须是完整那一句。
+
+
+def test_5xx_detail_reaches_the_user(monkeypatch):
+    import insta_engine.ai_client as ai_mod
+
+    hits = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        hits["n"] += 1
+        return FakeResp({"detail": "本站自部署的文本模型当前不可用（不会自动改走云端）"}, 503)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(ai_mod.time, "sleep", lambda *_: None)  # 别真等 2s+4s
+
+    client = GenClient("https://cloud.mat.test", "user-token", "", prompt_mode="server")
+    with pytest.raises(GenError) as exc:
+        complete_task_raw(client, "gen", {"nl": "打开设置", "app_info": {"package": "com.x"}},
+                          "生成")
+    assert "不会自动改走云端" in str(exc.value)
+    assert hits["n"] == 3, "5xx 应重试 3 次后再失败"
+
+
+def test_5xx_without_json_falls_back_to_status(monkeypatch):
+    import insta_engine.ai_client as ai_mod
+
+    class Plain:
+        status_code = 502
+        text = "bad gateway"
+
+        def json(self):
+            raise ValueError("not json")
+
+        def raise_for_status(self):
+            raise requests.HTTPError("502")
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Plain())
+    monkeypatch.setattr(ai_mod.time, "sleep", lambda *_: None)
+    client = GenClient("https://cloud.mat.test", "user-token", "", prompt_mode="server")
+    with pytest.raises(GenError, match="bad gateway"):
+        complete_task_raw(client, "gen", {"nl": "x", "app_info": {"package": "com.x"}}, "生成")
+
+
+def test_chat_urls_keep_plain_path_as_primary():
+    """默认路径不能改：厂商 API 可能自带版本段（智谱 /api/paas/v4）。"""
+    from insta_engine.ai_client import _chat_urls
+
+    primary, fallback = _chat_urls("https://open.bigmodel.cn/api/paas/v4")
+    assert primary == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    assert fallback.endswith("/api/paas/v4/v1/chat/completions")  # 只在 404 时才用
+
+
+def test_chat_urls_no_fallback_when_base_already_v1():
+    from insta_engine.ai_client import _chat_urls
+
+    primary, fallback = _chat_urls("https://api.example.com/v1/")
+    assert primary == "https://api.example.com/v1/chat/completions"
+    assert fallback == ""
+
+
+def test_chat_urls_offer_v1_for_bare_local_endpoint():
+    """本机服务（vlm_judge_server）只认 /v1，靠这条回退才连得上。"""
+    from insta_engine.ai_client import _chat_urls
+
+    primary, fallback = _chat_urls("http://127.0.0.1:8915")
+    assert primary == "http://127.0.0.1:8915/chat/completions"
+    assert fallback == "http://127.0.0.1:8915/v1/chat/completions"
+
+
+def test_404_switches_to_v1_and_succeeds(monkeypatch):
+    """真实链路：先 404，回退到 /v1 后拿到结果（不吞错、不重复计次）。"""
+    import insta_engine.ai_client as ai_mod
+
+    seen: list[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        seen.append(url)
+        if url.endswith("/v1/chat/completions"):
+            return FakeResp({"choices": [{"message": {"content": "ok"}}]})
+        return FakeResp({"error": "未知路径"}, 404)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(ai_mod.time, "sleep", lambda *_: None)
+
+    client = GenClient("http://127.0.0.1:8915", "k", "m", prompt_mode="local",
+                       prompt_path=None)
+    out = complete_task_text(client, "vision-locate", {"intent": "x", "target": "y"}, "定位")
+    assert out == "ok"
+    assert seen == ["http://127.0.0.1:8915/chat/completions",
+                    "http://127.0.0.1:8915/v1/chat/completions"]

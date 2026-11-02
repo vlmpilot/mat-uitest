@@ -619,6 +619,39 @@ def _output_budget(task: str, variables: dict | None) -> tuple[int | None, str]:
                   f"已封顶 8192——建议分段转换，否则尾部步骤可能缺失")
 
 
+def _chat_urls(base_url: str) -> tuple[str, str]:
+    """`(主 URL, 404 时回退 URL)`：兼容"带 /v1"与"不带 /v1"两类端点。
+
+    实测（2026-11-02）：mlx_lm.server 两种都收，`vlm_judge_server` **只收**
+    `/v1/chat/completions`；而厂商 API 常常自带版本段（智谱是 `/api/paas/v4`），
+    无脑补 `/v1` 会拼成 `/v4/v1/...`。所以默认路径**保持不变**，只在 404 时回退一次
+    ——404 基本只能是路径不对。
+    """
+    base = (base_url or "").rstrip("/")
+    primary = f"{base}/chat/completions"
+    fallback = "" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+    return primary, fallback
+
+
+def _error_detail(resp, limit: int = 300) -> str:
+    """从错误响应里抠出服务端给的 `detail`——它通常是**唯一可行动**的部分。
+
+    2026-11-02 实测：5xx 分支原来只写 `HTTP 503`，把服务端精心写的三条出路
+    （等一会重试 / 自带 API Key / 显式切云端）整段丢掉，用户只看到
+    「轻云请求失败（已重试 3 次）: HTTP 503」——等于没写。
+    """
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001 - 非 JSON 错误页：退回纯文本
+        text = (getattr(resp, "text", "") or "").strip()
+        return text[:limit] or f"HTTP {resp.status_code}"
+    if isinstance(body, dict):
+        detail = body.get("detail") or body.get("error") or ""
+        if detail:
+            return str(detail)[:limit]
+    return f"HTTP {resp.status_code}"
+
+
 def _server_task_text(client, task: str, variables: dict, context: str,
                       images: list[bytes] | None, rounds: list[dict] | None,
                       repair: str | None = None) -> str:
@@ -647,21 +680,28 @@ def _server_task_text(client, task: str, variables: dict, context: str,
     timeout = _env_int("GEN_TIMEOUT", 60)
     last_error: Exception | None = None
     call_started = time.monotonic()
+    from . import route as route_mod
+
+    headers = {
+        # 头名运行时拼装：避免「鉴权头冒号运行时值」静态形态被扫描误判（用户已批准）
+        "Auth" "orization": "Bearer " + client.api_key,
+    }
+    if route_mod.is_explicit():
+        # **只在显式设过时带**：不带 = 按服务端策略（能自部署就自部署，2026-11-02）。
+        # 老服务端不认识这个头，会忽略它——退化成本地优先，不是报错。
+        headers["X-Mat-Route"] = route_mod.preference()
     for attempt in range(3):
         started = time.monotonic()
         try:
-            resp = requests.post(
-                url,
-                # 头名运行时拼装：避免「鉴权头冒号运行时值」静态形态被扫描误判（用户已批准）
-                headers={"Auth" "orization": "Bearer " + client.api_key},
-                json=payload, timeout=timeout,
-            )
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if resp.status_code == 429:
                 _record_metrics(task=task, model="server", mode="server", started=started,
                                 ok=False, variables=variables, error="429 额度/限流")
                 raise GenError(f"{context}：{_quota_message(resp)}")
             if resp.status_code in (500, 502, 503, 504):
-                last_error = GenError(f"HTTP {resp.status_code}")
+                # 带上服务端的 detail：503 里写着"本地不可用、不会改走云端 + 三条出路"，
+                # 只报 HTTP 503 用户没法知道下一步该做什么。
+                last_error = GenError(_error_detail(resp))
                 time.sleep(2 ** attempt)
                 continue
             resp.raise_for_status()
@@ -931,6 +971,12 @@ class GenClient:
         # 带上端点：本机端点（127.0.0.1 / localhost）不出网，离线模式放行
         require_online(f"{context}（BYOK 端点）", endpoint=self.base_url)
         min_interval = _env_float("MAT_REQUEST_MIN_INTERVAL", 0.0)
+        # 路径兼容（2026-11-02 实测）：厂商 API 与多数本机服务是 `/chat/completions`
+        # （智谱的 base 甚至是 `/api/paas/v4`），而 mlx / vlm_judge_server 这类本机
+        # 服务只认 `/v1/chat/completions`。**默认不变**（避免把 `/v4` 拼成 `/v4/v1`），
+        # 只在 404 时回退一次——那只可能是路径不对，不可能是别的原因。
+        req_url, fallback_url = _chat_urls(self.base_url)
+        url_switched = {"done": False}
         last_error: Exception | None = None
         for attempt in range(3):
             started = time.monotonic()
@@ -941,10 +987,15 @@ class GenClient:
                         time.sleep(wait)
                 _last_request_at[0] = time.monotonic()
                 resp = requests.post(
-                    f"{self.base_url}/chat/completions",
+                    req_url,
                     headers={"Auth" "orization": "Bearer " + self.api_key},
                     json=payload, timeout=timeout,
                 )
+                if resp.status_code == 404 and fallback_url and not url_switched["done"]:
+                    # 只在没试过时切一次：404 基本只能是路径不对，重发同一个请求即可。
+                    url_switched["done"] = True
+                    req_url = fallback_url
+                    continue
                 if resp.status_code == 400 and "response_format" in payload:
                     # 端点不支持结构化输出 → **记下来并降级**（去掉该字段重试），
                     # 而不是把 400 抛给用户。降级事实写入模块状态，可被 status/doctor 反映。

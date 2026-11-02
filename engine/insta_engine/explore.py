@@ -420,7 +420,7 @@ def _screen_suspicious(png_bytes: bytes) -> str | None:
 #: 回退/关闭语义控件：点了**不产生前进导航边**（词表与判据在 safety.py——
 #: graph_repair 借链按同一词表排除，两处口径必须一致）。判据刻意保守：文案只收
 #: 全等（「返回首页」这类复合词不误伤），res-id 按词边界匹配 back/close/cancel/
-#: dismiss（如 com.tencent.news:id/title_bar_btn_back）——rid 是工程师命名，
+#: dismiss（如 com.example.news:id/title_bar_btn_back）——rid 是工程师命名，
 #: 信号比文案强。实测背景：explore 在首页点「返回」到达的 3 个 L1 页，arrival
 #: 重放 0/3 全死在第 1 跳。
 

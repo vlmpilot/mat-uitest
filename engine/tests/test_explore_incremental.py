@@ -300,7 +300,7 @@ def test_system_dialog_is_not_counted_as_leaving_app():
                 "com.android.systemui"):
         assert is_system_dialog(pkg), f"{pkg} 应被判为系统 UI"
     # 反例：系统设置本身是**合法的被测目标**（spike 的 t0 任务就是它），不能算系统弹窗
-    for pkg in ("com.android.settings", "com.tencent.news", "", "com.huawei.android.launcher"):
+    for pkg in ("com.android.settings", "com.example.news", "", "com.huawei.android.launcher"):
         assert not is_system_dialog(pkg), f"{pkg!r} 不该被判为系统弹窗"
 
 
@@ -609,8 +609,8 @@ def test_degenerate_res_id_is_recognised():
     """
     from insta_engine.page_index import is_degenerate_res_id
 
-    assert is_degenerate_res_id("com.xingin.xhs:id/0_resource_name_obfuscated")
-    assert not is_degenerate_res_id("com.xingin.xhs:id/search_box")
+    assert is_degenerate_res_id("com.example.gallery:id/0_resource_name_obfuscated")
+    assert not is_degenerate_res_id("com.example.gallery:id/search_box")
     assert not is_degenerate_res_id("com.x:id/_0_ok")      # 下划线开头是合法资源名
     assert not is_degenerate_res_id("")                     # 空的不算
 

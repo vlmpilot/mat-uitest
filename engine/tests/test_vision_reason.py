@@ -110,3 +110,56 @@ def test_runner_surfaces_model_reason(tmp_path, monkeypatch):
     assert runner._vision_locate(case.steps[0], {}) is None
     assert "found=false" in runner.vision_reason, runner.vision_reason
     assert "未命中或未启用" not in runner.vision_reason
+
+
+# -- 文案审计（2026-11-02：只观测不拦截）------------------------------------
+#
+# 实测的幻觉样本是：found=true / confidence=0.95 / 坐标 (0.137,0.383) / desc 原样
+# 回显 prompt 里的 "元素简述"。置信度和坐标都不可信，**文案才是破绽**。
+
+
+def test_extract_fields_reads_desc():
+    assert vision.extract_fields('{"desc": "齿轮图标", "found": true}')["desc"] == "齿轮图标"
+    assert vision.extract_fields("no desc here")["desc"] == ""
+
+
+def test_desc_verdict_flags_placeholder():
+    ok, reason = vision.desc_verdict("元素简述", "设置")
+    assert ok is False and "占位" in reason
+
+
+def test_desc_verdict_flags_empty():
+    ok, reason = vision.desc_verdict("", "设置")
+    assert ok is False and "为空" in reason
+
+
+def test_desc_verdict_accepts_real_description():
+    assert vision.desc_verdict("设置标题文字，位于屏幕顶部", "设置") == (True, "")
+
+
+def test_desc_verdict_marks_synonym_as_weak_signal():
+    """模型说"齿轮图标"来指"设置"是合法的——只记可疑，不算硬证据。"""
+    ok, reason = vision.desc_verdict("齿轮图标", "设置")
+    assert ok is False and "无交集" in reason
+
+
+def test_placeholder_desc_is_recorded_but_not_blocking(monkeypatch):
+    monkeypatch.setenv("MAT_AI_METRICS", "0")   # 别往真实 HOME 写盘
+    parsed = vision.parse_vision_response(
+        {"found": True, "confidence": 0.95, "x": 0.5, "y": 0.25, "desc": "元素简述"},
+        _png(), target="设置",
+    )
+    assert parsed is not None, "只观测不拦截：坐标照旧返回"
+    r = vision.last_result()
+    assert r["desc_ok"] is False
+    assert "占位" in r["desc_reason"]
+
+
+def test_real_desc_passes_audit(monkeypatch):
+    monkeypatch.setenv("MAT_AI_METRICS", "0")
+    vision.parse_vision_response(
+        {"found": True, "confidence": 0.95, "x": 0.5, "y": 0.25, "desc": "设置标题文字"},
+        _png(), target="设置",
+    )
+    r = vision.last_result()
+    assert r["desc_ok"] is True and r["desc_reason"] == ""

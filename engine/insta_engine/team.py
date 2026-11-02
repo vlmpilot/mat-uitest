@@ -26,11 +26,21 @@ def bearer() -> str:
     为什么授权优先：团队客户的身份是"这份合同"，不是某个匿名 ID。同一台机器可能先
     体验过、后来买了团队授权，以授权为准才符合直觉。标准版客户走不到团队命令
     （`entitlements` 先拦），顺序变化对他们没有影响。
+
+    ⚠️ **先看授权还在不在**（2026-11-01）：凭证按身份签、不随授权到期而失效，授权
+    过期后如果继续拿它当身份，用户会看到"到期了还在跑"。这里只是本机不认它（真正的
+    拒绝在服务端：`tokens.expires_at` 过期一律 401）。拿不到授权凭证就回落到匿名
+    token，命令会在服务端被拒——比本机假装还能用更诚实。
     """
     from . import licensing
     from .invite import auth_token
 
-    return licensing.read_server_token() or auth_token()
+    lic = licensing.read_license()
+    if "team_share" in (lic.get("features") or ()):
+        tok = licensing.read_server_token()
+        if tok:
+            return tok
+    return auth_token()
 
 
 def _bearer() -> str:
@@ -266,7 +276,16 @@ def status() -> int:
     print("本机授权: " + " · ".join(bits))
 
     if "team_share" not in (ent.get("features") or ()):
-        print("云端身份: —（当前档位不含团队协作，服务端会拒绝这类请求）")
+        # 档位与凭证是两件事：降级后旧凭证可能还在（2026-11-01 复核）。
+        # 说「服务端会拒绝」是错的——服务端只按**凭证**的档位判，它会照旧接受。
+        stale = licensing.read_server_token()
+        if stale:
+            print("云端身份: ⚠️ 本机仍留有云端凭证，但当前授权不含团队协作。")
+            print(f"  该凭证不会自己失效（服务端按凭证判档位）：{licensing.server_token_path()}")
+            print("  要用回团队库：mat activate --file <license.json>；"
+                  "要彻底清掉：删掉上面这个文件")
+        else:
+            print("云端身份: —（当前档位不含团队协作，服务端会拒绝这类请求）")
         return 1
 
     token = bearer()

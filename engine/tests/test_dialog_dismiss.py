@@ -113,7 +113,7 @@ def test_both_label_sets_are_non_empty_and_disjoint():
 @pytest.mark.parametrize("pkg,expected", [
     ("com.android.permissioncontroller", True),
     ("com.android.packageinstaller", True),
-    ("com.tencent.news", False),
+    ("com.example.news", False),
     ("com.android.settings", False),      # **不能算**：它本身就是合法被测目标（spike 的 t0）
 ])
 def test_is_system_dialog_keeps_settings_out(pkg: str, expected: bool):

@@ -1970,3 +1970,46 @@ def test_list_runs_ignores_corrupt_verify_json(tmp_path):
     (run_dir / "verify.json").write_text("{not json", encoding="utf-8")
 
     assert _verify_summary(run_dir) is None
+
+
+def test_list_runs_cache_still_sees_new_files(tmp_path):
+    """列表要缓存（真实工作区解析 2479 份 run.json 要 6.7 秒），但**不能因此看不见新变化**。
+
+    回归锁（2026-11-01 实测）：`/api/state` 每 5 秒轮询一次，而 `list_runs` 全量解析
+    要 7.2 秒 ⇒ 控制台永远追不上。缓存键带上 run.json / verify.json / diagnose.json /
+    calibration.json 四个 mtime：跑完一次诊断必须立刻反映，不能因为 run.json 没动
+    就继续显示「未诊断」。
+    """
+    import os
+    import shutil
+
+    from insta_engine.web_api.workspace import list_runs
+
+    d = tmp_path / "artifacts" / "case-a"
+    d.mkdir(parents=True)
+    (d / "run.json").write_text(json.dumps({
+        "case": {"caseId": "c1", "name": "A", "target": {"package": "com.x"}},
+        "run": {"case_id": "c1", "case_name": "A", "status": "failed", "steps": []},
+        "finished_at": "2026-11-01T00:00:00+00:00"}), encoding="utf-8")
+    os.utime(d / "run.json", (1_700_000_000, 1_700_000_000))
+
+    first = list_runs(tmp_path)
+    assert first[0]["diagnosed"] is False
+
+    # 只新增 diagnose.json（run.json 一个字节没动）——必须被看见
+    (d / "diagnose.json").write_text("{}", encoding="utf-8")
+    os.utime(d / "diagnose.json", (1_700_000_100, 1_700_000_100))
+    second = list_runs(tmp_path)
+    assert second[0]["diagnosed"] is True, "缓存不能把新落盘的诊断藏起来"
+
+    # run.json 变了也要重算
+    (d / "run.json").write_text(json.dumps({
+        "case": {"caseId": "c1", "name": "A2", "target": {"package": "com.x"}},
+        "run": {"case_id": "c1", "case_name": "A2", "status": "passed", "steps": []},
+        "finished_at": "2026-11-01T01:00:00+00:00"}), encoding="utf-8")
+    os.utime(d / "run.json", (1_700_000_200, 1_700_000_200))
+    assert list_runs(tmp_path)[0]["status"] == "passed"
+
+    # 目录删掉后缓存条目要被清掉（长驻进程不能只增不减）
+    shutil.rmtree(d)
+    assert list_runs(tmp_path) == []

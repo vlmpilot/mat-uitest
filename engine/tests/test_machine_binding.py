@@ -417,3 +417,96 @@ def test_cloudapi_is_not_imported_by_other_cli_modules():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd="/")
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False", "导入 CLI 时就把网络客户端拉进来了"
+
+
+def test_status_server_line_uses_the_token_plan(monkeypatch, tmp_path, capsys):
+    """团队凭证不能显示成「服务端授权（标准版）」——同一屏两个档位自相矛盾。
+
+    回归锁（2026-11-01 复核）：这行原来写死 `plan_label('pro')`。团队客户激活后，
+    上面一行是「本机授权: 团队版」，下面一行却是「服务端授权（标准版）」。
+    """
+    from insta_engine import __main__ as cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("requests.request", Recorder())
+    licensing.save_server_token("tok", {"plan": "team", "machines": 1, "max_machines": 5})
+
+    cli.cmd_status(None)
+
+    out = capsys.readouterr().out
+    assert "服务端授权（团队版）" in out
+    assert "服务端授权（标准版）" not in out
+
+
+def _fake_usage(plan: str) -> dict:
+    return {"month": "2026-11", "plan": plan, "gen_count": 0, "vision_count": 0,
+            "gen_byok": 0, "vision_byok": 0, "gen_official": 0, "vision_official": 0,
+            "gen_limit": 10000, "gen_enforced": False, "vision_limit": 1000}
+
+
+def test_status_mode_follows_license_not_the_token(monkeypatch, tmp_path, capsys):
+    """「使用方式」只由**授权**决定：官方代理下不能因为 .env 里是 free key 就显示体验模式。
+
+    回归锁（2026-11-01 复核）：原来写 `(remote or usage).get("plan")`，官方代理下
+    `remote` 恒有值 ⇒ 档位取的是**凭证**的 plan。而"先体验、后来买团队授权"是最常见的
+    升级路径（.env 里还留着早期 `mat token` 换的 free key）⇒ 客户看到「体验模式」，
+    同一屏下面却写着「授权: team」。付了钱显示成未激活。
+    """
+    from insta_engine import __main__ as cli
+    from insta_engine import promptstore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("requests.request", Recorder())
+    monkeypatch.setattr(promptstore, "is_server", lambda: True)
+    monkeypatch.setattr(cli, "_server_usage", lambda: {
+        "month": "2026-11", "plan": "free",
+        "gen": {"used": 0, "limit": 60}, "vision": {"used": 0, "limit": 20}})
+    monkeypatch.setattr(cli.UsageStore, "snapshot", lambda self: _fake_usage("team"))
+
+    cli.cmd_status(None)
+
+    out = capsys.readouterr().out
+    assert "团队模式" in out, out
+    assert "体验模式" not in out
+
+
+def test_status_mode_falls_back_to_token_when_no_license(monkeypatch, tmp_path, capsys):
+    """没有本地授权（free）时仍按凭证的 plan 显示——纯 token 用户不能变成「体验模式」。"""
+    from insta_engine import __main__ as cli
+    from insta_engine import promptstore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("requests.request", Recorder())
+    monkeypatch.setattr(promptstore, "is_server", lambda: True)
+    monkeypatch.setattr(cli, "_server_usage", lambda: {
+        "month": "2026-11", "plan": "pro",
+        "gen": {"used": 0, "limit": 2000}, "vision": {"used": 0, "limit": 300}})
+    monkeypatch.setattr(cli.UsageStore, "snapshot", lambda self: _fake_usage("free"))
+
+    cli.cmd_status(None)
+
+    assert "标准模式" in capsys.readouterr().out
+
+
+def test_status_warns_when_token_plan_differs_from_license(monkeypatch, tmp_path, capsys):
+    """授权是团队、凭证还是 free ⇒ 额度按凭证算，必须说出来。
+
+    不说的话，界面是「团队模式 · 本月生成 0/60」，看起来像团队版只给 60 次。
+    这条是"使用方式改成按授权"之后必须补的另一半：两个档位不一致时要解释清楚。
+    """
+    from insta_engine import __main__ as cli
+    from insta_engine import promptstore
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("requests.request", Recorder())
+    monkeypatch.setattr(promptstore, "is_server", lambda: True)
+    monkeypatch.setattr(cli, "_server_usage", lambda: {
+        "month": "2026-11", "plan": "free",
+        "gen": {"used": 0, "limit": 60}, "vision": {"used": 0, "limit": 20}})
+    monkeypatch.setattr(cli.UsageStore, "snapshot", lambda self: _fake_usage("team"))
+
+    cli.cmd_status(None)
+
+    out = capsys.readouterr().out
+    assert "凭证档位（free）与本机授权（team）不一致" in out
+    assert "GEN_API_KEY" in out

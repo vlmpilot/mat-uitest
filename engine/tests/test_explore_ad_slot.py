@@ -8,7 +8,7 @@
 
 ## 证据（不是猜的）
 
-首页 21 条 `tried` 里，两条的 rid 是 `com.tencent.news:id/txt_streamAd_title`
+首页 21 条 `tried` 里，两条的 rid 是 `com.example.news:id/txt_streamAd_title`
 —— **广告位有稳定的 rid 命名**。所以判据按 rid，不按文案（"秒杀"/"好价"会误杀真新闻标题）。
 
 ## 两道防线
@@ -94,11 +94,11 @@ def test_ad_slot_rid_is_narrow() -> None:
     """判据只看 rid 且要窄：`streamAd`/`ad_title` 算广告位，普通 rid 不算。"""
     from insta_engine.safety import is_ad_slot_rid
 
-    for rid in ("com.tencent.news:id/txt_streamAd_title",
+    for rid in ("com.example.news:id/txt_streamAd_title",
                 "com.x:id/ad_title", "com.x:id/banner_ad", "com.x:id/advert_view"):
         assert is_ad_slot_rid(rid), rid
     # 反向：真页面/真入口不能被误杀
-    for rid in ("com.tencent.news:id/title_text", "com.x:id/nav_btn_text",
+    for rid in ("com.example.news:id/title_text", "com.x:id/nav_btn_text",
                 "com.x:id/search_edit_text", "com.x:id/feed_card", ""):
         assert not is_ad_slot_rid(rid), rid
 

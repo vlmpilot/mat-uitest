@@ -121,7 +121,11 @@ def auth_token() -> str:
 
 
 def register() -> dict:
-    """注册匿名身份（幂等）。返回并落盘 `{user_id, invite_code, token}`。"""
+    """注册匿名身份（幂等）。返回并落盘 `{user_id, invite_code, token}`。
+
+    **只发公钥**：请求体里只有公钥哈希，不采集邮箱、手机号或设备指纹。防白刷不靠
+    识别用户——成本闸门在服务端是"全站每日总量封顶"，与"是谁在用"无关。
+    """
     out = _post("/invite/register", {"public_key": public_key()})
     state = {
         "user_id": out.get("user_id"),

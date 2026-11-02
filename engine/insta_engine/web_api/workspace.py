@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -220,10 +221,28 @@ def _verify_summary(run_dir: Path, case_id: str | None = None) -> dict | None:
             "next_actions": actions, "stale": stale}
 
 
+#: `list_runs` 的行缓存：`{run.json 绝对路径: ((mtime, verify, diagnose, calibration), 行)}`。
+#:
+#: 为什么需要（2026-11-01 实测）：真实工作区 2479 份 run.json，**解析要 6.7 秒**
+#: （rglob 只占 0.2 秒），而控制台每 5 秒轮询一次 `/api/state` ⇒ 永远追不上，
+#: 界面看着像卡死。缓存键带上**四个会改变这一行的文件 mtime**（run.json 本体、
+#: verify.json、diagnose.json、calibration.json），任一变了就重算——
+#: 这样「跑完一次诊断/校准」也能立刻反映，不会因为 run.json 没动就显示旧状态。
+_RUN_ROW_CACHE: dict[str, tuple[tuple[float, float, float, float], dict]] = {}
+
+
+def _mtime_or_zero(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def list_runs(root: Path) -> list[dict]:
     runs = []
     artifacts = root / "artifacts"
     if artifacts.exists():
+        seen_keys: set[str] = set()
         # P1-6（2026-10-24）：一层 glob 发现不了两层产物——CLI 套件条目
         # `artifacts/<套件>/<NN>_<stem>/run.json`、数据驱动 `artifacts/<stem>-ds/<组名>/`
         # 此前在报告列表**完全不可见**。改 rglob 递归发现；`dir` 从"叶子目录名"
@@ -231,11 +250,21 @@ def list_runs(root: Path) -> list[dict]:
         # 前端 `/artifacts/${dir}/report.html` 与 diagnose/calibrate 的
         # `root/"artifacts"/run` 都天然支持子路径）。
         for run_json in artifacts.rglob("run.json"):
+            run_dir = run_json.parent
+            cache_key = str(run_json)
+            stamp = (_mtime_or_zero(run_json),
+                     _mtime_or_zero(run_dir / "verify.json"),
+                     _mtime_or_zero(run_dir / "diagnose.json"),
+                     _mtime_or_zero(run_dir / "calibration.json"))
+            hit = _RUN_ROW_CACHE.get(cache_key)
+            if hit is not None and hit[0] == stamp:
+                runs.append(hit[1])
+                seen_keys.add(cache_key)
+                continue
             try:
                 data = json.loads(run_json.read_text(encoding="utf-8"))
                 run = data.get("run", {})
-                run_dir = run_json.parent
-                runs.append({
+                row = {
                     "dir": run_dir.relative_to(artifacts).as_posix(),
                     "case_id": run.get("case_id"),
                     "case_name": run.get("case_name"),
@@ -259,9 +288,17 @@ def list_runs(root: Path) -> list[dict]:
                     # 有就带出来——控制台据此渲「验证结论」卡；没有就别塞空对象（旧产物）。
                     # 带 `stale` 标记：目录被后来的运行覆盖过 ⇒ 判定不是这一次的（见函数注释）。
                     "verify": _verify_summary(run_dir, run.get("case_id")),
-                })
+                }
             except (OSError, ValueError):
                 continue
+            _RUN_ROW_CACHE[cache_key] = (stamp, row)
+            seen_keys.add(cache_key)
+            runs.append(row)
+        # 清掉本 root 下已消失的条目：长驻进程不能只增不减（删产物目录很常见）
+        prefix = str(artifacts) + os.sep
+        for stale_key in [k for k in _RUN_ROW_CACHE
+                          if k.startswith(prefix) and k not in seen_keys]:
+            _RUN_ROW_CACHE.pop(stale_key, None)
     # 按 finished_at 倒序——原「glob 字典序 ≈ 时间序」的假设被批量执行产物目录的
     # 「01_ 前缀」打破（2026-10-13 实测：最新批次排第 51 位，[:50] 裁掉导致新报告不显示）
     runs.sort(key=lambda r: r["finished_at"] or "", reverse=True)

@@ -3,8 +3,8 @@
   "reset": "monthly_utc",
   "plans": {
     "free": {
-      "gen": 60,
-      "vision": 20
+      "gen": 300,
+      "vision": 100
     },
     "pro": {
       "gen": 300,

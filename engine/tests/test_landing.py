@@ -25,7 +25,7 @@ from insta_engine.landing import (
 )
 from insta_engine.runner import Runner
 
-PKG = "com.tencent.news"
+PKG = "com.example.news"
 
 
 def _ctl(cls: str, text: str = "", desc: str = "", rid: str = "") -> dict:
@@ -80,7 +80,7 @@ def test_home_profile_uses_the_shallowest_page():
     ⇒ 用 `home_labels_for(max_depth=1)` 会把参考集变成"这个 App 显示过的一切"。
     """
     idx = _index([_page(1, _SEARCH, "detail"), _page(0, _HOME, "root")])
-    assert "rid:com.tencent.news:id/channel_bar_item_container" in home_profile(idx)
+    assert "rid:com.example.news:id/channel_bar_item_container" in home_profile(idx)
     assert "txt:历史搜索" not in home_profile(idx)
 
 
@@ -185,20 +185,20 @@ _SEARCH_XML = (
 
 _HOME_XML = (
     "<hierarchy>"
-    '<node class="android.widget.FrameLayout" package="com.tencent.news"'
-    ' resource-id="com.tencent.news:id/channel_bar_item_container"'
+    '<node class="android.widget.FrameLayout" package="com.example.news"'
+    ' resource-id="com.example.news:id/channel_bar_item_container"'
     ' clickable="true" bounds="[0,337][1080,430]"/>'
-    '<node class="android.widget.TextView" package="com.tencent.news" text="要闻"'
-    ' resource-id="com.tencent.news:id/channelbar_text" bounds="[46,340][200,420]"/>'
-    '<node class="android.widget.FrameLayout" package="com.tencent.news"'
-    ' resource-id="com.tencent.news:id/home_channel_search_box"'
+    '<node class="android.widget.TextView" package="com.example.news" text="要闻"'
+    ' resource-id="com.example.news:id/channelbar_text" bounds="[46,340][200,420]"/>'
+    '<node class="android.widget.FrameLayout" package="com.example.news"'
+    ' resource-id="com.example.news:id/home_channel_search_box"'
     ' clickable="true" bounds="[0,100][1080,200]"/>'
-    '<node class="android.widget.TextView" package="com.tencent.news" text="新闻"'
-    ' resource-id="com.tencent.news:id/nav_btn_text" bounds="[0,2200][270,2300]"/>'
-    '<node class="android.widget.TextView" package="com.tencent.news" text="视频"'
-    ' resource-id="com.tencent.news:id/nav_btn_text" bounds="[270,2200][540,2300]"/>'
-    '<node class="android.widget.TextView" package="com.tencent.news" text="我的"'
-    ' resource-id="com.tencent.news:id/nav_btn_text" bounds="[810,2200][1080,2300]"/>'
+    '<node class="android.widget.TextView" package="com.example.news" text="新闻"'
+    ' resource-id="com.example.news:id/nav_btn_text" bounds="[0,2200][270,2300]"/>'
+    '<node class="android.widget.TextView" package="com.example.news" text="视频"'
+    ' resource-id="com.example.news:id/nav_btn_text" bounds="[270,2200][540,2300]"/>'
+    '<node class="android.widget.TextView" package="com.example.news" text="我的"'
+    ' resource-id="com.example.news:id/nav_btn_text" bounds="[810,2200][1080,2300]"/>'
     "</hierarchy>"
 )
 

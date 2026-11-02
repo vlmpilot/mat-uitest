@@ -34,7 +34,7 @@ class _Shim:
 
 def test_subst_keeps_index() -> None:
     loc = Locator(strategy=LocatorStrategy.RES_ID,
-                  value="com.tencent.news:id/channel_bar_item_container", index=5)
+                  value="com.example.news:id/channel_bar_item_container", index=5)
     out = _Shim()._subst(loc, {})
     assert out.index == 5, "变量替换丢了 index ⇒ 运行期会点第一个实例"
     assert out.value == loc.value

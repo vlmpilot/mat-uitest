@@ -1805,6 +1805,12 @@ def cmd_activate(args) -> int:
     else:
         print(f"✅ 已激活 {licensing.plan_label(info['plan'])}（有效期至 "
               f"{_day(info['expires_at'])}）")
+        if info.get("downgraded"):
+            # 降级会**顺手作废团队凭证**（否则服务端照旧按 team 给额度）。
+            # 这件事必须说出来：不说的话，用户下一次 `mat team pull` 才发现库没了。
+            print("   ⚠️ 团队协作能力已失效：席位、团队库、报告链接与审计都不可用；"
+                  "本机的团队凭证已作废。")
+            print("      要用回团队版：mat activate --file <license.json>")
     if info.get("redeemed"):
         # 时长卡：核销已在 activate() 内完成（服务端登记 + 重签普通码写盘），无需再登记
         token = licensing.read_server_token()
@@ -1959,11 +1965,15 @@ def _license_status_lines() -> list[str]:
         meta = json.loads(licensing.server_token_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
+    # 档位**不能写死 pro**（2026-11-01 复核）：团队客户激活后，本机授权行写着「团队版」，
+    # 这行却写「标准版」——同一屏两个档位。凭证自己的 plan 优先，旧文件没这个键才回落。
+    label = licensing.plan_label(str(meta.get("plan")
+                                     or licensing.read_license().get("plan") or "pro"))
     if meta.get("machines"):
-        return [f"服务端授权（{licensing.plan_label('pro')}）: 已登记，本码绑定 "
+        return [f"服务端授权（{label}）: 已登记，本机绑定 "
                 f"{meta['machines']}/{meta.get('max_machines', '?')} 台机器"
                 "（`mat activate --machines` 查看，`--unbind` 解绑）"]
-    return [f"服务端授权（{licensing.plan_label('pro')}）: 已登记"
+    return [f"服务端授权（{label}）: 已登记"
             "（`mat activate --machines` 查看绑定）"]
 
 
@@ -2252,9 +2262,54 @@ def _server_usage() -> dict | None:
             return None
         data = resp.json()
         return {"month": data.get("month"), "plan": data.get("plan"),
-                "gen": data.get("gen", {}), "vision": data.get("vision", {})}
+                "gen": data.get("gen", {}), "vision": data.get("vision", {}),
+                # 路由事实（2026-11-02）：老服务端没有这个字段 ⇒ 空 dict，调用方降级处理
+                "routing": data.get("routing") or {}}
     except Exception:
         return None
+
+
+def _print_routing(remote: dict | None) -> None:
+    """说明「内容去哪」——这是产品承诺的一半，不能只写在文档里。
+
+    **文本与视觉是两条独立的路**（2026-11-02）：本地视觉端点没配时，文本在本站
+    自部署模型上跑，截图仍经模型服务商。所以不能笼统一句"不外发"——那正是
+    之前的文档与服务端行为自相矛盾的根源。
+
+    事实来自服务端 `/usage.routing`（老服务端没有该字段 ⇒ 不猜，只报客户端设置）。
+    """
+    from . import route
+
+    facts = (remote or {}).get("routing") or {}
+    pref = route.preference()
+    if pref == route.CLOUD:
+        print("  路由: 云端模型服务商（MAT_ROUTE=cloud）—— 文本与截图都会发给模型商")
+        return
+    if not facts:
+        if pref == route.LOCAL:
+            print("  路由: 已要求本地（MAT_ROUTE=local）—— 服务端版本较旧，确认不了实际路由")
+        return
+    text_local = bool(facts.get("text_local"))
+    vision_local = bool(facts.get("vision_local"))
+    if not text_local:
+        if pref == route.LOCAL:
+            print("  路由: ⚠️ MAT_ROUTE=local，但当前档位不走本站自部署模型"
+                  "——生成会被拒绝（去掉该设置可改用云端）")
+        else:
+            print("  路由: 云端模型服务商（该档位不走本站自部署模型）")
+        return
+    if pref == route.LOCAL and not vision_local:
+        print("  路由: ⚠️ MAT_ROUTE=local —— 文本走本站模型，但视觉没有自部署端点，"
+              "视觉兜底会被拒绝")
+        return
+    tone = "（MAT_ROUTE=local）" if pref == route.LOCAL else ""
+    if vision_local:
+        # 2026-11-02 起**不再回落云端**：本地不可用就报错。这句要说出来——
+        # 否则用户会以为"服务挂了会自动用云端"，那正是我们刻意不做的事。
+        print(f"  路由: 本站自部署模型{tone}—— 文本与截图都不外发；"
+              "服务不可用时会报错，不会改走云端")
+    else:
+        print(f"  路由: 文本在本站自部署模型{tone} · 视觉兜底经模型服务商（截图会外发）")
 
 
 def cmd_ai_stats(args) -> int:
@@ -2262,13 +2317,22 @@ def cmd_ai_stats(args) -> int:
     from . import ai_metrics
 
     print(ai_metrics.render(ai_metrics.summarize(args.hours)))
+    audit = ai_metrics.summarize_vision_audit(args.hours)
+    if audit["total"]:
+        # 只观测不拦截（2026-11-02）：视觉兜底的真实调用量还太少，先攒"模型有没有
+        # 真读出控件"的证据；占用率高到一定程度，再决定要不要把它变成拦截条件。
+        print(f"\n视觉文案审计（近 {audit['hours']} 小时）：命中 {audit['total']} 次，"
+              f"其中 {audit['bad']} 次文案可疑（{audit['rate']:.0%}）")
+        for reason, n in sorted(audit["by_reason"].items(), key=lambda kv: -kv[1]):
+            print(f"  · {reason}：{n}")
+        print("  说明：文案可疑通常意味着模型没真读控件（坐标更不可信），但**未拦截**。")
     print(f"\n明细：{ai_metrics.metrics_path()}")
     return 0
 
 
 def cmd_status(_args) -> int:
     usage = UsageStore().snapshot()
-    from . import promptstore
+    from . import licensing, promptstore
 
     server = promptstore.is_server()
     remote = _server_usage() if server else None
@@ -2279,7 +2343,16 @@ def cmd_status(_args) -> int:
     # 标准模式可以走代理，也可以自带 API Key，两种组合都合法。
     # ⚠️ 2026-10-25 起「团队模式」只指团队授权（team/private）；`--share` 叫**共享模式**，
     # 它不再改变使用方式的显示（此前 `--share` 会被控制台显示成团队模式，双口径已统一）。
-    plan = (remote or usage).get("plan") or "free"
+    #
+    # **授权优先，token 只在未激活时兜底**（2026-11-01 复核）：原来写成
+    # `(remote or usage)`，官方代理下 `remote` 恒有值 ⇒ 档位取的是**凭证**的 plan。
+    # 于是"先体验过、后来买了团队授权"的客户（最常见的那条升级路径：.env 里还留着
+    # 早期 `mat token` 换的 free key）会看到「体验模式」，而同一屏下面写着「授权: team」。
+    # 这条与上面那句"只由授权决定"自相矛盾，也把付了钱的客户显示成未激活。
+    # 没有本地授权（free）时才用凭证的 plan——纯 token 用户仍然显示得出档位。
+    license_plan = str(usage.get("plan") or "free")
+    token_plan = str((remote or {}).get("plan") or "")
+    plan = license_plan if license_plan != "free" else (token_plan or license_plan)
     usage_mode = _usage_mode_label(plan)
     ai_access = "官方代理" if server else "自带 API Key"
     if server:
@@ -2289,10 +2362,19 @@ def cmd_status(_args) -> int:
             print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
             print(f"NL 生成（{remote['month']}）: {gen.get('used', 0):g}/{gen.get('limit', '?'):g}"
                   " · 本地执行不限量")
+            # 授权与凭证是两套档位：额度**按凭证**算（服务端只认 Bearer）。
+            # 团队客户升级后 .env 里往往还是早期 `mat token` 换的 free key ⇒ 额度只有 60，
+            # 而上面写着「团队模式」——不说清会以为团队版只给 60 次（2026-11-01 复核）。
+            if license_plan != "free" and token_plan and token_plan != license_plan:
+                print(f"  ⚠️ 凭证档位（{token_plan}）与本机授权（{license_plan}）不一致："
+                      "上面这个额度是按**凭证**算的。")
+                print("     把授权换来的凭证配成 GEN_API_KEY 后额度才按授权算："
+                      f"{licensing.server_token_path()}")
         else:
             print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")
             print(f"NL 生成（{usage['month']}）: 已调用 {usage['gen_count']:g} 次"
                   f"{_byok_note(usage, 'gen')} · 服务端暂不可达，额度以服务端为准")
+        _print_routing(remote)
     else:
         # 自带 API Key：token 用户自己付 ⇒ **没有额度这个概念**，别把策略数字当限制展示
         print(f"MAT v{__version__}  {usage_mode} · AI 接入: {ai_access}")

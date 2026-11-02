@@ -328,3 +328,25 @@ def test_complete_task_writes_end_to_end_latency(home):
     assert task_rows[0]["rounds"] == 2, "修了一轮"
     assert task_rows[0]["latency_ms"] is not None, "端到端耗时必须落盘"
     assert task_rows[0]["latency_ms"] >= 0
+
+
+# -- 视觉文案审计（2026-11-02）----------------------------------------------
+
+
+def test_vision_audit_records_and_summarizes(home):
+    ai_metrics.record_vision_audit(desc_ok=False, reason="desc 是占位词",
+                                   confidence=0.95, desc_len=4, target_len=2)
+    ai_metrics.record_vision_audit(desc_ok=True, confidence=0.9, desc_len=12, target_len=2)
+    summary = ai_metrics.summarize_vision_audit(24)
+    assert summary["total"] == 2
+    assert summary["bad"] == 1
+    assert summary["by_reason"] == {"desc 是占位词": 1}
+    # 不记文案本身（与 ai.jsonl 同一纪律）
+    raw = ai_metrics.vision_audit_path().read_text(encoding="utf-8")
+    assert "元素简述" not in raw
+
+
+def test_vision_audit_respects_metrics_off(home, monkeypatch):
+    monkeypatch.setenv("MAT_AI_METRICS", "0")
+    ai_metrics.record_vision_audit(desc_ok=False, reason="desc 为空")
+    assert ai_metrics.summarize_vision_audit(24)["total"] == 0

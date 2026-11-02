@@ -28,8 +28,11 @@ _DEFAULTS: dict[str, Any] = {
     "version": 1,
     "reset": "monthly_utc",
     "plans": {
-        "free": {"gen": 60, "vision": 20},
-        "pro": {"gen": 2000, "vision": 300},
+        # 2026-11-02：单人档给到标准档额度（300/100），不需要激活码。
+        # 此前这里是 60/20，而 pro 写的是 2000/300——与 policy 漂了很久，因为一致性
+        # 测试只看两份 JSON、不看这些常量（已补 test_builtin_defaults_match_policy）。
+        "free": {"gen": 300, "vision": 100},
+        "pro": {"gen": 300, "vision": 100},
         "team": {"gen": 10000, "vision": 1000},
         "private": {"gen": None, "vision": None},
     },

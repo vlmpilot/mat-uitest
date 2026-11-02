@@ -27,6 +27,22 @@ def test_packaged_copies_match_canonical():
         f"副本与唯一事实源不一致：{cloud_copy}（跑 scripts/sync_quota_policy.py 修复）")
 
 
+def test_builtin_defaults_match_policy():
+    """**兜底常量**也必须与 policy 一致：只在文件损坏时才用到，而那正是最不能出错的时候。
+
+    2026-11-02 实测到的漂移：`quota_policy._DEFAULTS` 里 pro 还是 2000/300、free 还是
+    60/20，policy 早就是 300/100。原测试只看两份 JSON，常量没人管——同类漂移会在
+    "策略文件读不到"的雨天一次性放大（引擎按 2000 放行、服务端按 300 拦截）。
+    """
+    import json
+
+    from insta_engine.quota_policy import _DEFAULTS
+
+    canonical = json.loads((REPO / "policy" / "quota.json").read_text(encoding="utf-8"))
+    assert _DEFAULTS["plans"] == canonical["plans"], (
+        "quota_policy._DEFAULTS 与 policy/quota.json 漂移（改一处忘另一处）")
+
+
 def test_engine_and_cloud_limits_agree():
     if not (REPO / "cloud").is_dir():
         pytest.skip("公开仓不含闭源侧 cloud/，服务端解析一致性在闭源仓 CI 校验")
