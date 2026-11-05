@@ -426,9 +426,10 @@ def api_gen(root: Path, body: dict) -> tuple[int, dict]:
         if truncated:
             tail += f"；超出上限已截断 {truncated} 条"
         # 文件名后追加 #展示编号+用例标题（发起人 2026-10-13）：文件名随机难对上号，
-        # 编号/标题与用例列表同源（case_meta 惰性分配，同锁同注册表，幂等无副作用）
-        from .workspace import case_meta
+        # 编号/标题与用例列表同源（case_meta 只读推导；落盘交给 persist，GET 不再写盘）
+        from .workspace import case_meta, persist_case_numbers
 
+        persist_case_numbers(root)
         meta = case_meta(root)
         def _desc(name: str) -> str:
             m = meta.get(name) or {}

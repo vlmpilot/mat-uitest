@@ -318,7 +318,14 @@ def eval_adapter(root: Path, adapter: str, base: str, holdout: list[dict],
 
 def write_use_config(root: Path, adapter: str, base: str,
                      server_url: str = "http://127.0.0.1:8080") -> Path:
-    """`mat finetune use`：把 gen 的 local 三件套写进工作区 .env（提示段不覆盖已有值）。"""
+    """`mat finetune use`：把 gen 的 local 三件套写进工作区 .env（提示段不覆盖已有值）。
+
+    🔴 **前置条件：必须先自己起一个带 adapter 的文本服务**（例如
+    `mlx_lm.server --model <基座> --adapter-path <adapter> --port 8080`）。
+    本项目从 2026-11-04 起默认部署**只常驻视觉模型**（`scripts/serve_local.sh vl`
+    不起文本服务），文本任务走云端 ⇒ 不先起这个服务，写完配置后 gen 会连不上。
+    想整机离线再用这条路径；否则请保留云端接入。
+    """
     env_path = Path(root) / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     wanted = {

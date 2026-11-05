@@ -23,6 +23,11 @@ from ..run_index import iter_run_json
 #: 用例展示编号分配锁（case_meta 可能被并发 state 请求调用，编号不能重发）
 _CASE_NO_LOCK = threading.Lock()
 
+#: 进程内编号表：`{工作区绝对路径: {用例文件名: 编号}}`。
+#: GET 路径**只读盘、不写盘**（2026-11-05），但编号仍要在同一进程内稳定：
+#: 删除不回收、并发不重发、新增续号——全靠这张表承接，落盘交给写接口。
+_CASE_NOS_MEM: dict[str, dict[str, int]] = {}
+
 #: 迁移档位 → 要搬的子目录（相对工作区根）。
 _MIGRATE_DIRS: dict[str, list[str]] = {
     "none": [],
@@ -136,51 +141,122 @@ def api_workspace_switch(server, old_root: Path, host: str, body: dict) -> tuple
 
 # -- 清单读取（自 Phase 0 搬入；state.py 与报告/执行视图的数据源） --------------------
 
+def _case_names(cases_dir: Path) -> list[str]:
+    """参与编号的用例文件（按文件名序）；`_batch_` 历史批量临时文件不算。"""
+    return sorted(p.name for p in cases_dir.glob("*.json")
+                  if not p.name.startswith("_batch_"))
+
+
+def _read_case_nos(reg_path: Path) -> dict[str, int]:
+    """只读注册表；缺失/损坏/无权限一律当空表——**读取方不能因此失败**。"""
+    try:
+        data = json.loads(reg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # 值可能是手改/历史脏数据（字符串、bool）：非 int 一律丢弃，避免 max() 混类型炸掉
+    return {str(k): v for k, v in data.items()
+            if isinstance(v, int) and not isinstance(v, bool)}
+
+
+def _case_nos_key(root: Path) -> str:
+    try:
+        return str(root.resolve())
+    except OSError:
+        return str(root)
+
+
+def _assign_case_nos(nos: dict[str, int], names: list[str]) -> dict[str, int]:
+    """给未登记的文件续号（max+1）；已登记的不动 ⇒ 删除不回收、重命名算新用例。"""
+    next_no = max(nos.values(), default=0) + 1
+    for name in names:
+        if name not in nos:
+            nos[name] = next_no
+            next_no += 1
+    return nos
+
+
+def _merged_case_nos(root: Path, reg_path: Path, names: list[str]) -> dict[str, int]:
+    """盘上注册表 + 进程内编号的合并结果（盘上值优先：已持久化的是权威口径）。
+
+    调用方必须已持有 `_CASE_NO_LOCK`。合并结果回写进程内存，保证同一进程内
+    多轮 GET 的编号恒定（即使一次都没落过盘）。
+    """
+    nos = _read_case_nos(reg_path)
+    mem = _CASE_NOS_MEM.setdefault(_case_nos_key(root), {})
+    for name, no in mem.items():
+        nos.setdefault(name, no)
+    _assign_case_nos(nos, names)
+    mem.update(nos)
+    return nos
+
+
 def case_meta(root: Path) -> dict:
-    """用例文件 → {package, title} 映射（配置台按 App 分组/联动的数据源）。
+    """用例文件 → {package, title, no} 映射（配置台按 App 分组/联动的数据源）。
 
     「no」= 展示用例编号 #N（发起人 2026-10-12：caseId 随机字母难沟通且大量重复）。
-    每个用例文件首次出现时分配递增数字，持久化在 artifacts/.case_no.json——
-    删除用例不回收编号（沟通口径稳定）、重命名视为新用例。纯展示字段，
-    不参与执行链与报告对账（对账仍以 JSON 里的 caseId 为准）。
+    编号持久化在 `artifacts/.case_no.json`：删除不回收（沟通口径稳定）、重命名算新用例。
+    纯展示字段，不参与执行链与报告对账（对账仍以 JSON 里的 caseId 为准）。
+
+    **GET 不得写盘**（2026-11-05 评审 C3）：只读注册表，读不到就用内存推导；
+    落盘只发生在 `persist_case_numbers()`，由显式写接口（保存/生成/自愈用例）调用。
+    旧实现每次 GET 发现新用例就 `write_text` —— 只读挂载的工作区一访问就 500。
     """
     meta = {}
     cases_dir = root / "cases"
     if not cases_dir.exists():
         return meta
+    names = _case_names(cases_dir)
     with _CASE_NO_LOCK:
         reg_path = root / "artifacts" / ".case_no.json"
+        nos = _merged_case_nos(root, reg_path, names)
+    for name in names:
         try:
-            nos = json.loads(reg_path.read_text(encoding="utf-8"))
-            nos = nos if isinstance(nos, dict) else {}
+            data = json.loads((cases_dir / name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            nos = {}
-        next_no = max([*nos.values(), 0]) + 1
-        dirty = False
-        for f in sorted(cases_dir.glob("*.json")):
-            if f.name.startswith("_batch_"):
-                continue  # 历史批量临时文件不进编号/元数据（2026-10-24 兜底，同 state 列表过滤）
-            if f.name not in nos:
-                nos[f.name] = next_no
-                next_no += 1
-                dirty = True
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            pkg = (data.get("target") or {}).get("package", "")
-            meta[f.name] = {
-                "package": pkg,
-                "app": pkg,  # 别名：前端/概览按 app 读取（键名曾不匹配 ⇒ 应用列全"—"）
-                "title": data.get("name", ""),
-                "caseId": data.get("caseId", ""),  # 固定标识：跨改名稳定，报告/日志对账用
-                "datasets": bool(data.get("datasets")),
-                "no": nos[f.name],
-            }
-        if dirty:
-            reg_path.parent.mkdir(parents=True, exist_ok=True)
-            reg_path.write_text(json.dumps(nos, ensure_ascii=False), encoding="utf-8")
+            continue
+        pkg = (data.get("target") or {}).get("package", "")
+        meta[name] = {
+            "package": pkg,
+            "app": pkg,  # 别名：前端/概览按 app 读取（键名曾不匹配 ⇒ 应用列全"—"）
+            "title": data.get("name", ""),
+            "caseId": data.get("caseId", ""),  # 固定标识：跨改名稳定，报告/日志对账用
+            "datasets": bool(data.get("datasets")),
+            "no": nos[name],
+        }
     return meta
+
+
+def persist_case_numbers(root: Path) -> bool:
+    """把展示编号表落盘。**只由显式写接口调用，GET 永不调用**。
+
+    只读工作区（只读挂载/权限不足/磁盘满）返回 False 而不是抛异常：
+    写接口本身已经成功（用例已落盘），编号晚一轮再持久化不影响可用性。
+    写盘走临时文件 + `os.replace`：中途失败不会把既有注册表截断成半份。
+    """
+    cases_dir = root / "cases"
+    if not cases_dir.exists():
+        return True
+    names = _case_names(cases_dir)
+    with _CASE_NO_LOCK:
+        reg_path = root / "artifacts" / ".case_no.json"
+        before = _read_case_nos(reg_path)
+        nos = _merged_case_nos(root, reg_path, names)
+        if nos == before:
+            return True  # 没有新编号，不碰盘（只读部署也不会制造无意义的失败）
+        tmp = reg_path.with_name(reg_path.name + ".tmp")
+        try:
+            reg_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(nos, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, reg_path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+    return True
 
 
 def _verify_summary(run_dir: Path, case_id: str | None = None) -> dict | None:

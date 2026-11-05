@@ -28,9 +28,12 @@ function SubscribeTab({ state }: { state: StateResp }) {
             style={{ marginInlineEnd: 0 }}>
             {usageModeLabel(state.license?.plan)}
           </Tag>
-          {/* 到期日（2026-10-13）：团队/私有化合同授权才显示；2026-11-02 起
-              控制台不再提供激活码输入（早期码用 `mat activate <码>` 离线激活）。 */}
-          {state.license?.plan === "pro" && state.license?.expires_at ? (
+          {/* 到期日（2026-10-13）：任何带到期日的授权都显示——v2 合同（team/private）
+              与历史单人码都在 `read_license()` 里返回 `expires_at`（licensing.py:433/203）。
+              2026-11-05 修：原条件写死 `plan === "pro"`，导致**付费的团队客户看不到合同
+              到期日**，只有早期单人码能看到，方向正好反了。
+              2026-11-02 起控制台不再提供激活码输入（早期码用 `mat activate <码>` 离线激活）。 */}
+          {state.license?.expires_at ? (
             <Typography.Text style={{ color: "#389e0d", fontWeight: 600, marginLeft: 8 }}>
               有效期至 {new Date(state.license.expires_at * 1000).toLocaleDateString()}
             </Typography.Text>
@@ -51,9 +54,15 @@ function SubscribeTab({ state }: { state: StateResp }) {
       <div style={{ marginTop: 16 }}>
         <SeatsCard />
       </div>
-      <div style={{ marginTop: 16 }}>
-        <FinetuneCard />
-      </div>
+      {/* 微调卡片默认关闭（2026-11-05）：训练对唯一来源是 gen 落盘的 meta.nl，本机存量
+          实测 0 对（1925 条 run 全部缺 nl，31 个用例无一含它），200 对门槛永远到不了；
+          且本项目默认部署只常驻视觉模型，训完也没有文本服务加载 adapter。
+          能力保留在 CLI（mat finetune，已标「实验性」），要露出时把这个常量改成 true。 */}
+      {SHOW_FINETUNE_CARD && (
+        <div style={{ marginTop: 16 }}>
+          <FinetuneCard />
+        </div>
+      )}
     </>
   );
 }
@@ -65,10 +74,18 @@ function SubscribeTab({ state }: { state: StateResp }) {
 function AboutTab({ state }: { state: StateResp }) {
   return (
     <Descriptions size="small" column={1} bordered>
-      <Descriptions.Item label="版本">MAT v{state.version}({state.console})</Descriptions.Item>
+      {/* 只显示版本号（2026-11-05）：原来还拼了 state.console，而它的取值是
+          "pro"/"legacy"（表示包里有没有新版控制台产物，见 state.py:73），和套餐档位
+          `pro` 撞名——用户会读成「Pro 版」。这信息对用户无用，去掉。 */}
+      <Descriptions.Item label="版本">MAT v{state.version}</Descriptions.Item>
       <Descriptions.Item label="官网"><a href="https://mobileaitest.com" target="_blank" rel="noreferrer">mobileaitest.com</a></Descriptions.Item>
       <Descriptions.Item label="开源仓库"><a href="https://github.com/vlmpilot/mat-uitest" target="_blank" rel="noreferrer">github.com/vlmpilot/mat-uitest</a>(AGPL-3.0)</Descriptions.Item>
-      <Descriptions.Item label="文档">仓库 docs/(使用手册 13 · 引擎设计 22)</Descriptions.Item>
+      {/* 指向官网手册（2026-11-05）：原来写的是仓库内路径加两个编号（使用手册 13 ·
+          引擎设计 22）——那些编号只在本仓内部有意义，公开仓的路径也不保证与之一致，
+          对用户更是无从下手。 */}
+      <Descriptions.Item label="使用手册">
+        <a href="https://mobileaitest.com/manual.html" target="_blank" rel="noreferrer">mobileaitest.com/manual.html</a>
+      </Descriptions.Item>
     </Descriptions>
   );
 }
@@ -114,16 +131,25 @@ function ExportTab() {
   const [link, setLink] = useState<string | null>(null);
   const doExport = async (media: boolean) => {
     setBusy(true);
+    // 轮询上限 10 分钟（2026-11-05：原 200 次×1s）。到点不再干等，但必须**明确告诉用户**
+    // 任务还在后台跑——以前这里静默退出循环，用户以为导完了，反复点按钮又堆出多个任务。
+    // 产物位置是确定的：服务端写 <工作区>/artifacts/mat-export-<时间戳>.zip（export.py:19）。
+    let settled = false;
     try {
       const { job_id } = await startExport(media);
-      for (let i = 0; i < 200; i++) {
+      for (let i = 0; i < 600; i++) {
         const job = await getJob(job_id);
         if (job.status !== "running") {
           if (job.status === "done") { message.success(job.summary || "导出完成"); setLink(job.link || null); }
           else message.error(job.error || `任务${job.status}`);
+          settled = true;
           break;
         }
         await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (!settled) {
+        message.info("导出仍在后台进行（含截图的大工作区耗时较长）——完成后会出现在"
+          + "工作区 artifacts/ 目录，文件名 mat-export-<时间>.zip", 8);
       }
     } catch (e) { message.error(String(e)); } finally { setBusy(false); }
   };
@@ -143,7 +169,7 @@ function ExportTab() {
 }
 
 // 团队成员（2026-10-25 产品定位调整）：功能不分档，商业化只控额度 + 人数；
-// **团队共享只随团队授权提供**——标准/体验授权面向单人使用，`--share` 下上限也恒 1。
+// **团队共享只随团队授权提供**——单人版授权面向单人使用，`--share` 下上限也恒 1。
 // 名单落 artifacts/team_seats.json，任何成员在此都能移除名单里的人（无权限分级：这是内网
 // 协作的取舍，不是权限系统）——名额不是权限，别当安全边界讲；误填/离职的名字要能被人清掉，
 // 所以不限制"只能删自己"。
@@ -161,9 +187,12 @@ function WxContact() {
   return <a href="https://mobileaitest.com/#contact" target="_blank" rel="noreferrer">联系客服</a>;
 }
 
-// 微调数据(L2 工具链,2026-10-28):nl 回溯对数与门槛进度——数据积累是后台自动的,
-// 用户看不见就会忘;export 一键落 dataset/(训练本体走 CLI:mat finetune train,长任务+mlx 环境
-// 不进控制台)。仅 local 模式生效(server 官方代理加载不了用户 adapter)。
+//: 是否露出「微调数据」卡片。默认 false——能力在 CLI，入口先收起来（理由见渲染处注释）。
+const SHOW_FINETUNE_CARD = false;
+
+// 微调数据(L2 工具链,2026-10-28):nl 回溯对数与门槛进度。
+// 🔴 2026-11-05 起默认不渲染（见下方 SHOW_FINETUNE_CARD）：本机实测 0 对可训练数据，
+// 且默认部署不再常驻文本模型——先修好数据来源与自建服务路径再打开。
 function FinetuneCard() {
   const [data, setData] = useState<FinetuneStats | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -199,8 +228,8 @@ function FinetuneCard() {
             </span>
           )}
           <div style={{ color: "#8a919f", fontSize: 12 }}>
-            正常使用 MAT（生成+通过）即自动积累;训练:mat finetune train(训练数据只在本机;
-            adapter 仅 local 模式生效)。完整操作手册:使用手册 §4.15。
+            实验性：训练对依赖 gen 落盘的 nl，本机存量 0 对；训练需自建文本服务
+            （mlx_lm.server），默认部署只常驻视觉模型。训练数据只在本机。
           </div>
           <Button size="small" loading={exporting} onClick={doExport}>导出 dataset/</Button>
         </Space>
@@ -236,9 +265,9 @@ function SeatsCard() {
         message={<span><TeamOutlined style={{ color: "#4F5BFF", marginRight: 8 }} />成员管理</span>}
         description={data && !data.shared ? (
           <span>本机单人模式：这个控制台只有你（安装者）。要和同事共用同一个控制台，
-            用 <Typography.Text code>mat console --share</Typography.Text> 启动——团队共享随团队授权提供（标准/体验授权面向单人使用）。</span>
+            用 <Typography.Text code>mat console --share</Typography.Text> 启动——团队共享随团队授权提供（单人版授权面向单人使用）。</span>
         ) : data && data.shared && !data.team_authorized ? (
-          <span>团队共享随团队授权提供：当前授权面向单人使用，<Typography.Text code>--share</Typography.Text> 下也只有你 1 人。若名单里的名字就是你自己（换了浏览器/设备，或改过名字）：点右侧 <Typography.Text code>×</Typography.Text> 移除旧名字即可进入；要与同事共用同一个控制台，请联系我们获取团队授权（<WxContact />，或加微信 lazy_vizen）。</span>
+          <span>团队共享随团队授权提供：当前授权面向单人使用，<Typography.Text code>--share</Typography.Text> 下也只有你 1 人。若名单里的名字就是你自己（换了浏览器/设备，或改过名字）：点右侧 <Typography.Text code>×</Typography.Text> 移除旧名字即可进入；要与同事共用同一个控制台，请联系我们获取团队授权（<WxContact />）。</span>
         ) : (
           <span>团队模式按成员管理：同事首次进入填名字即占一位，当前 {used}/{data?.limit ?? 5}{full ? "——已满，请" : "，如需增加名额请"}<WxContact />。</span>
         )} />

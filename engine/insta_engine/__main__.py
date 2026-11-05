@@ -3308,8 +3308,8 @@ def main(argv: list[str] | None = None) -> None:
 
     ft = sub.add_parser(
         "finetune",
-        help="用户侧微调工具链 L2:export(抽数据)/train(LoRA)/eval(留出评测)/use(写配置);"
-             "仅 local 模式生效,训练数据只在本机")
+        help="[实验性] 微调工具链 L2:export(抽数据)/train(LoRA)/eval(留出评测)/use(写配置);"
+             "需自建文本服务(本项目默认部署只常驻视觉模型),训练数据只在本机")
     ft_sub = ft.add_subparsers(dest="ft_cmd", required=True)
     ft_export = ft_sub.add_parser("export", help="从执行记录抽 (nl → DSL) 训练对(只取 passed)")
     ft_export.add_argument("--app", help="限定被测 App 包名(缺省全 App 混合)")

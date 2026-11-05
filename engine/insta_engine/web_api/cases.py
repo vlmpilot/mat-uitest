@@ -46,6 +46,10 @@ def api_case_save(root: Path, body: dict) -> tuple[int, dict]:
         return 400, {"error": f"用例 JSON 不合法: {exc}"[:300]}
     (root / "cases").mkdir(exist_ok=True)
     (root / "cases" / name).write_text(content, encoding="utf-8")
+    # 写接口才落编号表（GET 只读，2026-11-05 C3）；失败不影响保存本身
+    from .workspace import persist_case_numbers
+
+    persist_case_numbers(root)
     return 200, {"ok": True, "warnings": _case_warnings(root, case)}
 
 
@@ -199,6 +203,10 @@ def api_import_convert(root: Path, body: dict) -> tuple[int, dict]:
                               controls=controls, graph=graph, cancel_event=cancel,
                               index_dir=base_dir, on_progress=progress)
         _, bundle = save_import_bundle(root, upload, package, batch, used)
+        # 导入是写接口（POST 触发的后台任务）：把草稿用例的编号落盘
+        from .workspace import persist_case_numbers
+
+        persist_case_numbers(root)
         summary = batch["summary"]
         scope = (f"已中止：完成 {summary['total']}/{len(cases)} 条" if cancel.is_set()
                  else f"共 {summary['total']} 条")
@@ -358,4 +366,8 @@ def api_case_rename(root: Path, body: dict) -> tuple[int, dict]:
                           encoding="utf-8")
             updated.append(sf.name)
     src.rename(dst)
+    # 重命名视为新用例（编号不回收）：新编号由写接口落盘
+    from .workspace import persist_case_numbers
+
+    persist_case_numbers(root)
     return 200, {"ok": True, "file": dst_name, "suites_updated": updated}

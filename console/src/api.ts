@@ -98,7 +98,7 @@ export type AuditItem = { ts: string; operator: string; action: string;
 export const getAudit = (limit = 50) =>
   j<{ items: AuditItem[]; total: number }>(`/api/audit?limit=${limit}`);
 
-// 团队成员（2026-10-25 起：共享名额**只随团队授权提供**——标准/体验授权面向单人使用，
+// 团队成员（2026-10-25 起：共享名额**只随团队授权提供**——单人版授权面向单人使用，
 // `--share` 下上限恒 1）：`shared` 由后端按实际监听地址判断，前端据此决定提示与新增入口；
 // `team_authorized` 区分「共享了但没授权」（提示去拿团队授权）与「团队授权」（正常成员管理）
 // ——不能拿 limit 推授权状态：团队合同席位可以是 1。

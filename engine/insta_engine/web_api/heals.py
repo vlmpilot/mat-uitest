@@ -66,4 +66,8 @@ def api_heal_apply(root: Path, body: dict) -> tuple[int, dict]:
     new_case, notes = apply_heals(case, proposals)
     out = root / "cases" / f"{run}-healed.json"
     out.write_text(dump_dsl(new_case), encoding="utf-8")
+    # 写接口（POST）：新用例的展示编号落盘；GET 路径不再写盘（2026-11-05 C3）
+    from .workspace import persist_case_numbers
+
+    persist_case_numbers(root)
     return 200, {"ok": True, "out": out.name, "notes": notes}

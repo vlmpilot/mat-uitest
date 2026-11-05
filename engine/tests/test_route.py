@@ -318,3 +318,29 @@ def test_print_routing_uses_describe_route(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "本地（不可用即报错）" in out
     assert "未配置云端——只能走本地" in out
+
+
+# -- 配置矛盾：档位说本地、端点没配（2026-11-05） -----------------------------
+
+
+def test_status_reports_conflict_when_plan_local_but_endpoint_missing(monkeypatch):
+    """`text_local=False` 不能自己解释自己：必须显式报出"档位与配置矛盾"。
+
+    旧实现 `text_local` 只看档位，默认实例报 True（假自证）；现在服务端报实际
+    去向，这里验证客户端把 `text_conflict` 如实说出来，而不是静默选云端。
+    """
+    _clear(monkeypatch)
+    facts = {"text_local": False, "vision_local": False, "text_conflict": True}
+    text = _text(route.describe_route(facts))
+    assert "矛盾" in text
+    assert "MAT_LOCAL_BASE_URL" in text
+    # 去向本身仍是云端（事实不能因为矛盾就改口）
+    assert "文本走本地=否" in text
+
+
+def test_status_does_not_claim_conflict_when_endpoint_configured(monkeypatch):
+    _clear(monkeypatch)
+    facts = {"text_local": True, "vision_local": False, "text_conflict": False}
+    text = _text(route.describe_route(facts))
+    assert "矛盾" not in text
+    assert "文本走本地=是" in text

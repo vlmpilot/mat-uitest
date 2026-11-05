@@ -218,7 +218,9 @@ def route_map(remote_routing: dict | None = None) -> dict[str, str]:
       3. `legacy`：`decide()` 返回 `auto`，而服务端 auto 的实际规则是**本地优先**
          （配了本地端点就走本地；本地不可用即报错，**不回落、也不按轮次改道**）；
          只有**没配**该端点时才走云端。这里用 `/usage.routing` 的两个事实把 auto
-         落实成 local / cloud；服务端没上报（老版本）则保持 auto（未确认）。
+         落实成 local / cloud；2026-11-05 起服务端上报的是**实际去向**（档位 + 端点
+         配置，见 `core.py:_routing_facts`）。更老的服务端该字段只按档位算，无法
+         区分——遇到时先升级服务端；完全没上报则保持 auto（未确认）。
     - `cloud_available=False`（无凭证/无云端端点）：云端任务标记 `blocked`，调用会报错。
     """
     facts = remote_routing or {}
@@ -282,7 +284,7 @@ def describe_route(remote_routing: dict | None = None) -> list[str]:
             + ("是" if text_local else "否")
             + " · 视觉走本地="
             + ("是" if vision_local else "否")
-            + "（按档位配置，不探测当下健康）"
+            + "（按档位 + 端点配置判定，不是承诺；健康不参与此判定）"
         )
 
     if is_explicit() and pref == CLOUD:
@@ -340,4 +342,10 @@ def describe_route(remote_routing: dict | None = None) -> list[str]:
                 lines.append("  说明：服务端没有可用的云端配置——标为云端/不可用的任务会报错。")
             else:
                 lines.append("  说明：未配置云端——只能走本地；本地不可用会直接报错。")
+        # 「档位说本地、端点没配」是**配置矛盾**，不能静默挑一个答案（2026-11-05）：
+        # 组里的去向写云端是事实，这里补一句为什么会这样，否则用户会以为档位没生效。
+        if facts.get("text_conflict") is True:
+            lines.append("  矛盾：该档位声明文本在本地处理，但服务端未配置文本端点"
+                         "（MAT_LOCAL_BASE_URL）——文本实际会发给模型服务商。"
+                         "请补端点，或显式设 MAT_ROUTE=cloud 并写清口径。")
     return lines
