@@ -40,15 +40,29 @@ def server(tmp_path, monkeypatch):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
     # 等端口就绪：首个请求要付**冷启动**的账（设备枚举要跑 hdc/adb 子进程、字体扫描等，
-    # 2026-10-31 实测 macOS+DevEco 上 hdc list targets 单次 1.3s）——
-    # 旧写法 timeout=1 且只 catch ConnectionError，冷启动一慢就抛 ReadTimeout 把整文件
-    # 25 条用例判成 error（看着像代码坏了，其实是夹具太紧）。放宽到 5s 并一并重试超时。
-    for _ in range(40):  # 等端口就绪
+    # 2026-10-31 实测 macOS+DevEco 上 hdc list targets 单次 1.3s）。
+    # 2026-11-04：改成**总截止时间**，不再用「40 次 × 单次 5s」。旧写法一旦 /api/state
+    # 单次超过 5s（冷启动或大工作区），最坏要等 40 × 5.1s ≈ 204s 才 yield，
+    # 表象就是"全量卡在 92% 像死机"；而且超时后不报错，第一条用例才失败。
+    deadline = time.monotonic() + 15.0
+    started = time.monotonic()
+    attempts = 0
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        attempts += 1
+        remaining = max(0.5, deadline - time.monotonic())
         try:
-            requests.get(f"{base}/api/state", timeout=5)
+            requests.get(f"{base}/api/state", timeout=min(5.0, remaining))
             break
-        except (requests.ConnectionError, requests.ReadTimeout):
-            time.sleep(0.1)
+        except (requests.ConnectionError, requests.ReadTimeout) as exc:
+            last_error = exc
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    else:
+        pytest.fail(
+            f"web_server 在 15s 内未就绪（尝试 {attempts} 次，累计 "
+            f"{time.monotonic() - started:.1f}s）：最后一次错误 {last_error!r}",
+            pytrace=False,
+        )
     yield base, tmp_path
     srv.shutdown()          # 关键：跑完就关，不留线程
     srv.server_close()

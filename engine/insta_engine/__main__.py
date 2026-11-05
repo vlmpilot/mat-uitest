@@ -1639,7 +1639,11 @@ def cmd_seat(args) -> int:
         mid = licensing.machine_id()
         print("本机标识（把这行发给运营，用于给这台机器增加成员名额）：")
         print(f"  {mid}")
-        print(f"  ↑ 也可以只报前 12 位：{mid[:12]}（唯一性足够）")
+        # 2026-11-03 首次手工交付演练发现：这里原本写「也可以只报前 12 位（唯一性足够）」，
+        # 但服务端 `seat_grants` 是按 **machine_id 精确匹配**取的（store.py:746/754），
+        # 运营按 12 位加 → 客户 sync 拿 64 位查 → 永远匹配不上，而且两边都不报错
+        # （grant 返回成功、sync 返回成功，名额就是不生效）。必须整段复制。
+        print("  ↑ 请整段发过来：服务端按这个串精确匹配，只报前几位会加不上名额。")
         return 0
 
     if action == "sync":
@@ -2200,46 +2204,23 @@ def _server_usage() -> dict | None:
 
 
 def _print_routing(remote: dict | None) -> None:
-    """说明「内容去哪」——这是产品承诺的一半，不能只写在文档里。
+    """说明「内容去哪」——按**任务**列出当前去向，而不是只报服务端 `text_local`。
 
-    **文本与视觉是两条独立的路**（2026-11-02）：本地视觉端点没配时，文本在本站
-    自部署模型上跑，截图仍经模型服务商。所以不能笼统一句"不外发"——那正是
-    之前的文档与服务端行为自相矛盾的根源。
-
-    事实来自服务端 `/usage.routing`（老服务端没有该字段 ⇒ 不猜，只报客户端设置）。
+    为什么按任务：`legacy` 下服务端 auto 是**本地优先**（不可用即报错），
+    `MAT_ROUTE_POLICY=explicit` 下文本任务首轮即走云端，**文本会发出去**；只写
+    "文本与截图都不外发"会在那一刻变成假话。事实来自 `route.describe_route()`：
+    它同时读策略表、`MAT_ROUTE` 覆盖和服务端 `/usage.routing`（老服务端没有该字段时
+    显示"未确认"）。
     """
     from . import route
 
-    facts = (remote or {}).get("routing") or {}
-    pref = route.preference()
-    if pref == route.CLOUD:
-        print("  路由: 云端模型服务商（MAT_ROUTE=cloud）—— 文本与截图都会发给模型商")
-        return
-    if not facts:
-        if pref == route.LOCAL:
-            print("  路由: 已要求本地（MAT_ROUTE=local）—— 服务端版本较旧，确认不了实际路由")
-        return
-    text_local = bool(facts.get("text_local"))
-    vision_local = bool(facts.get("vision_local"))
-    if not text_local:
-        if pref == route.LOCAL:
-            print("  路由: ⚠️ MAT_ROUTE=local，但当前档位不走本站自部署模型"
-                  "——生成会被拒绝（去掉该设置可改用云端）")
-        else:
-            print("  路由: 云端模型服务商（该档位不走本站自部署模型）")
-        return
-    if pref == route.LOCAL and not vision_local:
-        print("  路由: ⚠️ MAT_ROUTE=local —— 文本走本站模型，但视觉没有自部署端点，"
-              "视觉兜底会被拒绝")
-        return
-    tone = "（MAT_ROUTE=local）" if pref == route.LOCAL else ""
-    if vision_local:
-        # 2026-11-02 起**不再回落云端**：本地不可用就报错。这句要说出来——
-        # 否则用户会以为"服务挂了会自动用云端"，那正是我们刻意不做的事。
-        print(f"  路由: 本站自部署模型{tone}—— 文本与截图都不外发；"
-              "服务不可用时会报错，不会改走云端")
-    else:
-        print(f"  路由: 文本在本站自部署模型{tone} · 视觉兜底经模型服务商（截图会外发）")
+    facts = dict((remote or {}).get("routing") or {})
+    # 云端是否可用只在**明确缺凭证**时断言（GEN_BASE_URL/GEN_API_KEY 都没有）；
+    # 服务端可达但没上报 `cloud_available` 时保持未知，不猜。
+    if not (os.environ.get("GEN_BASE_URL") and os.environ.get("GEN_API_KEY")):
+        facts.setdefault("cloud_available", False)
+    for line in route.describe_route(facts):
+        print(line)
 
 
 def cmd_ai_stats(args) -> int:
@@ -2555,7 +2536,7 @@ def cmd_metrics(args) -> int:
 def cmd_finetune(args) -> int:
     """`mat finetune`:用户侧微调工具链 L2(数据抽取/训练/留出评测/加载)。
 
-    边界(工具链文档 §4.5):adapter 与基座绑定;平台不背书质量;数据不出本机。
+    边界(工具链文档 §4.5):adapter 与基座绑定;平台不背书质量;训练数据只在本机。
     仅 local 模式生效(server 官方代理跑的是平台基座,加载不了用户 adapter)。
     """
     from .finetune import (
@@ -3221,7 +3202,9 @@ def main(argv: list[str] | None = None) -> None:
                      "当前为首个可用版本：run 可用，explore/index 尚未接入）")
     run.add_argument("--record", action="store_true",
                      help="执行录屏：全程录制，通过自动删除、失败保留进 artifacts/video/（报告内嵌播放器）")
-    run.add_argument("--artifacts", help="产物目录（默认 artifacts/<文件名>）")
+    run.add_argument("--artifacts",
+                     help="产物目录（缺省：单条 artifacts/<用例名>-<UTC时间戳>；"
+                          "套件 artifacts/<套件名>/<NN>_<用例名>）")
     run.add_argument("--no-quality-gate", action="store_true",
                      help="**关闭跑前质量闸门**（默认开）：跑之前对用例做一次确定性修复"
                           "（补 launch / 剥状态后缀 / 断言缺定位时继承本步目标），"
@@ -3247,7 +3230,8 @@ def main(argv: list[str] | None = None) -> None:
     ver.add_argument("--platform", default="android",
                      choices=("android", "ios", "harmony"),
                      help="设备平台（默认 android）")
-    ver.add_argument("--artifacts", help="产物目录（缺省 artifacts/verify/<用例名>-<时间>）")
+    ver.add_argument("--artifacts",
+                     help="产物目录（缺省 artifacts/<用例名>-<UTC时间戳>，与单条 run 同构）")
     ver.add_argument("--json", action="store_true", help="输出 mat.verify/1 JSON（agent 用这个）")
     ver.add_argument("--no-quality-gate", action="store_true", help="跳过用例质量闸门")
     ver.add_argument("--allow-unmet-preconditions", action="store_true",
@@ -3325,7 +3309,7 @@ def main(argv: list[str] | None = None) -> None:
     ft = sub.add_parser(
         "finetune",
         help="用户侧微调工具链 L2:export(抽数据)/train(LoRA)/eval(留出评测)/use(写配置);"
-             "仅 local 模式生效,数据不出本机")
+             "仅 local 模式生效,训练数据只在本机")
     ft_sub = ft.add_subparsers(dest="ft_cmd", required=True)
     ft_export = ft_sub.add_parser("export", help="从执行记录抽 (nl → DSL) 训练对(只取 passed)")
     ft_export.add_argument("--app", help="限定被测 App 包名(缺省全 App 混合)")

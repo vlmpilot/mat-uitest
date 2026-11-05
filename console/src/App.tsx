@@ -34,8 +34,9 @@ import { VIEWS, VIEW_BY_HASH, VIEW_BY_KEY, ViewKey, VIEW_GROUPS } from "./views"
 // 视图清单单一来源 src/views.ts（菜单分组 / ⌘K / 深链共用，修"三处手工同步漏项"）；
 // 菜单按「准备 → 执行 → 资产 → 设置」工作流分组；全部视图支持 hash 深链。
 
-function StatCard({ icon, tint, color, title, value, sub }: {
-  icon: ReactNode; tint: string; color: string; title: string; value: ReactNode; sub?: ReactNode }) {
+function StatCard({ icon, tint, color, title, value, sub, subWrap }: {
+  icon: ReactNode; tint: string; color: string; title: string; value: ReactNode; sub?: ReactNode;
+  subWrap?: boolean }) {
   return (
     <Card style={{ height: "100%" }}>
       <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
@@ -48,12 +49,29 @@ function StatCard({ icon, tint, color, title, value, sub }: {
           {/* 长值（如 144.5/不限）降字号+禁换行——24px 在 span=6 列必换行（发起人 2026-10-12） */}
           <div style={{ fontSize: typeof value === "string" && value.length >= 8 ? 18 : 24,
             fontWeight: 600, lineHeight: "32px", whiteSpace: "nowrap" }}>{value}</div>
-          {sub && <div style={{ fontSize: 12, color: "#8a919f", whiteSpace: "nowrap",
-            overflow: "hidden", textOverflow: "ellipsis" }}>{sub}</div>}
         </div>
       </div>
+      {/* 副标题独占一行：图标右侧只剩 ~80px，放不下「探测失败 + 快照年龄」整句
+          （会被 ellipsis 截成「最近一…」）。独占整卡宽度后短文案仍是一行，
+          失败态才换行，且不会挤坏上面的图标/数字。 */}
+      {sub && <div style={{ fontSize: 12, color: "#8a919f", marginTop: 6,
+        lineHeight: "16px",
+        whiteSpace: subWrap ? "normal" : "nowrap",
+        overflow: "hidden", textOverflow: "ellipsis" }}>{sub}</div>}
     </Card>
   );
+}
+
+// 设备快照年龄（2026-11-04）：`devices_asof` 是服务端**成功采到**列表的 UNIX 秒。
+// 每次轮询重新渲染时现算（不缓存、不在挂载时算死）；单位收敛到 秒/分钟/小时
+// （>60s 不显示「90 秒前」）。asof 为 null 或时钟偏差导致负数 ⇒ 不显示相对时间，
+// 避免出现「null 秒前」「-3 秒前」这种看起来准确其实错的文案。
+function deviceAgeText(asof: number | null | undefined): string | null {
+  if (asof == null) return null;
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - asof));
+  if (secs < 60) return `${secs} 秒前`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`;
+  return `${Math.floor(secs / 3600)} 小时前`;
 }
 
 // P0 下一步建议卡(发起人 2026-10-13):按工作流依赖链(设备→AI→图谱→用例→执行→复盘)
@@ -180,6 +198,19 @@ function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => voi
         <br/>· 视觉兜底<b>单独额度</b>:本月 {quota.vision_count}/{quota.vision_limit ?? "∞"}
         <br/>· 换自带 API Key(local)则不消耗官方额度</>;
   const online = state.devices.filter((d) => d.state === "device");
+  const deviceAge = deviceAgeText(state.devices_asof);
+  const deviceError = state.devices_probe_error;
+  // 概览卡副标题优先级：探测失败 > 预热 > 「机型 · X 秒前」 > 未连接。
+  // 失败时保留服务端的旧列表，但必须说清"看到的是什么时候的列表"，不能装作实时。
+  const deviceSub = deviceError
+    ? (deviceAge ? `最近一次探测失败，显示的是 ${deviceAge}的列表`
+        : "最近一次探测失败，暂无可显示的列表")
+    : state.devices_warming
+    ? "正在读取设备…"
+    : online.length
+    ? [online.map((d) => d.model || d.serial).slice(0, 2).join(" · "), deviceAge]
+        .filter(Boolean).join(" · ")
+    : "未连接设备";
   const apps = new Set(Object.values(state.caseMeta).map((m) => m.app).filter(Boolean));
   const passed = state.runs.filter((r) => r.status === "passed").length;
   const [wsOpen, setWsOpen] = useState(false);
@@ -241,10 +272,15 @@ function Overview({ state, onNav }: { state: StateResp; onNav: (nav: Nav) => voi
       )}
       {/* 邀请奖励到账提示：只在到账时冒一条，不常驻 */}
       <InviteNotice />
+      {deviceError && (
+        <Alert style={{ marginBottom: 12 }} type="warning" showIcon
+          message="设备探测失败——显示的是上一次成功的列表"
+          description={deviceError} />
+      )}
       <Row gutter={16}>
         <Col span={6}><StatCard icon={<MobileOutlined />} tint="#f0fdf4" color="#52c41a"
           title="在线设备" value={online.length}
-          sub={online.length ? online.map((d) => d.model || d.serial).slice(0, 2).join(" · ") : "未连接设备"} /></Col>
+          sub={deviceSub} subWrap /></Col>
         <Col span={6}><StatCard icon={<FileTextOutlined />} tint="#eef1ff" color="#4F5BFF"
           title="用例" value={state.cases.length}
           sub={apps.size ? `覆盖 ${apps.size} 个应用` : "暂无用例"} /></Col>

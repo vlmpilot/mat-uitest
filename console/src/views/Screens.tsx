@@ -8,6 +8,7 @@ import DeviceScreen from "../components/DeviceScreen";
 import InstallModal from "../components/InstallModal";
 import LogPanel from "../components/LogPanel";
 import PageHeader from "../components/PageHeader";
+import { usePolling } from "../usePolling";
 
 // 设备投屏(发起人定稿布局):从左到右=设备列表 | 投屏区域 | 日志区域。
 // **只有被选中的设备进行投屏**(未选中设备零轮询);投屏区固定屏宽按手机比例;
@@ -45,15 +46,18 @@ function deviceJobs(jobs: JobInfo[], sel: Sel): JobInfo[] {
 export default function Screens({ state, focusJob }: { state: StateResp; focusJob?: string }) {
   const [jobs, setJobs] = useState<JobInfo[]>([]);
   const [taskRunning, setTaskRunning] = useState(false);
-  useEffect(() => {
-    const check = () => getJobs().then((d) => {
+  const [jobsError, setJobsError] = useState<string | null>(null);
+  // 3s 轮询：单飞 + 旧响应丢弃 + 错误可见（2026-11-04）。
+  usePolling(
+    () => getJobs(),
+    3000,
+    (d) => {
       setJobs(d.jobs);
       setTaskRunning(d.jobs.some((j) => j.status === "running"));
-    }).catch(() => {});
-    check();
-    const t = setInterval(check, 3000);
-    return () => clearInterval(t);
-  }, []);
+      setJobsError(null);
+    },
+    { onError: (e) => setJobsError(String(e)) },
+  );
 
   // 真机 = Android(adb) + iOS USB 真机 + 鸿蒙(hdc target)；iOS 模拟器来自 simctl 清单，
   // 不在 state.devices 里。iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 不拉模拟器清单。
@@ -83,12 +87,12 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
   const loadSims = useCallback(() => {
     listIosSims().then((d) => setSims(d.simulators)).catch(() => setSims([]));
   }, []);
-  useEffect(() => {
-    if (!iosSupported) { setSims([]); return; }
-    loadSims();
-    const t = setInterval(loadSims, 15000);
-    return () => clearInterval(t);
-  }, [loadSims, iosSupported]);
+  usePolling(
+    () => listIosSims(),
+    iosSupported ? 15000 : null,
+    (d) => setSims(d.simulators),
+    { onError: () => setSims([]) },
+  );
 
   // 候选设备:在线 Android(带系统版本) + 鸿蒙(hdc target) + iOS USB 真机(serial=udid，
   // 直接透传驱动层) + iOS 模拟器(booted 直接投屏,未启动点击即启动)
@@ -255,6 +259,11 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
   return (
     <>
       <PageHeader title="设备/执行日志" />
+      {jobsError && (
+        <Alert style={{ marginBottom: 12 }} type="error" showIcon closable
+          message={`任务列表刷新失败：${jobsError}`}
+          onClose={() => setJobsError(null)} />
+      )}
       {taskRunning && (
         <Alert style={{ marginBottom: 12 }} type="warning" showIcon
           message="任务执行中，手动操作可能干扰用例（操控不抢设备锁，救场通道保持畅通）" />
@@ -264,7 +273,11 @@ export default function Screens({ state, focusJob }: { state: StateResp; focusJo
             鸿蒙：serial=127.0.0.1:port 是模拟器（hdc 本机 TCP），
             其他 target key 是真机——不能沿用 iOS 的「serial 非 null=真机」判据。 */}
         <Card size="small" title="设备列表" style={{ width: 210, flex: "none" }}>
-          {candidates.length === 0 && <span style={{ color: "#999" }}>无在线设备——手机开启 USB 调试并插上</span>}
+          {candidates.length === 0 && <span style={{ color: "#999" }}>
+            {state.devices_warming
+              ? "正在读取设备，请稍候"
+              : "无在线设备——手机开启 USB 调试并插上"}
+          </span>}
           {([["真机", candidates.filter((c) => c.platform === "android"
                 || (c.platform === "ios" && c.serial != null)
                 || (c.platform === "harmony" && !(c.serial || "").startsWith("127.0.0.1")))],

@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -116,6 +118,8 @@ from .web_api.workspace import (  # noqa: F401
     list_runs,
 )
 
+logger = logging.getLogger(__name__)
+
 #: 请求体上限（字节）。超过就回 **413**。
 MAX_BODY_BYTES = 1_000_000
 
@@ -180,10 +184,63 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
+    def _internal_error(self, exc: Exception) -> None:
+        """500 只回通用文案 + request id（2026-11-04）：异常类型/消息可能带绝对路径、
+        工作区名或内部参数，`--share` 给同事时等于把这些一起发出去。细节只进日志。"""
+        rid = uuid.uuid4().hex[:8]
+        logger.exception("request failed (rid=%s)", rid)
+        self._json(500, {"error": "内部错误，请查看控制台日志", "request_id": rid})
+
     def _file(self, path: Path, ctype: str) -> None:
-        if not path.exists():
+        self._send_file(path, ctype)
+
+    #: 文件下载分块大小（2026-11-04）：此前 `read_bytes()` 把整份报告包/录屏
+    #: 一次性读进内存，`GET /artifacts/<几百 MB>.mp4` 或并发下载会把进程撑爆。
+    _FILE_CHUNK = 64 * 1024
+
+    def _send_file(self, path: Path, ctype: str) -> None:
+        """分块输出文件，支持 `Range`（206）。内存占用与文件大小无关。"""
+        if not path.exists() or not path.is_file():
             return self._send(404, b"missing", "text/plain")
-        self._send(200, path.read_bytes(), ctype)
+        size = path.stat().st_size
+        start, end = 0, max(0, size - 1)
+        status = 200
+        rng = (self.headers.get("Range") or "").strip()
+        if rng.startswith("bytes=") and size > 0:
+            spec = rng[len("bytes="):].split(",", 1)[0].strip()
+            first, _, last = spec.partition("-")
+            try:
+                if first:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+                elif last:  # 后缀区间：bytes=-N
+                    start = max(0, size - int(last))
+                else:
+                    raise ValueError
+            except ValueError:
+                return self._send(416, b"range not satisfiable", "text/plain")
+            if start >= size or start > end:
+                return self._send(416, b"range not satisfiable", "text/plain")
+            end = min(end, size - 1)
+            status = 206
+        length = 0 if size == 0 else end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        remaining = length
+        with path.open("rb") as fh:
+            fh.seek(start)
+            while remaining > 0:
+                chunk = fh.read(min(self._FILE_CHUNK, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     # -- GET：纯 JSON 端点路由表（特殊形态——bytes 静态/文件服务——留在 do_GET 分支） --
     def _get_json_routes(self):
@@ -330,7 +387,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                              else "text/css; charset=utf-8" if target.suffix == ".css"
                              else "image/svg+xml" if target.suffix == ".svg"
                              else "application/octet-stream")
-                    return self._send(200, target.read_bytes(), ctype)
+                    return self._send_file(target, ctype)
                 return self._send(404, b"not found", "text/plain")
             # 使用手册（发起人 2026-10-13）：console/public/manual.html 随构建进 dist，
             # 侧栏左下角「使用手册」链接指向这里。SPA 兜底(下方)会把一切路径回落
@@ -383,7 +440,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                    f"{import_id}/{name}")
                 if target is None or not target.exists():
                     return self._json(404, {"error": "not found"})
-                return self._send(200, target.read_bytes(), "application/json; charset=utf-8")
+                return self._send_file(target, "application/json; charset=utf-8")
             if path.startswith("/screenshots/"):
                 # 人工截屏的固定目录（与 artifacts/ 平级的独立存储，发起人需求）
                 base = (self.root / "screenshots").resolve()
@@ -391,7 +448,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 if target is None or not target.exists():
                     return self._send(404, b"not found", "text/plain")
                 ctype = "image/png" if target.suffix == ".png" else "text/plain; charset=utf-8"
-                return self._send(200, target.read_bytes(), ctype)
+                return self._send_file(target, ctype)
             if path.startswith("/artifacts/"):
                 base = (self.root / "artifacts").resolve()
                 target = safe_join(base, path[len("/artifacts/"):])
@@ -404,7 +461,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     ".mp4": "video/mp4",           # 录屏（P3）随报告相对引用播放
                     ".json": "application/json; charset=utf-8",
                 }.get(target.suffix, "text/plain; charset=utf-8")
-                return self._send(200, target.read_bytes(), ctype)
+                return self._send_file(target, ctype)
             if path == "/live" or path.startswith("/live/"):
                 # 任务实时视图页（只读旁路：设备投屏 + 事件流；门控口径见 web_api/live.py
                 # ——必须在 SPA 兜底之前接管，否则 /live/* 会被 index.html 吞掉）
@@ -414,8 +471,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if (CONSOLE_DIST / "index.html").exists() and not path.startswith(("/api/", "/artifacts/")):
                 return self._file(CONSOLE_DIST / "index.html", "text/html; charset=utf-8")
             return self._json(404, {"error": "not found"})
-        except Exception as exc:
-            return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:  # noqa: BLE001 - HTTP 边界：统一转通用 500 + request id
+            return self._internal_error(exc)
 
     def _host_allowed(self) -> bool:
         """A1 缓解（2026-10-12 评审）：校验 Host 头——防 DNS rebinding 的唯一有效手段。
@@ -585,8 +642,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._audit(path)  # 团队协作：所有写操作落审计（谁改的/谁下发的，发起人 2026-10-12）
                 return self._json(*route())
             return self._json(404, {"error": "not found"})
-        except Exception as exc:
-            return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:  # noqa: BLE001 - HTTP 边界：统一转通用 500 + request id
+            return self._internal_error(exc)
 
     _AUDIT_LOCK = threading.Lock()
     _AUDIT_KEYS = ("name", "case", "case_name", "suite", "id", "job_id", "package",

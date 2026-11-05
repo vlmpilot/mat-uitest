@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import shutil
+import tempfile
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +35,9 @@ from pathlib import Path
 from . import seat_quota
 from .quota_policy import plan_limits as _policy_limits
 from .state import state_home
+
+#: 已保留过损坏副本的 usage.json（path → mtime），防止反复读时刷出一堆文件。
+_CORRUPT_SNAPSHOTS: dict[str, float] = {}
 
 
 def insta_home() -> Path:
@@ -77,9 +83,17 @@ class UsageStore:
         self._source = source
 
     def _load(self) -> dict:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        """读 usage.json；解析失败时回退到上次成功写盘的 `.bak`。
+
+        2026-11-04：旧实现把损坏文件当作 `{}` ⇒ 本月已用计数直接归零（同时把视觉
+        额度闸门重新打开）。现在先保留损坏文件副本（`.corrupt-<时间>`），再尝试
+        `.bak`；只有两者都不可读才按零处理（首次安装的正常路径）。
+        """
+        data = self._read_json(self.path)
+        if data is None and self.path.exists():
+            self._preserve_corrupt()
+            data = self._read_json(self._backup_path)
+        if data is None:
             data = {}
         month = datetime.now(UTC).strftime("%Y-%m")
         if data.get("month") != month:  # 月度滚动重置：两个计数一并归零
@@ -132,7 +146,9 @@ class UsageStore:
 
     def consume(self, amount: float = 1.0, byok: bool | None = None) -> dict:
         """生成用量核销（写入；成功落盘后调用，仅统计展示）。"""
-        return self._bump("gen_count", amount, byok=self._is_byok(byok))
+        # 2026-11-04：读改写统一进文件锁，避免并发运行丢计数。
+        return self._locked(lambda: self._bump("gen_count", amount,
+                                               byok=self._is_byok(byok)))
 
     def ensure_vision_capacity(self, amount: float = 1.0) -> dict:
         """视觉兜底额度预检（不写入）；额度不足抛 QuotaExceeded（真实 token 成本闸）。
@@ -163,7 +179,8 @@ class UsageStore:
 
     def consume_vision(self, amount: float = 1.0, byok: bool | None = None) -> dict:
         """视觉兜底额度核销（写入；调用前应先 ensure_vision_capacity）。"""
-        return self._bump("vision_count", amount, byok=self._is_byok(byok))
+        return self._locked(lambda: self._bump("vision_count", amount,
+                                               byok=self._is_byok(byok)))
 
     def check_vision(self, amount: float = 1.0, enforce: bool = True) -> dict:
         """视觉兜底调用前：预检 + 计数原子完成（文件锁）。
@@ -178,8 +195,10 @@ class UsageStore:
         def _op() -> dict:
             if enforce:
                 self.ensure_vision_capacity(amount)
-            # enforce=False 即自带 Key：成本由用户结算，只记 BYOK 分项
-            return self.consume_vision(amount, byok=not enforce)
+            # enforce=False 即自带 Key：成本由用户结算，只记 BYOK 分项。
+            # 注意：这里不能再调 `consume_vision`（它自己会拿锁）——flock 不
+            # 可重入，会自锁。`_bump` 是无锁内核，本函数已在 `_locked` 内。
+            return self._bump("vision_count", amount, byok=not enforce)
         return self._locked(_op)
 
     # -- 内部 ---------------------------------------------------------------
@@ -190,6 +209,56 @@ class UsageStore:
             return flag
         source = self._source or _current_source()
         return source != "official"
+
+    @property
+    def _backup_path(self) -> Path:
+        return self.path.with_suffix(self.path.suffix + ".bak")
+
+    def _read_json(self, path: Path) -> dict | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _preserve_corrupt(self) -> None:
+        """保留损坏文件副本，便于事后定位（否则被下一次写入直接覆盖）。
+
+        同一进程内对外部 mtime 相同的损坏文件只留一份：`snapshot()` 会被界面反复
+        调用，否则每秒生成一个新副本。
+        """
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return
+        key = str(self.path)
+        if _CORRUPT_SNAPSHOTS.get(key) == mtime:
+            return
+        _CORRUPT_SNAPSHOTS[key] = mtime
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        dst = self.path.with_suffix(self.path.suffix + f".corrupt-{stamp}")
+        with contextlib.suppress(OSError):
+            shutil.copy2(self.path, dst)
+
+    def _write_atomic(self, data: dict) -> None:
+        """临时文件 + `os.replace`：读者不会看到半截 JSON。
+
+        只有当前文件仍可解析时才更新 `.bak`——否则损坏文件会覆盖掉唯一可恢复的备份。
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists() and self._read_json(self.path) is not None:
+            with contextlib.suppress(OSError):
+                shutil.copy2(self.path, self._backup_path)
+        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent),
+                                   prefix=self.path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     def _bump(self, field: str, amount: float, byok: bool = False) -> dict:
         """读-改-写计数（写盘尽力而为）。
@@ -204,8 +273,7 @@ class UsageStore:
             key = _BYOK_FIELD[field]
             data[key] = round((data.get(key) or 0) + amount, 2)
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            self._write_atomic(data)
         except OSError:
             warnings.warn(f"配额计数写盘失败（{self.path}），本次调用按未计数继续",
                           RuntimeWarning, stacklevel=2)

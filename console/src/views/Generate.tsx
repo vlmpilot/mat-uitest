@@ -1,6 +1,7 @@
 import { Alert, AutoComplete, Badge, Button, Card, Input, Modal, Space, Steps, Tabs, Tag, Upload, message } from "antd";
 import { EditOutlined, FileTextOutlined, InboxOutlined, ThunderboltOutlined } from "@ant-design/icons";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { usePolling } from "../usePolling";
 import { StateResp, postJson, getReadiness, getJob, startIndex, getAppNote, saveAppNote } from "../api";
 import JobMonitor from "../components/JobMonitor";
 import PageHeader from "../components/PageHeader";
@@ -106,24 +107,45 @@ function GenTab({ state, onCasesChanged }: { state: StateResp; onCasesChanged: (
   // 就地构建图谱（2026-10-25）：无图谱的提示不再把人支去「页面复核」页找按钮——
   // action 直接放提示条上，一键发起 index job、就地轮询到完成再刷新准备度。
   const [building, setBuilding] = useState(false);
+  const [buildJob, setBuildJob] = useState<string | null>(null);
+  const buildStarted = useRef(0);
+  const BUILD_TIMEOUT_MS = 10 * 60 * 1000;   // 与看门狗一致
+  const finishBuild = (text: string, kind: "success" | "error") => {
+    if (kind === "success") message.success(text); else message.error(text);
+    setBuildJob(null);
+    setBuilding(false);
+  };
   const buildIndex = async () => {
-    if (!pkg) return;
+    if (!pkg || building) return;
     setBuilding(true);
     try {
       const { job_id } = await startIndex({ package: pkg, refresh: true });
       message.info("正在构建页面图谱(需要一台在线设备,约 1-2 分钟)…");
-      for (let i = 0; i < 400; i++) {           // 上限 ~10 分钟（与看门狗一致）
-        const job = await getJob(job_id);
-        if (job.status !== "running") {
-          if (job.status === "done") { message.success(job.summary || "页面图谱构建完成"); refreshReady(pkg); }
-          else message.error(job.error || `任务${job.status}`);
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-    } catch (e) { message.error(String(e)); }
-    finally { setBuilding(false); }
+      buildStarted.current = Date.now();
+      setBuildJob(job_id);
+    } catch (e) { message.error(String(e)); setBuilding(false); }
   };
+  // 建图进度轮询：单飞 + 旧响应丢弃；超过 10 分钟必须给出明确超时提示（
+  // 旧实现自旋 400 次后静默退出，界面看起来"完成"却什么都没发生）。
+  usePolling(
+    () => getJob(buildJob as string),
+    buildJob ? 1500 : null,
+    (job) => {
+      if (job.status === "running") {
+        if (Date.now() - buildStarted.current > BUILD_TIMEOUT_MS) {
+          finishBuild("页面图谱构建超过 10 分钟仍未完成，请检查设备连接后重试", "error");
+        }
+        return;
+      }
+      if (job.status === "done") {
+        finishBuild(job.summary || "页面图谱构建完成", "success");
+        refreshReady(pkg);
+      } else {
+        finishBuild(job.error || `任务${job.status}`, "error");
+      }
+    },
+    { onError: (e) => finishBuild(`查询建图进度失败：${String(e)}`, "error") },
+  );
 
   const launch = async () => {
     setBusy(true);

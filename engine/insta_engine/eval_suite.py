@@ -226,7 +226,7 @@ def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,
     report_dir.mkdir(parents=True, exist_ok=True)
 
     # 路由口径清零：报告里的 `route_mix` 必须是**这一批**的，不能带上历史累计
-    from . import ai_client
+    from . import ai_client, route
 
     ai_client.route_reset()
     results: list[dict] = []
@@ -267,6 +267,10 @@ def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,
         # 本批实际走了哪条上游（local / maas / unknown）：回落是静默的，
         # 没有这个字段就无法判断"两批数字能不能直接比"（部署文档里记了判读方法）
         "route_mix": ai_client.route_snapshot(),
+        # 按任务拆分（2026-11-04）：A/B 后直接回答"describe 走的是哪边"，
+        # 全局三桶会把 gen 与 describe 的混源掩盖掉。形状是新增字段，旧消费方不受影响。
+        "route_mix_by_task": ai_client.route_snapshot_by_task(),
+        "route_policy": route.policy(),
         **sm,
     }
     out = report_dir / f"{suite_path.stem}-report.json"

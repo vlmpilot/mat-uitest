@@ -199,7 +199,7 @@ function FinetuneCard() {
             </span>
           )}
           <div style={{ color: "#8a919f", fontSize: 12 }}>
-            正常使用 MAT（生成+通过）即自动积累;训练:mat finetune train(数据不出本机;
+            正常使用 MAT（生成+通过）即自动积累;训练:mat finetune train(训练数据只在本机;
             adapter 仅 local 模式生效)。完整操作手册:使用手册 §4.15。
           </div>
           <Button size="small" loading={exporting} onClick={doExport}>导出 dataset/</Button>

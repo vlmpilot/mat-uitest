@@ -48,6 +48,8 @@ node_modules/
 console/node_modules/
 console/dist/
 engine/insta_engine/console_dist/
+# tsc 增量构建缓存：每次 npm run build 都会变，跟踪它只会产生噪音提交（2026-11-05 摘除）
+*.tsbuildinfo
 .coverage
 htmlcov/
 coverage.xml

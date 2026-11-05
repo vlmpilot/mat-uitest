@@ -165,12 +165,18 @@ def start_job(kind: str, fn, meta: dict | None = None) -> str:
         try:
             summary, link = fn(emit, cancel)
             with _JOB_LOCK:
-                _JOBS[job_id].update(status=("cancelled" if cancel.is_set() else "done"),
-                                     summary=summary, link=link)
+                job = _JOBS.get(job_id)
+                # 2026-11-04：看门狗已判 error 时，执行线程晚到的 "done" 不得覆盖它
+                # （否则 UI 上的"已超时"会自己消失）。任务也可能已被上限淘汰。
+                if job is not None and job.get("status") != "error":
+                    job.update(status=("cancelled" if cancel.is_set() else "done"),
+                               summary=summary, link=link)
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             with _JOB_LOCK:
-                _JOBS[job_id].update(status="error", error=err)
+                job = _JOBS.get(job_id)
+                if job is not None:
+                    job.update(status="error", error=err)
             # 失败原因进事件流（2026-10-13 用户反馈：事件日志只停在最后一条 running，
             # 失败原因只躺在 /api/job 的 error 字段里，前端执行日志区完全看不到）
             _append_event(job_id, "job", "error", err[:300])
@@ -178,9 +184,14 @@ def start_job(kind: str, fn, meta: dict | None = None) -> str:
     threading.Thread(target=worker, daemon=True).start()
     with _JOB_LOCK:  # 上限淘汰（防长会话内存增长）
         while len(_JOBS) > 60:
-            oldest = min(_JOBS, key=lambda j: _JOBS[j].get("started_ts", 0))
-            if _JOBS[oldest]["status"] == "running":
+            # 2026-11-04：旧实现在「最旧的那条还在跑」时直接 break，导致后续所有
+            # 短任务都不再被淘汰（长任务 + 100 个短任务 ⇒ 表无限增长）。改成跳过
+            # running、继续找下一条可淘汰项；全部在跑时才停。
+            candidates = [jid for jid, job in _JOBS.items()
+                          if job.get("status") != "running"]
+            if not candidates:
                 break
+            oldest = min(candidates, key=lambda j: _JOBS[j].get("started_ts", 0))
             del _JOBS[oldest]
             if len(_JOBS) <= 50:
                 break
@@ -204,6 +215,11 @@ def sweep_stale_jobs(timeout_seconds: int = JOB_TIMEOUT_SECONDS) -> int:
             if now - last <= timeout_seconds:
                 continue
             job["status"] = "error"
+            # 同步置取消位：执行线程（runner/explore）检查到后尽快返回，
+            # 从而在 runs.py 的 finally 里释放设备锁，而不是继续空转占锁。
+            cancel = job.get("cancel")
+            if cancel is not None:
+                cancel.set()
             hint = _TIMEOUT_HINTS.get(str(job.get("kind") or ""), _DEVICE_TIMEOUT_HINT)
             job["error"] = (f"任务超过 {max(1, int(timeout_seconds // 60))} 分钟无活动，已标记超时——"
                             f"{hint}")

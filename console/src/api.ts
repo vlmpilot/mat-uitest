@@ -33,6 +33,12 @@ export type StateResp = {
   license?: { plan: string; expires_at: number | null };
   code_stale: { stale: boolean; file?: string; behind_seconds?: number }; gen_ready: boolean;
   devices: Device[]; console?: "pro" | "legacy"; prompt_mode?: "server" | "local";
+  // 设备快照年龄（2026-11-04）：服务端是把探测挪到后台后的内存快照，
+  // 这三个字段与 /api/devices 完全同源、同语义（不要在前端另算）。
+  // asof = 成功采到列表的 UNIX 秒；null 表示还没有成功快照（预热中）。
+  devices_asof?: number | null;
+  devices_probe_error?: string | null;
+  devices_warming?: boolean;
   // iOS 仅 macOS 可用（Xcode 工具链）：Windows/Linux 下隐藏环境卡、iOS 运行平台与模拟器入口
   ios_supported?: boolean;
   // 遍历探索建议（readiness.EXPLORE_TIP 单一来源下发；2026-10-26 去术语留判据）

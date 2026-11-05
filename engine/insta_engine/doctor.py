@@ -426,6 +426,14 @@ def android_checks() -> list[Check]:
             detail="MAT_ROUTE=cloud：文本与截图都会发给模型服务商",
             hint="改回自部署：删掉 MAT_ROUTE 这一行（或设成 local）",
         ))
+    elif route_mod.is_policy_explicit() and server_mode:
+        # 策略表只在官方代理（server）下生效：文本任务走云端，视觉仍在本地。
+        checks.append(Check(
+            id="route", label="数据路由(按任务策略表)", ok=True,
+            detail="MAT_ROUTE_POLICY=explicit：gen/convert/describe/diagnose/map/polish "
+                   "走云端（文本会发出去），vision-locate 仍本地",
+            hint="要文本与截图都强制本地：设 MAT_ROUTE=local；要回到默认：删掉 MAT_ROUTE_POLICY 这一行",
+        ))
 
     # 视觉兜底三态（对齐 CLI vision_status_text 的核心提醒：「配了模型」≠「会触发」）：
     # 未配置=warn 引导配置；已配置未授权=warn 提示两条授权路径（不擅自断定该改哪边——

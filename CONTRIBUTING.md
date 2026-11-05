@@ -58,6 +58,19 @@ API 形状变更要同步核对 web_server.py 的路由清单。
   → wheel + twine check（三件套内嵌于脚本）。⚠️ 该脚本属维护者内部发布工具，
   **不在公开仓库内**（公开仓的验证路径见上：`pip install -e './engine[dev]'` + ruff + pytest）。
 - 版本号：向后兼容修复升 patch（0.4.x）；新增用户可见能力升 minor（0.5.0）。
+- **版本 tag（2026-11-03 起）**：发版时在 `chore(release): X.Y.Z` 那个提交上打 annotated tag，
+  命名 `v<版本号>`——与 PyPI 上的版本号一一对应：
+
+  ```bash
+  git tag -a v0.7.13 -m "0.7.13" <发版提交>
+  git push origin v0.7.13
+  ```
+
+  **时机是 `twine upload` 成功之后**：tag 代表「已发布」，不是「准备发布」——上传失败要能
+  干净地撤掉本地 tag 重来，而不是留一个指向废产物的标记。
+  为什么必须有：仓库到 2026-11-03 为止只有 `pre-console-v2-merge-20261013` 一个临时 tag，
+  `git describe` 对不上任何版本号；客户报「0.7.13 有问题」时只能靠 `__version__` 反查提交，
+  无法 `git checkout v0.7.13` 复现。tag 是**唯一能按版本号回到当时那棵树**的东西。
 - **发版后两处对外面必须跟上**（漏了不会报错，只会慢慢说谎）：
   1. **skill 镜像仓**：`bash scripts/sync_skill_repo.sh --write --push`——随包的
      `mobileapp-testing/SKILL.md` 是唯一事实来源，`vlmpilot/mat-skill` 只是给「助手不能执行

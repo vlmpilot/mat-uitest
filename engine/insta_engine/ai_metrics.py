@@ -13,7 +13,7 @@
 `nl` / `app_info` / 模型输出都可能含 PII。默认**一个字节都不记**——
 否则我们刚验证过的"服务端零留存"会从客户端这边破掉。
 
-需要内容时显式开 `MAT_GEN_TRACE=1`：**只落本地、单独目录、带脱敏标记**，用于将来真要训练时
+需要内容时显式开 `MAT_GEN_TRACE=1`：**只落本地、单独目录、未脱敏（含用户输入，禁止上传或入库）**，用于将来真要训练时
 构造同构样本（题 + 答案）。默认关。
 
 ## 开关
@@ -84,7 +84,10 @@ def record(*, task: str, model: str = "", ok: bool = True, latency_ms: float | N
            completion_tokens: int | None = None, prompt_chars: int | None = None,
            completion_chars: int | None = None, max_tokens: int | None = None,
            error: str = "", truncated: bool = False,
-           scope: str = "call", rounds: int | None = None) -> None:
+           scope: str = "call", rounds: int | None = None,
+           route_decision: str | None = None, route_reason: str = "",
+           route_est_tokens: int | None = None, route_round: int | None = None,
+           repair_kind: str = "") -> None:
     """记一次调用。**任何异常都不外抛**——计量坏掉不能把生成搞挂。
 
     token 数来自端点的 `usage`；端点不返回时（如轻云代理只回 content）退化为字符数，
@@ -94,6 +97,10 @@ def record(*, task: str, model: str = "", ok: bool = True, latency_ms: float | N
     - "call"（默认）= 一次**传输层**调用（网络/成本口径）；
     - "task" = 一次**逻辑任务**的最终结局，带 `rounds`（内容修复轮数，1=首穿）。
       「单次生成成功率」的口径 = task 行的首穿率——与「端到端跑通率」分家，勿混引。
+
+    `route_decision` / `route_reason` / `route_est_tokens` / `route_round`（2026-11-04）：
+    每次请求的路由决策留痕，供 A/B 与"这批数字走的哪条上游"直接对照；
+    默认 `legacy` 策略下 `route_decision` 为空（不带请求头，行为与引入前一致）。
     """
     if not enabled():
         return
@@ -113,6 +120,16 @@ def record(*, task: str, model: str = "", ok: bool = True, latency_ms: float | N
         "error": (error or "")[:160],
         "scope": scope,
         "rounds": rounds,
+        # 路由观测（2026-11-04）：决策去向 + 原因 + 估算 token + 轮次。
+        # 注意 `route_decision` 是**客户端策略表给出的去向**，不是服务端实际执行；
+        # 实际执行仍看 eval report 的 `route_mix`。两者要能对照着读。
+        "route_decision": route_decision,
+        "route_reason": route_reason[:160],
+        "route_est_tokens": route_est_tokens,
+        "route_round": route_round,
+        # 内容级重试的**首次原因**：json / schema / page（空=首穿）。
+        # A/B 里"schema 修复率""页守卫冲突率"直接按这个字段统计。
+        "repair_kind": repair_kind,
     }
     path = metrics_path()
     try:

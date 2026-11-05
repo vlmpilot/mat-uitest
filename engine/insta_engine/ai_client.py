@@ -38,22 +38,36 @@ TASKS = ("gen", "convert", "map", "vision-locate", "describe")
 #: `/mat/complete`，那里没有"路由"这回事。
 _ROUTE_COUNTS: dict[str, int] = {"local": 0, "maas": 0, "unknown": 0}
 
+#: 按任务拆分的同一口径（2026-11-04）。A/B 后要能直接答"describe 这批走的哪边"，
+#: 只看全局三桶不够——gen 与 describe 分流的批次，混在一起会把结论带偏。
+_ROUTE_BY_TASK: dict[str, dict[str, int]] = {}
+
 
 def route_reset() -> None:
     """一批跑批开始前清零（`mat eval run` 调用）。"""
     for key in _ROUTE_COUNTS:
         _ROUTE_COUNTS[key] = 0
+    _ROUTE_BY_TASK.clear()
 
 
 def route_snapshot() -> dict[str, int]:
-    """当前累计，写进 report 的 `route_mix`。"""
+    """当前累计，写进 report 的 `route_mix`（**保持既有形状**，消费方不受影响）。"""
     return dict(_ROUTE_COUNTS)
 
 
-def _note_route(route) -> None:
+def route_snapshot_by_task() -> dict[str, dict[str, int]]:
+    """按任务拆分的实际路由计数，写进 report 的 `route_mix_by_task`。"""
+    return {task: dict(counts) for task, counts in _ROUTE_BY_TASK.items()}
+
+
+def _note_route(route, task: str = "") -> None:
     """记一次路由。**旧服务端不认识这个字段** ⇒ 记 unknown，而不是假装走本地。"""
     key = str(route or "").strip().lower()
-    _ROUTE_COUNTS[key if key in ("local", "maas") else "unknown"] += 1
+    bucket = key if key in ("local", "maas") else "unknown"
+    _ROUTE_COUNTS[bucket] += 1
+    if task:
+        counts = _ROUTE_BY_TASK.setdefault(task, {"local": 0, "maas": 0, "unknown": 0})
+        counts[bucket] += 1
 
 
 def apply_quality_gate(case: TestCase, index_dir: Path | None = None) -> TestCase:
@@ -386,11 +400,14 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
     def _elapsed_ms() -> int:
         return int((time.monotonic() - _t0) * 1000)
 
+    # 重试原因（A/B 口径：json / schema / page）。按**去重后累计**记录：先 JSON 修复、
+    # 下一轮再撞页守卫时记成 `json+page`，否则"页守卫冲突率"会被低估。
+    repair_kind = ""
     for _ in range(_content_repairs() + 1):
         _round += 1
         if task_mode(client) == "server":
             text = _server_task_text(client, task, variables, context, images, rounds,
-                                     repair=repair)
+                                     repair=repair, round_index=_round)
         else:
             messages = _messages_from(_assemble_local(task, variables), images=images, rounds=rounds)
             if repair:
@@ -403,10 +420,12 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
                     return validator(data)
                 except PageConflictError as exc:
                     last = exc
+                    repair_kind = _repair_mark(repair_kind, "page")
                     repair = _PAGE_REPAIR_NOTE.format(err=str(exc)[:900])
                     continue
                 except Exception as exc:
                     last = GenError(f"{context}输出不符合 schema: {exc}", content=str(data))
+                    repair_kind = _repair_mark(repair_kind, "schema")
                     repair = _SCHEMA_REPAIR_NOTE.format(err=str(exc)[:400])
                     continue
             import inspect
@@ -425,28 +444,31 @@ def complete_task_raw(client, task: str, variables: dict, context: str,
             data = _loads(text, context)
         except GenError as exc:
             last = exc
+            repair_kind = _repair_mark(repair_kind, "json")
             repair = _JSON_REPAIR_NOTE.format(err=str(exc)[:400])
             continue
         if validator is None:
             ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round,
-                              latency_ms=_elapsed_ms())
+                              latency_ms=_elapsed_ms(), repair_kind=repair_kind)
             return data
         try:
             out = validator(data)
         except PageConflictError as exc:
             last = exc
+            repair_kind = _repair_mark(repair_kind, "page")
             repair = _PAGE_REPAIR_NOTE.format(err=str(exc)[:900])
             continue
         except Exception as exc:
             last = GenError(f"{context}输出不符合 schema: {exc}", content=text)
+            repair_kind = _repair_mark(repair_kind, "schema")
             repair = _SCHEMA_REPAIR_NOTE.format(err=str(exc)[:400])
             continue
         ai_metrics.record(task=task, mode=_mode, ok=True, scope="task", rounds=_round,
-                          latency_ms=_elapsed_ms())
+                          latency_ms=_elapsed_ms(), repair_kind=repair_kind)
         return out
     ai_metrics.record(task=task, mode=_mode, ok=False, scope="task",
                       rounds=_round, error=(str(last) or "")[:160],
-                      latency_ms=_elapsed_ms())
+                      latency_ms=_elapsed_ms(), repair_kind=repair_kind)
     raise GenError(f"{context}：内容级重试 {_content_repairs()} 次后仍不合法（JSON 或 schema）。"
                    f"{last}", content=getattr(last, "content", None))
 
@@ -462,6 +484,16 @@ def _content_repairs() -> int:
         return max(0, int(raw))
     except ValueError:
         return 2
+
+
+def _repair_mark(current: str, kind: str) -> str:
+    """累计一次内容重试原因，去重后用 `+` 连接（`json+schema+page`，顺序=首次出现）。
+
+    只做观测：供 A/B 统计 "schema 修复率 / 页守卫冲突率"，不影响重试逻辑本身。
+    """
+    parts = [p for p in current.split("+") if p]
+    return current if kind in parts else "+".join([*parts, kind])
+
 
 _SCHEMA_REPAIR_NOTE = (
     "上一次输出的 JSON **语法合法，但不符合用例 schema**（某字段类型或取值不对）。"
@@ -579,7 +611,7 @@ def _variables_chars(variables: dict | None) -> int | None:
 def _record_metrics(*, task: str, model: str, mode: str, started: float, ok: bool,
                     data: dict | None = None, content: str = "",
                     variables: dict | None = None, max_tokens: int | None = None,
-                    error: str = "") -> None:
+                    error: str = "", decision=None) -> None:
     """记一次调用（`ai_metrics` 内部吞掉所有异常，计量坏掉不影响业务）。"""
     from . import ai_metrics
 
@@ -594,6 +626,11 @@ def _record_metrics(*, task: str, model: str, mode: str, started: float, ok: boo
         # 输出 token 撞到上限 ⇒ 极可能被截断（这是"静默失败"的早期信号）
         truncated=bool(ct is not None and max_tokens and ct >= max_tokens),
         error=error,
+        # 路由决策留痕：legacy 下为空（不带头），explicit 下写去向与原因
+        route_decision=(decision.route if decision and decision.is_explicit else None),
+        route_reason=(decision.reason if decision else ""),
+        route_est_tokens=(decision.est_tokens if decision else None),
+        route_round=(decision.round_index if decision else None),
     )
 
 
@@ -654,7 +691,7 @@ def _error_detail(resp, limit: int = 300) -> str:
 
 def _server_task_text(client, task: str, variables: dict, context: str,
                       images: list[bytes] | None, rounds: list[dict] | None,
-                      repair: str | None = None) -> str:
+                      repair: str | None = None, round_index: int = 1) -> str:
     """server 模式：把原始材料发到代理，prompt 与模型都在服务端决定。
 
     `repair` 是内容级重试的修复提示（上一轮输出为何不合法）——服务端应当把它作为
@@ -686,17 +723,21 @@ def _server_task_text(client, task: str, variables: dict, context: str,
         # 头名运行时拼装：避免「鉴权头冒号运行时值」静态形态被扫描误判（用户已批准）
         "Auth" "orization": "Bearer " + client.api_key,
     }
-    if route_mod.is_explicit():
-        # **只在显式设过时带**：不带 = 按服务端策略（能自部署就自部署，2026-11-02）。
+    # 路由决策（2026-11-04）：优先级 = `MAT_ROUTE` 显式值 > 策略表 > auto。
+    # **legacy 默认下 decision.route == auto，与引入前完全一致（不带请求头）**；
+    # `MAT_ROUTE_POLICY=explicit` 才按任务/体量/轮次给出 local|cloud。
+    decision = route_mod.decide(task, variables, round_index=round_index)
+    if decision.route != route_mod.AUTO:
         # 老服务端不认识这个头，会忽略它——退化成本地优先，不是报错。
-        headers["X-Mat-Route"] = route_mod.preference()
+        headers["X-Mat-Route"] = decision.route
     for attempt in range(3):
         started = time.monotonic()
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if resp.status_code == 429:
                 _record_metrics(task=task, model="server", mode="server", started=started,
-                                ok=False, variables=variables, error="429 额度/限流")
+                                ok=False, variables=variables, error="429 额度/限流",
+                                decision=decision)
                 raise GenError(f"{context}：{_quota_message(resp)}")
             if resp.status_code in (500, 502, 503, 504):
                 # 带上服务端的 detail：503 里写着"本地不可用、不会改走云端 + 三条出路"，
@@ -706,18 +747,20 @@ def _server_task_text(client, task: str, variables: dict, context: str,
                 continue
             resp.raise_for_status()
             body = resp.json()
-            _note_route(body.get("route"))
+            _note_route(body.get("route"), task)
             content = GenClient._strip_fences(body["content"])
             # 代理目前只回 content（无 usage）⇒ token 记 None，由字符数兜底估算
             _record_metrics(task=task, model=str(body.get("model") or "server"),
                             mode="server", started=started, ok=True,
-                            data=body, content=content, variables=variables)
+                            data=body, content=content, variables=variables,
+                            decision=decision)
             return content
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
             time.sleep(2 ** attempt)
     _record_metrics(task=task, model="server", mode="server", started=call_started,
-                    ok=False, variables=variables, error=str(last_error)[:160])
+                    ok=False, variables=variables, error=str(last_error)[:160],
+                    decision=decision)
     raise GenError(f"{context} 轻云请求失败（已重试 3 次）: {last_error}")
 
 

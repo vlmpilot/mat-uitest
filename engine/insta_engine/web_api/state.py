@@ -8,10 +8,9 @@ import time
 from pathlib import Path
 
 from .. import __version__, promptstore
-from ..device import list_adb_devices
 from ..quota import UsageStore
 from ..readiness import EXPLORE_TIP
-from .device import harmony_state_devices, ios_state_devices
+from .device import devices_snapshot
 from .runtime import CONSOLE_DIST, _now, source_staleness
 from .workspace import case_meta, list_explores, list_imports, list_indexes, list_runs
 
@@ -32,6 +31,15 @@ def api_state(root: Path, usage: dict | None = None) -> tuple[int, dict]:
     # expires_at 为 None，前端不显示日期。
     from ..licensing import read_license
     lic = read_license()
+    # 设备清单改读后台快照（2026-11-04）：adb / iOS / 鸿蒙三条探测都在慢路径上
+    # （鸿蒙冷缓存 1.3s + 每台两次 `hdc.shell(timeout=10)`），原来同步拼在这里，
+    # 一台离线设备就能让整个 `/api/state` 卡十几秒、控制台开页白屏。现在请求只读
+    # 内存快照，过期时后台按 TTL 刷新（不等待）。
+    # 三个新字段只增不改，现有字段名与类型保持不变（前端不改也能跑）：
+    #   devices_asof       这份列表成功采到时的 UNIX 秒；null = 还没有成功快照
+    #   devices_probe_error 最近一次探测失败原因（成功后回到 null，旧列表继续返回）
+    #   devices_warming    首次请求仍在预热：devices 可能暂时为空，稍后轮询即可
+    snap = devices_snapshot()
     return 200, {
         "version": __version__,
         "cwd": str(root),
@@ -54,8 +62,11 @@ def api_state(root: Path, usage: dict | None = None) -> tuple[int, dict]:
              or (bool(os.environ.get("GEN_MODEL")) and promptstore.resolve("gen") is not None)),
         # 遍历探索建议（判据本体保留；2026-10-26 去掉「甜点判据」术语）：单一来源下发
         "explore_tip": EXPLORE_TIP,
-        # Android(adb) + iOS USB 真机（2026-10-19：控制台真机入口；iOS 侧带 TTL 缓存）
-        "devices": list_adb_devices() + ios_state_devices() + harmony_state_devices(),
+        # Android(adb) + iOS USB 真机 + 鸿蒙设备：来自后台快照（2026-11-04）
+        "devices": snap["devices"],
+        "devices_asof": snap["asof"],
+        "devices_probe_error": snap["error"],
+        "devices_warming": snap["warming"],
         # iOS 工具链（Xcode / simctl / devicectl / xcodebuild）只在 macOS 存在：
         # Windows/Linux 前端据此隐藏 iOS 环境卡、iOS 运行平台与模拟器入口（2026-10-22）
         "ios_supported": sys.platform == "darwin",

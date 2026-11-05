@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -125,15 +126,145 @@ def _harmony_state_devices_uncached() -> list[dict]:
     return out
 
 
+# -- `/api/state` 设备快照：请求只读内存，探测在后台按 TTL 刷新（2026-11-04） ----
+#
+# 为什么必须挪走：`harmony_state_devices()` 冷缓存要 1.3s（hdc 探测），每台设备还要
+# 两次 `hdc.shell(timeout=10)`；一台离线鸿蒙机就能让 `/api/state` 单次吃掉 10–20s，
+# 控制台开页白屏。`list_adb_devices()` 的 adb 冷启动同理（timeout=10，失败还回退
+# adbutils）。**请求线程不再付这笔账**：读上次快照立即返回，过期只触发后台刷新。
+
+#: 快照有效期；与 iOS/鸿蒙各自的 TTL 同值，前端轮询间隔是 5s。
+_DEVICES_TTL = 8.0
+#: 冷启动（完全没有快照）时允许同步等待的上限；超时就回空列表 + 预热标记。
+_DEVICES_COLD_JOIN = 2.0
+
+_devices_lock = threading.Lock()
+_devices_snapshot: list[dict] | None = None
+_devices_asof: int | None = None          # 成功探测完成时的 UNIX 秒
+_devices_error: str | None = None         # 最近一次失败原因；成功后清空
+_devices_thread: threading.Thread | None = None
+_devices_generation = 0                   # reset 后旧线程的结果作废
+_devices_last_attempt = 0.0               # 上次**发起**探测的 monotonic 时间（失败也要节流）
+
+
+def _probe_devices() -> list[dict]:
+    """真实枚举（慢路径）：adb + iOS USB + 鸿蒙。失败由调用方记录，不清旧快照。
+
+    adb 侧统一补 `platform="android"`：`/api/devices` 一直带这个键，
+    `/api/state` 则靠前端 `d.platform || "android"` 兜底。快照层是两个接口的
+    唯一来源，必须先把两侧归一化，否则同一份快照在两个页面里长得不一样。
+    """
+    android = [{**d, "platform": "android"} for d in list_adb_devices()]
+    return android + ios_state_devices() + harmony_state_devices()
+
+
+def _refresh_worker(generation: int) -> None:
+    global _devices_snapshot, _devices_asof, _devices_error, _devices_thread
+    try:
+        devices = _probe_devices()
+    except Exception as exc:  # noqa: BLE001 - 探测失败要能显示给前端，不能吞掉
+        with _devices_lock:
+            if generation == _devices_generation:
+                _devices_error = f"{type(exc).__name__}: {exc}"
+    else:
+        with _devices_lock:
+            if generation == _devices_generation:
+                _devices_snapshot = devices
+                _devices_asof = int(time.time())
+                _devices_error = None
+    finally:
+        with _devices_lock:
+            if generation == _devices_generation:
+                _devices_thread = None
+
+
+def _start_refresh() -> tuple[threading.Thread | None, bool]:
+    """单飞 + 节流：已有刷新线程就复用它；返回 (线程, 是否由本次启动)。
+
+    `_devices_last_attempt` 单独记**发起**时间，而不是复用 `_devices_asof`：
+    探测失败时 `asof` 按契约保持不变，只看它会退化成"每个请求都重试一次慢探测"。
+    """
+    global _devices_thread, _devices_last_attempt
+    with _devices_lock:
+        if _devices_thread is not None and _devices_thread.is_alive():
+            return _devices_thread, False
+        now = time.monotonic()
+        if now - _devices_last_attempt < _DEVICES_TTL:
+            return None, False
+        _devices_last_attempt = now
+        generation = _devices_generation
+        thread = threading.Thread(
+            target=_refresh_worker, args=(generation,),
+            name="mat-devices-probe", daemon=True,
+        )
+        _devices_thread = thread
+        thread.start()
+        return thread, True
+
+
+def devices_snapshot() -> dict:
+    """`/api/state` 用的设备快照。
+
+    - 有快照：立即返回；过期只触发后台刷新，**不等**；
+    - 没有快照：最多同步等 `_DEVICES_COLD_JOIN`（2s），超时回空列表 + `warming=True`；
+    - 探测失败：保留旧 `devices` 与 `devices_asof`，只更新 `error`。
+    """
+    now = time.time()
+    with _devices_lock:
+        snapshot = _devices_snapshot
+        asof = _devices_asof
+        error = _devices_error
+        running = _devices_thread is not None and _devices_thread.is_alive()
+
+    if snapshot is None:
+        if running:
+            return {"devices": [], "asof": None, "error": error, "warming": True}
+        thread, started = _start_refresh()
+        if started and thread is not None:
+            thread.join(_DEVICES_COLD_JOIN)
+        with _devices_lock:
+            snapshot = _devices_snapshot
+            asof = _devices_asof
+            error = _devices_error
+            running = _devices_thread is not None and _devices_thread.is_alive()
+        if snapshot is None:
+            return {"devices": [], "asof": None, "error": error, "warming": running}
+        return {"devices": snapshot, "asof": asof, "error": error, "warming": False}
+
+    if asof is None or now - asof >= _DEVICES_TTL:
+        _start_refresh()  # 后台刷新，不阻塞本次请求
+    return {"devices": snapshot, "asof": asof, "error": error, "warming": False}
+
+
+def reset_devices_snapshot() -> None:
+    """测试用：清空快照并作废仍在跑的旧探测线程的结果。"""
+    global _devices_snapshot, _devices_asof, _devices_error, _devices_thread
+    global _devices_generation, _devices_last_attempt
+    with _devices_lock:
+        _devices_generation += 1
+        _devices_snapshot = None
+        _devices_asof = None
+        _devices_error = None
+        _devices_thread = None
+        _devices_last_attempt = 0.0
+
+
 def api_devices() -> tuple[int, dict]:
-    """GET /api/devices：adb 枚举 + iOS USB 真机 + 鸿蒙设备（2026-10-26 起三方同列），
+    """GET /api/devices：adb + iOS USB 真机 + 鸿蒙设备（2026-10-26 起三方同列），
     逐项标注 platform 供上层按平台路由（评审 I4）。iOS 模拟器不可枚举
     （WDA 常驻 localhost:8100），可达性在首次连接时校验。
+
+    与 `/api/state` 共用 `devices_snapshot()`（2026-11-04）：同一份快照、同一套
+    `devices_asof / devices_probe_error / devices_warming` 语义，冷启动同样是
+    ≤2s 联合等待。**不另起缓存**——两套缓存必然不同步，设备页和概览页的数字会对不上。
     """
-    devices = [{**d, "platform": "android"} for d in list_adb_devices()]
-    devices.extend(ios_state_devices())
-    devices.extend(harmony_state_devices())
-    return 200, {"devices": devices}
+    snap = devices_snapshot()
+    return 200, {
+        "devices": snap["devices"],
+        "devices_asof": snap["asof"],
+        "devices_probe_error": snap["error"],
+        "devices_warming": snap["warming"],
+    }
 
 
 def _simctl_devices() -> dict | None:
