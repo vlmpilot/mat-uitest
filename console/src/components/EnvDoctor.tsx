@@ -218,7 +218,7 @@ export default function EnvDoctor({ state }: { state: StateResp }) {
       <Col span={12}>
         <DoctorCard title="AI 生成" loading={!android && !err} checks={aiChecks} resp={android}
           conclusion={genOk
-            ? { color: "green", text: `已配置 · ${state.prompt_mode === "server" ? "server" : "自部署"}` }
+            ? { color: "green", text: `已配置 · ${state.prompt_mode === "server" ? "官方代理" : "自带 Key"}` }
             : { color: "orange", text: "未配置" }}
           onRerun={() => runOne("android")} busy={busyKey === "android"}
           onManage={() => setManageOpen(true)} />

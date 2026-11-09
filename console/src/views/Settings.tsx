@@ -56,7 +56,7 @@ function SubscribeTab({ state }: { state: StateResp }) {
       </div>
       {/* 微调卡片默认关闭（2026-11-05）：训练对唯一来源是 gen 落盘的 meta.nl，本机存量
           实测 0 对（1925 条 run 全部缺 nl，31 个用例无一含它），200 对门槛永远到不了；
-          且本项目默认部署只常驻视觉模型，训完也没有文本服务加载 adapter。
+          且本项目默认部署不再常驻本地模型服务，训完也没有文本服务加载 adapter。
           能力保留在 CLI（mat finetune，已标「实验性」），要露出时把这个常量改成 true。 */}
       {SHOW_FINETUNE_CARD && (
         <div style={{ marginTop: 16 }}>
@@ -229,7 +229,7 @@ function FinetuneCard() {
           )}
           <div style={{ color: "#8a919f", fontSize: 12 }}>
             实验性：训练对依赖 gen 落盘的 nl，本机存量 0 对；训练需自建文本服务
-            （mlx_lm.server），默认部署只常驻视觉模型。训练数据只在本机。
+            （mlx_lm.server），默认部署不再常驻本地模型服务。训练数据只在本机。
           </div>
           <Button size="small" loading={exporting} onClick={doExport}>导出 dataset/</Button>
         </Space>
