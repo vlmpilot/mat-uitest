@@ -100,3 +100,29 @@ def test_verify_keeps_record_when_artifacts_gone(ledger_mod, tmp_path, capsys):
     assert ledger_mod.cmd_verify(type("A", (), {})()) == 1
     assert "产物已不在" in capsys.readouterr().out
     assert ledger_mod.LEDGER.read_text(encoding="utf-8").strip()
+
+
+def test_summarize_reads_repeat_layout(ledger_mod, tmp_path):
+    """`mat eval --repeat N` 的产物是 `r1/<task>/run.json`、`r2/<task>/run.json`。
+
+    此前只 glob 一层，repeat≥2 的产物会报「没有 run.json」——评测数据入不了台账，
+    等于「数字只从 run.json 读」这条纪律在 repeat≥2 时失效（2026-11-23 补）。
+    """
+    art = tmp_path / "eval" / "public-subset"
+    for idx in (1, 2, 3):
+        d = art / f"r{idx}" / "demo-f01-login-ok"
+        d.mkdir(parents=True)
+        (d / "run.json").write_text(json.dumps({
+            "finished_at": "2026-11-23T12:00:00",
+            "device_serial": "SERIAL",
+            "platform": "android",
+            "device": {"model": "ELE-AL00", "os_version": "10"},
+            "run": {"case_id": "demo-f01-login-ok", "case_name": "登录成功",
+                    "status": "passed", "duration_ms": 1000,
+                    "steps": [{"status": "passed"}]},
+        }, ensure_ascii=False), encoding="utf-8")
+
+    s = ledger_mod.summarize_arm(art)
+    assert (s["cases"], s["passed"], s["failed"]) == (3, 3, 0)
+    assert (s["steps_passed"], s["steps_total"]) == (3, 3)
+    assert s["device"] == "ELE-AL00 · 10"

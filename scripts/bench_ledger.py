@@ -63,10 +63,15 @@ def _first_error(run: dict) -> str:
 
 
 def summarize_arm(artifacts: Path) -> dict:
-    """统计一个产物目录（内含若干 `<序号>_<caseId>/run.json`）。"""
-    runs = []
-    for p in sorted(artifacts.glob("*/run.json")):
-        runs.append(json.loads(p.read_text(encoding="utf-8")))
+    """统计一个产物目录。
+
+    支持两种布局：
+    - `repeat=1`：`<序号>_<caseId>/run.json`（`mat run` 的产物）
+    - `repeat>1`：`r1/<task>/run.json`、`r2/<task>/run.json`…（`mat eval` 按遍分目录，
+      2026-11-23 补：此前只 glob 一层，repeat≥2 的产物直接读不到）
+    """
+    paths = sorted(artifacts.glob("*/run.json")) + sorted(artifacts.glob("r*/*/run.json"))
+    runs = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
     if not runs:
         raise SystemExit(f"没有 run.json：{artifacts}")
 

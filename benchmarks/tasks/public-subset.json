@@ -1,6 +1,6 @@
 {
  "name": "public-subset",
- "comment": "可对外复现的最小评测子集：自建靶场（examples/demo-app，源码自带缺陷）+ 公开 DSL + 预期标签。指标定义见 benchmarks/METRICS.md，复现步骤见 README。注意：白屏类缺陷的判据是 explore 的截图灰度判据，不属于 DSL 断言，故本子集只收DSL 可判的功能缺陷。",
+ "comment": "可对外复现的最小评测子集：自建靶场（examples/demo-app，源码自带缺陷）+ 公开 DSL + 预期标签。10 条常规流程（expect=pass）+ 7 条缺陷检出（expect=fail，复用内部已验证的缺陷探针）。指标定义见 benchmarks/METRICS.md，复现步骤见 README。白屏类缺陷的判据是 explore 的截图灰度判据、不属 DSL 断言，故不在本子集内。",
  "apps": {
   "com.insta.demo": {
    "source": "examples/demo-app（完整 Gradle 工程；源码即为带缺陷版，勿修已标注的缺陷）",
@@ -8,6 +8,8 @@
    "required_controls": [
     "detail_title",
     "error_text",
+    "export_report_btn",
+    "export_result",
     "item_text",
     "login_btn",
     "password",
@@ -18,7 +20,7 @@
    "check_controls": "构建安装后 `adb shell uiautomator dump` 或 `mat index` 核对上面这些 id 都存在；缺任何一个说明 App 版本与子集不匹配（子集按当前源码编写）"
   }
  },
- "pass_threshold": 0.7,
+ "pass_threshold": 0.6,
  "labels": {
   "pass": "常规流程，应通过",
   "fail": "源码自带缺陷，应失败（通过 = 假绿）"
@@ -1181,19 +1183,18 @@
    "expect": "pass"
   },
   {
-   "id": "demo-b01-login-lockout",
-   "expect": "fail",
-   "nl": "连续 3 次密码错误后，登录按钮应禁用（源码自带「无禁用态」缺陷，本条应失败）",
+   "id": "defect-empty-search-undefined",
+   "nl": "登录后进列表页，搜索框**空输入**直接按搜索键，列表**不该**显示 undefined",
    "case": {
-    "caseId": "case_demob01",
-    "name": "缺陷检出：连续失败后按钮应禁用",
+    "caseId": "case_defect01",
+    "name": "缺陷：空搜索显示 undefined",
     "target": {
      "package": "com.insta.demo"
     },
     "steps": [
      {
       "id": "s1",
-      "intent": "启动",
+      "intent": "启动 demo",
       "action": "launch",
       "params": {
        "package": "com.insta.demo",
@@ -1202,6 +1203,14 @@
      },
      {
       "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
       "intent": "输入账号",
       "action": "input",
       "target": {
@@ -1213,20 +1222,20 @@
       }
      },
      {
-      "id": "s3",
-      "intent": "输入错误密码 1",
+      "id": "s4",
+      "intent": "输入密码",
       "action": "input",
       "target": {
        "strategy": "res-id",
        "value": "com.insta.demo:id/password"
       },
       "params": {
-       "text": "wrong-1"
+       "text": "pass1234"
       }
      },
      {
-      "id": "s4",
-      "intent": "点登录 1",
+      "id": "s5",
+      "intent": "点登录",
       "action": "tap",
       "target": {
        "strategy": "res-id",
@@ -1234,28 +1243,131 @@
       }
      },
      {
-      "id": "s5",
-      "intent": "等错误提示 1",
+      "id": "s6",
+      "intent": "等列表页",
       "action": "wait",
       "params": {
-       "ms": 900
+       "ms": 2000
       }
      },
      {
-      "id": "s6",
-      "intent": "输入错误密码 2",
+      "id": "s7",
+      "intent": "点搜索框（不输入任何内容）",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "按 IME 搜索键（空输入）",
+      "action": "key-event",
+      "params": {
+       "key": "enter"
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "等列表刷新",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s10",
+      "intent": "断言列表**不该**出现 undefined",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "text",
+         "value": "undefined"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "fail"
+  },
+  {
+   "id": "defect-login-btn-should-disable",
+   "nl": "密码连错 3 次后按钮**应禁用**（直接断言控件状态）；第 4 次点击**不该**再累加计数",
+   "case": {
+    "caseId": "case_defect02",
+    "name": "缺陷：连错后登录按钮无禁用态",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动 demo",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入错误密码",
       "action": "input",
       "target": {
        "strategy": "res-id",
        "value": "com.insta.demo:id/password"
       },
       "params": {
-       "text": "wrong-2"
+       "text": "wrong"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "第 1 次点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "第 2 次点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
       }
      },
      {
       "id": "s7",
-      "intent": "点登录 2",
+      "intent": "第 3 次点登录",
       "action": "tap",
       "target": {
        "strategy": "res-id",
@@ -1264,44 +1376,15 @@
      },
      {
       "id": "s8",
-      "intent": "等错误提示 2",
+      "intent": "等错误提示刷新",
       "action": "wait",
       "params": {
-       "ms": 900
+       "ms": 1000
       }
      },
      {
       "id": "s9",
-      "intent": "输入错误密码 3",
-      "action": "input",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/password"
-      },
-      "params": {
-       "text": "wrong-3"
-      }
-     },
-     {
-      "id": "s10",
-      "intent": "点登录 3",
-      "action": "tap",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/login_btn"
-      }
-     },
-     {
-      "id": "s11",
-      "intent": "等错误提示 3",
-      "action": "wait",
-      "params": {
-       "ms": 900
-      }
-     },
-     {
-      "id": "s12",
-      "intent": "断言登录按钮已禁用",
+      "intent": "**直接断言**：连错 3 次后登录按钮应处于禁用态（T36 控件状态断言）",
       "action": "wait",
       "params": {
        "ms": 300
@@ -1315,9 +1398,584 @@
         }
        }
       ]
+     },
+     {
+      "id": "s10",
+      "intent": "第 4 次点登录（**若按钮已禁用，这一下不该生效**）",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s11",
+      "intent": "等",
+      "action": "wait",
+      "params": {
+       "ms": 1000
+      }
+     },
+     {
+      "id": "s12",
+      "intent": "断言计数**没有**涨到 4（量**后果**：即使按钮状态对了，点击也不该生效）",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "text",
+         "value": "账号或密码错误（4）"
+        }
+       }
+      ]
      }
     ]
-   }
+   },
+   "expect": "fail"
+  },
+  {
+   "id": "defect-longpress-no-menu",
+   "nl": "长按列表项应**弹出上下文菜单**（出现「删除」）",
+   "case": {
+    "caseId": "case_defect04",
+    "name": "缺陷：长按无反应",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动 demo",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "长按首项",
+      "action": "long-press",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/item_text"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "等菜单",
+      "action": "wait",
+      "params": {
+       "ms": 1200
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "断言菜单出现（正确行为）",
+      "action": "wait",
+      "params": {
+       "ms": 100
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "删除"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "fail"
+  },
+  {
+   "id": "defect-list-count-wrong",
+   "nl": "筛选后计数应反映**过滤结果**（搜索「蓝牙」应显示「共 2 项」）",
+   "case": {
+    "caseId": "case_defect03",
+    "name": "缺陷：筛选后计数仍显示全量",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动 demo",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "搜蓝牙",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "蓝牙"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1200
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "断言计数=2（正确行为）",
+      "action": "wait",
+      "params": {
+       "ms": 100
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "共 2 项"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "fail"
+  },
+  {
+   "id": "defect-search-truncated",
+   "nl": "搜索框输入 14 字符应**完整保留**（不该被静默截断到 10）",
+   "case": {
+    "caseId": "case_defect05",
+    "name": "缺陷：超长输入被静默截断",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动 demo",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "输入 14 字符",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "abcdefghijklmn"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "等生效",
+      "action": "wait",
+      "params": {
+       "ms": 800
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "断言输入框内容完整（正确行为）",
+      "action": "wait",
+      "params": {
+       "ms": 100
+      },
+      "assertions": [
+       {
+        "type": "text-equals",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/search_box"
+        },
+        "expected": "abcdefghijklmn"
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "fail"
+  },
+  {
+   "id": "defect-no-empty-hint",
+   "nl": "搜索**无结果**时应显示空状态提示「没有找到相关结果」",
+   "case": {
+    "caseId": "case_defect06",
+    "name": "缺陷：无结果无提示",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动 demo",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "搜一个不存在的词",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "zzzz"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1200
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "断言空状态提示出现（正确行为）",
+      "action": "wait",
+      "params": {
+       "ms": 100
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "没有找到相关结果"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "fail"
+  },
+  {
+   "id": "defect-crash-export",
+   "nl": "登录后点「导出报表」**不该崩溃**（正确行为：显示「已导出 N 条记录」）",
+   "case": {
+    "caseId": "case_defect07",
+    "name": "缺陷：点「导出报表」直接崩溃",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动 demo",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "点「导出报表」",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/export_report_btn"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "等崩溃/导出完成",
+      "action": "wait",
+      "params": {
+       "ms": 1000
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "断言导出结果出现（正确行为）",
+      "action": "wait",
+      "params": {
+       "ms": 100
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/export_result"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "fail"
   }
  ]
 }

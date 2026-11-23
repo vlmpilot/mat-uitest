@@ -92,12 +92,20 @@ class _Stale:
 
 
 class _Typed:
-    """输入成功但字段回读为空（厂商安全键盘拦截的形态）。"""
+    """输入成功、回读可见的字段（可带 App 侧变换：截断、加前缀等）。"""
 
     exists = True
 
     def __init__(self, values: list[str]):
         self.values = values
+        self.clicks = 0
+        self.set_texts: list[str] = []
+
+    def click(self):
+        self.clicks += 1
+
+    def set_text(self, text: str):
+        self.set_texts.append(text)
 
     def get_text(self):
         return self.values.pop(0) if self.values else ""
@@ -188,3 +196,46 @@ def test_password_field_is_recognised_by_its_mask(monkeypatch):
     assert drv.calls == [], "密码框不得走二级通道（会把文本打两遍）"
 
 
+
+
+def test_input_landed_accepts_truncated_readback(monkeypatch):
+    """App **截断**输入时，回读是输入的前缀 ⇒ 必须判「已生效」，不许走二级通道。
+
+    靶场搜索框故意静默截断（>10 字符取前 10）。旧判据只判「输入 ∈ 回读」，
+    截断场景必然不成立 ⇒ 误判"输入未生效" ⇒ `fallback_input` 二次输入 ⇒ 内容被
+    污染成 `nmlkjihgfe`（2026-11-23 真机实测），带截断缺陷的用例于是报出误导性的
+    「实际 nmlkjihgfe」，看不出真实原因是截断。
+    """
+    monkeypatch.setattr(locator_mod.time, "sleep", lambda _s: None)
+
+    class _Drv:
+        platform = "android"
+        calls: list[str] = []
+
+        def fallback_input(self, text: str) -> bool:  # noqa: ARG002
+            self.calls.append(text)
+            return True
+
+    drv = _Drv()
+    node = _Typed(["abcdefghij", "abcdefghij"])
+    Element(strategy="res-id", value="search_box", node=node, drv=drv).set_text("abcdefghijklmn")
+    assert node.set_texts == ["abcdefghijklmn"], "输入本身必须发生"
+    assert drv.calls == [], "截断是 App 变换输入，不是「没进去」——不许二次输入"
+
+
+def test_input_landed_still_rejects_unrelated_readback(monkeypatch):
+    """双向包含不能放水：回读与输入毫无关系时仍要判未生效（走二级通道）。"""
+    monkeypatch.setattr(locator_mod.time, "sleep", lambda _s: None)
+
+    class _Drv:
+        platform = "android"
+        calls: list[str] = []
+
+        def fallback_input(self, text: str) -> bool:
+            self.calls.append(text)
+            return True
+
+    drv = _Drv()
+    node = _Typed(["旧的搜索词", "旧的搜索词", "旧的搜索词"])
+    Element(strategy="res-id", value="search_box", node=node, drv=drv).set_text("abcdefghijklmn")
+    assert drv.calls == ["abcdefghijklmn"], "完全无关的回读 ⇒ 必须走二级通道"

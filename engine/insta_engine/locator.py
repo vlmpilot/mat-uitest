@@ -183,6 +183,13 @@ class Element:
         判「包含」而不是「相等」：xhs 的回读是「搜索, 咖啡」，前缀是 App 自绘的、
         不是被污染的查询词（实测提交后的查询词就是「咖啡」）。比较前做归一化
         （去分隔符、统一大小写），覆盖手机号/金额这类**自动格式化**字段。
+
+        🔴 必须是**双向**包含（2026-11-23 修）：App 也会**截断/过滤**用户输入
+        （靶场搜索框超过 10 字符静默截断 `abcdefghijklmn` → `abcdefghij`）。
+        只判「输入 ∈ 回读」时，截断场景必然不成立 ⇒ 误判「输入未生效」⇒ 走
+        `fallback_input` 二次输入 ⇒ 内容被污染：实测搜索框回读变成 `nmlkjihgfe`，
+        带截断缺陷的用例因此报出误导性的「实际 nmlkjihgfe」，看不出真实原因是截断
+        （这也是「缺陷任务的失败原因必须只能是缺陷本身」这条纪律要防的情况）。
         """
         if not text:
             return True
@@ -191,7 +198,12 @@ class Element:
             return True  # 读不到不判死，见 `_read_text`
         if self._is_password():
             return True
-        return bool(readback) and _norm(text) in _norm(readback)
+        if not readback:  # None（读不到具体值）或 ""（真空，安全键盘拦截）
+            return False
+        want, got = _norm(text), _norm(readback)
+        if not got:
+            return False
+        return want in got or want.startswith(got)
 
     def clear_text(self) -> None:
         """清空输入框：`clear_text()` → `set_text("")` → 按键通道，都无效则记 `note`。
