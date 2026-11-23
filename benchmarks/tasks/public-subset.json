@@ -1,15 +1,21 @@
 {
  "name": "public-subset",
- "comment": "可对外复现的最小评测子集：自建靶场（examples/demo-app，源码自带白屏缺陷）+ 公开 DSL + 预期标签。指标定义见 benchmarks/METRICS.md，复现步骤见 README。",
+ "comment": "可对外复现的最小评测子集：自建靶场（examples/demo-app，源码自带缺陷）+ 公开 DSL + 预期标签。指标定义见 benchmarks/METRICS.md，复现步骤见 README。注意：白屏类缺陷的判据是 explore 的截图灰度判据，不属于 DSL 断言，故本子集只收DSL 可判的功能缺陷。",
  "apps": {
   "com.insta.demo": {
-   "source": "examples/demo-app（完整 Gradle 工程；源码即为带缺陷版，勿修 BlankActivity）",
-   "expect_build": "由当前源码构建的 debug APK",
-   "reference_apk": {
-    "name": "demo-app-broken.apk",
-    "sha256": "c70d815b826fbbd7abfca29bbb1f1b412d3df6fadf4ef48aa9dec7e3fde77fb1",
-    "note": "参考构建产物，仅用于核对『是否同一棵树』；以你按当前源码构建的结果为准"
-   }
+   "source": "examples/demo-app（完整 Gradle 工程；源码即为带缺陷版，勿修已标注的缺陷）",
+   "build": "gradle :app:assembleDebug → app/build/outputs/apk/debug/app-debug.apk",
+   "required_controls": [
+    "detail_title",
+    "error_text",
+    "item_text",
+    "login_btn",
+    "password",
+    "search_box",
+    "username",
+    "welcome_text"
+   ],
+   "check_controls": "构建安装后 `adb shell uiautomator dump` 或 `mat index` 核对上面这些 id 都存在；缺任何一个说明 App 版本与子集不匹配（子集按当前源码编写）"
   }
  },
  "pass_threshold": 0.7,
@@ -1175,12 +1181,12 @@
    "expect": "pass"
   },
   {
-   "id": "demo-b01-announce-title",
+   "id": "demo-b01-login-lockout",
    "expect": "fail",
-   "nl": "登录后点「查看公告」，公告页应显示标题（源码自带白屏缺陷，本条应失败）",
+   "nl": "连续 3 次密码错误后，登录按钮应禁用（源码自带「无禁用态」缺陷，本条应失败）",
    "case": {
     "caseId": "case_demob01",
-    "name": "缺陷检出：公告页标题",
+    "name": "缺陷检出：连续失败后按钮应禁用",
     "target": {
      "package": "com.insta.demo"
     },
@@ -1208,19 +1214,19 @@
      },
      {
       "id": "s3",
-      "intent": "输入密码",
+      "intent": "输入错误密码 1",
       "action": "input",
       "target": {
        "strategy": "res-id",
        "value": "com.insta.demo:id/password"
       },
       "params": {
-       "text": "pass1234"
+       "text": "wrong-1"
       }
      },
      {
       "id": "s4",
-      "intent": "点登录",
+      "intent": "点登录 1",
       "action": "tap",
       "target": {
        "strategy": "res-id",
@@ -1229,96 +1235,27 @@
      },
      {
       "id": "s5",
-      "intent": "等列表页",
+      "intent": "等错误提示 1",
       "action": "wait",
       "params": {
-       "ms": 1500
+       "ms": 900
       }
      },
      {
       "id": "s6",
-      "intent": "点查看公告",
-      "action": "tap",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/announce_btn"
-      }
-     },
-     {
-      "id": "s7",
-      "intent": "等公告页",
-      "action": "wait",
-      "params": {
-       "ms": 1500
-      }
-     },
-     {
-      "id": "s8",
-      "intent": "断言公告标题在",
-      "action": "wait",
-      "params": {
-       "ms": 300
-      },
-      "assertions": [
-       {
-        "type": "exists",
-        "target": {
-         "strategy": "res-id",
-         "value": "com.insta.demo:id/announce_title"
-        }
-       }
-      ]
-     }
-    ]
-   }
-  },
-  {
-   "id": "demo-b02-announce-body",
-   "expect": "fail",
-   "nl": "登录后点「查看公告」，公告页应显示正文（源码自带白屏缺陷，本条应失败）",
-   "case": {
-    "caseId": "case_demob02",
-    "name": "缺陷检出：公告正文",
-    "target": {
-     "package": "com.insta.demo"
-    },
-    "steps": [
-     {
-      "id": "s1",
-      "intent": "启动",
-      "action": "launch",
-      "params": {
-       "package": "com.insta.demo",
-       "cold": true
-      }
-     },
-     {
-      "id": "s2",
-      "intent": "输入账号",
-      "action": "input",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/username"
-      },
-      "params": {
-       "text": "alice"
-      }
-     },
-     {
-      "id": "s3",
-      "intent": "输入密码",
+      "intent": "输入错误密码 2",
       "action": "input",
       "target": {
        "strategy": "res-id",
        "value": "com.insta.demo:id/password"
       },
       "params": {
-       "text": "pass1234"
+       "text": "wrong-2"
       }
      },
      {
-      "id": "s4",
-      "intent": "点登录",
+      "id": "s7",
+      "intent": "点登录 2",
       "action": "tap",
       "target": {
        "strategy": "res-id",
@@ -1326,97 +1263,28 @@
       }
      },
      {
-      "id": "s5",
-      "intent": "等列表页",
-      "action": "wait",
-      "params": {
-       "ms": 1500
-      }
-     },
-     {
-      "id": "s6",
-      "intent": "点查看公告",
-      "action": "tap",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/announce_btn"
-      }
-     },
-     {
-      "id": "s7",
-      "intent": "等公告页",
-      "action": "wait",
-      "params": {
-       "ms": 1500
-      }
-     },
-     {
       "id": "s8",
-      "intent": "断言公告正文在",
+      "intent": "等错误提示 2",
       "action": "wait",
       "params": {
-       "ms": 300
-      },
-      "assertions": [
-       {
-        "type": "exists",
-        "target": {
-         "strategy": "res-id",
-         "value": "com.insta.demo:id/announce_body"
-        }
-       }
-      ]
-     }
-    ]
-   }
-  },
-  {
-   "id": "demo-b03-announce-back",
-   "expect": "fail",
-   "nl": "登录后点「查看公告」再确认列表可回（白屏页无返回入口，本条应失败）",
-   "case": {
-    "caseId": "case_demob03",
-    "name": "缺陷检出：公告页不可返回",
-    "target": {
-     "package": "com.insta.demo"
-    },
-    "steps": [
-     {
-      "id": "s1",
-      "intent": "启动",
-      "action": "launch",
-      "params": {
-       "package": "com.insta.demo",
-       "cold": true
+       "ms": 900
       }
      },
      {
-      "id": "s2",
-      "intent": "输入账号",
-      "action": "input",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/username"
-      },
-      "params": {
-       "text": "alice"
-      }
-     },
-     {
-      "id": "s3",
-      "intent": "输入密码",
+      "id": "s9",
+      "intent": "输入错误密码 3",
       "action": "input",
       "target": {
        "strategy": "res-id",
        "value": "com.insta.demo:id/password"
       },
       "params": {
-       "text": "pass1234"
+       "text": "wrong-3"
       }
      },
      {
-      "id": "s4",
-      "intent": "点登录",
+      "id": "s10",
+      "intent": "点登录 3",
       "action": "tap",
       "target": {
        "strategy": "res-id",
@@ -1424,43 +1292,26 @@
       }
      },
      {
-      "id": "s5",
-      "intent": "等列表页",
+      "id": "s11",
+      "intent": "等错误提示 3",
       "action": "wait",
       "params": {
-       "ms": 1500
+       "ms": 900
       }
      },
      {
-      "id": "s6",
-      "intent": "点查看公告",
-      "action": "tap",
-      "target": {
-       "strategy": "res-id",
-       "value": "com.insta.demo:id/announce_btn"
-      }
-     },
-     {
-      "id": "s7",
-      "intent": "等公告页",
-      "action": "wait",
-      "params": {
-       "ms": 1500
-      }
-     },
-     {
-      "id": "s8",
-      "intent": "断言列表欢迎文案仍在",
+      "id": "s12",
+      "intent": "断言登录按钮已禁用",
       "action": "wait",
       "params": {
        "ms": 300
       },
       "assertions": [
        {
-        "type": "exists",
+        "type": "disabled",
         "target": {
          "strategy": "res-id",
-         "value": "com.insta.demo:id/welcome_text"
+         "value": "com.insta.demo:id/login_btn"
         }
        }
       ]
