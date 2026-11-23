@@ -21,6 +21,11 @@ from .dsl import VISION_LLM_MISUSE_HINT, Locator, LocatorStrategy
 #: `***`（变了但不含目标），那条要记 `note` 交给人判；把 `*` 算成掩码会把它静默放过。
 _MASK_CHARS = frozenset("•●")
 
+#: 坐标定位下清空输入框的按键次数（`MOVE_END` + N×`DEL`）。坐标 Element 读不到原文长度，
+#: 只能给足余量：多余的 `DEL` 在空输入框上是无操作，少按一下却会留一个字符（更难发现）。
+#: 驱动侧 `clear_by_keyevents` 会用 `MAX_CLEAR_KEYS` 封顶。
+_COORD_CLEAR_PRESSES = 40
+
 
 class LocatorNotSupported(RuntimeError):
     """策略未实现或属闭源边界。"""
@@ -214,7 +219,16 @@ class Element:
         `result.warning` —— 让复核的人知道"这一步的清空不可信"。
         """
         if self.node is None:
-            raise RuntimeError("坐标定位不支持清空输入")
+            # 坐标定位（视觉兜底 / 纯视觉执行器）没有无障碍节点，三级无障碍通道都用不了，
+            # 直接走按键通道。2026-11-22 真机 A/B 实测：这里原本直接 `raise`，而 `s2_leg_b`
+            # 已经用 `clear_by_keyevents` 真清空了 —— runner 再调一次本方法就把整步判红，
+            # `gen-184020-3` / `gen-191453-3` 各 3 个 run 全卡在这一行。
+            escalator = getattr(self.drv, "clear_by_keyevents", None) if self.drv is not None else None
+            if callable(escalator) and escalator(_COORD_CLEAR_PRESSES):
+                return
+            self.note = ("坐标定位：当前平台没有按键清空通道（iOS 只有元素级 clear）"
+                         "——清空未执行，若后续输入被拼接请改断结果态")
+            return
         before, before_known = self._read_text()
         clear = getattr(self.node, "clear_text", None)
         if callable(clear):

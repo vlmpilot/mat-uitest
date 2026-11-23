@@ -26,7 +26,9 @@ import re
 import time
 from urllib.parse import urlparse
 
-import requests
+# 保留：测试用 monkeypatch.setattr("insta_engine.api_client.requests.request", ...)
+# 替换请求函数——它依赖本模块有 requests 属性；底层请求已改走 egress。
+import requests  # noqa: F401
 
 #: 请求头回显时需要打码的键名（小写比较；含子串 token/key/secret 的也打码）
 _REDACT_KEYS = {"authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -178,7 +180,7 @@ def run_api(params: dict, variables: dict[str, str]) -> dict:
     evidence 结构：method/url/status/duration_ms/passed/error/
     request{headers(打码)} / expect[{desc,passed}] / body_snippet / saved{...}
     """
-    from .offline import require_online
+    from . import egress
 
     started = time.monotonic()
     evidence: dict = {"method": "GET", "url": "", "status": None,
@@ -190,7 +192,7 @@ def run_api(params: dict, variables: dict[str, str]) -> dict:
     try:
         # 带 URL 判定：本机 mock 服务（127.0.0.1/localhost）不出网，离线模式放行。
         # 必须先替换变量再判定——`{base_url}/health` 这种写法的 host 只在替换后才可见。
-        require_online("api 步骤（HTTP 业务断言）", endpoint=url)
+        egress.check(url, "api 步骤（HTTP 业务断言）")
     except Exception as exc:
         evidence["error"] = f"{type(exc).__name__}: {exc}"
         evidence["duration_ms"] = int((time.monotonic() - started) * 1000)
@@ -219,8 +221,8 @@ def run_api(params: dict, variables: dict[str, str]) -> dict:
             # 原样进证据等于把客户系统的凭据随报告外发
             evidence["request"]["json"] = _redact_json(body)
 
-        resp = requests.request(
-            method, url,
+        resp = egress.request(
+            method, url, purpose="api 步骤（HTTP 业务断言）",
             headers=headers,
             json=body,
             timeout=max(0.1, timeout_ms / 1000),

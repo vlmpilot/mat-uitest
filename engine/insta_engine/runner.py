@@ -1202,18 +1202,18 @@ class Runner:
         before_call = None
         if self.vision_client is None:
             from . import promptstore
-            from .offline import is_loopback
+            from .offline import is_private_endpoint
 
             # 三种情形，成本归属各不相同：
             #   · 官方代理（平台出 token）：按档位限额，enforce=True；
             #   · 自带 Key（用户出 token）：只计数不拦，enforce=False；
-            #   · **端点在本机**（GEN_VL_BASE_URL 指向 127.0.0.1/::1/localhost）：
+            #   · **端点是私有端点**（本机回环 / MAT_PRIVATE_HOSTS 里的内网模型）：
             #     平台一分钱不出，就不该占平台额度，连计数也不该记——`mat status`
             #     的视觉用量只该反映「平台代付」的那部分。
             # 第三条是 2026-10-26 补的：组合「GEN_PROMPT_MODE=server + 本地兜底端点」
             # 若不特判，本地兜底会把官方视觉额度吃光，额度满后 QuotaExceeded 连
             # **本地模型**一起拒掉——恰好废掉了本地化唯一确定的收益（截图不出本机）。
-            if not is_loopback(vision.endpoint()):
+            if not is_private_endpoint(vision.endpoint()):
                 usage = UsageStore()
                 enforce = promptstore.is_server()
 

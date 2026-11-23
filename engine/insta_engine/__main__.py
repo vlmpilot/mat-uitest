@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__, suite_cmd
-from .ai_client import GenClient
+from .ai_client import GenClient, GenError
 from .credentials import CredentialStore
 from .device import list_adb_devices
 from .doctor import VISION_OPT_IN_HINT
@@ -123,7 +123,23 @@ def cmd_devices(_args) -> int:
 
 def cmd_gen(args) -> int:
     usage = UsageStore()  # 仅统计展示（P0-2：本地不再拦截生成；官方代理 429 权威 / BYOK 不限）
-    client = GenClient.from_env()
+    try:
+        from .ai_setup import ai_setup_hint, missing_env_vars
+
+        # 提交前预检（与 MCP mat_generate_case 同构）：缺配置时给出「写到哪 + 写什么 +
+        # 怎么复检」。env_path 与 main() 的加载路径（cwd/.env）一致——CLI 的「工作区」
+        # 就是当前目录；from_env 的兜底报错不带路径（它不知道 cwd 语义，猜必错）。
+        missing = missing_env_vars()
+        if missing:
+            print(ai_setup_hint(missing, env_path=str((Path.cwd() / ".env").resolve())),
+                  file=sys.stderr)
+            return 1
+        client = GenClient.from_env()
+    except GenError as exc:
+        # 报错即引导（ai_setup）：可粘贴的 .env 片段直接走 stderr，不再裸 traceback——
+        # 配置缺失是必经之路，agent 和人都只需要这一段。
+        print(str(exc), file=sys.stderr)
+        return 1
     app_info = {"package": args.package}
     controls = _controls_for(args.package)
     if controls:
@@ -2188,10 +2204,13 @@ def _server_usage() -> dict | None:
     if not base or not key:
         return None
     try:
-        import requests
+        from . import egress
 
-        resp = requests.get(f"{base}/usage",
-                            headers={_AUTH_HEADER: "Bearer " + key}, timeout=8)
+        # 统一出口：离线模式下按私有端点校验（公网拒绝、本机/内网放行），
+        # 重定向也逐跳校验。2026-11-23 修复前本函数没有任何离线检查，
+        # `mat status` 会带着 GEN_API_KEY 请求 GEN_BASE_URL/usage（已发布版本实测复现）。
+        resp = egress.get(f"{base}/usage", purpose="查询服务端用量（mat status）",
+                          headers={_AUTH_HEADER: "Bearer " + key}, timeout=8)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -2238,6 +2257,27 @@ def cmd_ai_stats(args) -> int:
             print(f"  · {reason}：{n}")
         print("  说明：文案可疑通常意味着模型没真读控件（坐标更不可信），但**未拦截**。")
     print(f"\n明细：{ai_metrics.metrics_path()}")
+    return 0
+
+
+def cmd_verify_stats(args) -> int:
+    """打印 verify 调用计量：4 周闸门里「调用 ≥100 次」这一半的本地证据。"""
+    from . import verify_usage
+
+    since = getattr(args, "since", None)
+    if since:
+        try:
+            datetime.fromisoformat(since)
+        except ValueError:
+            # 库级 summarize 对坏日期宽容回落，CLI 不能跟着静默：闸门起算日写错
+            # 会把「未达标」算成「达标」，必须当场报错。
+            print("--since 需要 YYYY-MM-DD，如 2026-10-31", file=sys.stderr)
+            return 1
+    sm = verify_usage.summarize(args.days, since=since)
+    if getattr(args, "json", False):
+        print(json.dumps(sm, ensure_ascii=False, indent=1))
+    else:
+        print(verify_usage.render(sm))
     return 0
 
 
@@ -2732,7 +2772,7 @@ def cmd_console(args) -> int:
         import secrets
         # 变量名/传参避开「口令字面量键形」的静态误判（这里是一次性访问口令，
         # 非存储凭据；拆拼处置经用户 2026-10-19 批准）
-        access_code = getattr(args, "password", None) or secrets.token_hex(4)  # 8 hex + /api/auth 失败冷却（5 次/5 分钟 ⇒ 锁 30s）
+        access_code = getattr(args, "password", None) or secrets.token_hex(16)  # 32 hex（128 bit）+ /api/auth 失败冷却（5 次/5 分钟 ⇒ 锁 30s）
         print("⚠️ 局域网分享开启：同网段内需访问口令（含运行/删改用例权限），仅限可信内网。")
         print(f"🔑 访问口令: {access_code}   （同事首次打开链接时输入一次即可）")
         urls = lan_urls(args.port)
@@ -2941,6 +2981,13 @@ def main(argv: list[str] | None = None) -> None:
         "ai-stats", help="AI 调用统计（近 N 小时：次数/失败/截断/p50/p95/token；只读本地计量）")
     _aist.add_argument("--hours", type=int, default=24, help="统计窗口（小时，默认 24）")
     _aist.set_defaults(func=cmd_ai_stats)
+    _vst = sub.add_parser(
+        "verify-stats",
+        help="verify 调用统计（近 4 周次数/按日/按判定；只读本机计量，不上传）")
+    _vst.add_argument("--days", type=int, default=28, help="统计窗口（天，默认 28）")
+    _vst.add_argument("--since", help="窗口起算日 YYYY-MM-DD（优先于 --days，用于对齐闸门）")
+    _vst.add_argument("--json", action="store_true", help="输出 JSON（agent / 脚本用）")
+    _vst.set_defaults(func=cmd_verify_stats)
     seat_p = sub.add_parser("seat", help="团队成员：本机标识 / 同步配额 / 查看现状")
     seat_sub = seat_p.add_subparsers(dest="seat_action")
     seat_sub.add_parser("id", help="打印本机标识（发给运营，用于给这台机器增加成员名额）")

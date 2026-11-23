@@ -711,9 +711,13 @@ def _server_task_text(client, task: str, variables: dict, context: str,
         payload["user_append"] = appended
     if images:
         payload["images"] = [base64.b64encode(img).decode("ascii") for img in images]
-    from .offline import require_online
-    require_online(f"{context}（任务 {task}）")
+    from . import egress
+
     url = f"{client.base_url}/mat/complete"
+    purpose = f"{context}（任务 {task}）"
+    # 私有端点（本机 / MAT_PRIVATE_HOSTS）离线放行；在重试循环外快速失败，
+    # 不等到 3 次退避跑完（2026-11-23 统一出口）。
+    egress.check(url, purpose)
     timeout = _env_int("GEN_TIMEOUT", 60)
     last_error: Exception | None = None
     call_started = time.monotonic()
@@ -733,7 +737,8 @@ def _server_task_text(client, task: str, variables: dict, context: str,
     for attempt in range(3):
         started = time.monotonic()
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            resp = egress.post(url, purpose=purpose, headers=headers, json=payload,
+                               timeout=timeout)
             if resp.status_code == 429:
                 _record_metrics(task=task, model="server", mode="server", started=started,
                                 ok=False, variables=variables, error="429 额度/限流",
@@ -778,14 +783,15 @@ class GenClient:
     @classmethod
     def from_env(cls) -> GenClient:
         from . import promptstore
+        from .ai_setup import ai_setup_hint, missing_env_vars
 
         server = promptstore.is_server()
-        missing = [name for name in ("GEN_BASE_URL", "GEN_API_KEY") if not os.environ.get(name)]
-        # server 模式下模型由服务端决定，不再要求本地配置 GEN_MODEL
-        if not server and not os.environ.get("GEN_MODEL"):
-            missing.append("GEN_MODEL")
+        # 报错即引导：缺什么 + 可粘贴的 .env 片段 + 复检方式，全部来自 ai_setup
+        # （CLI stderr / MCP error / skill 文档三处同一口径），不再让用户去翻
+        # docs/13-产品使用手册.md。server 模式下模型由服务端决定，不需要 GEN_MODEL。
+        missing = missing_env_vars()
         if missing:
-            raise GenError(f"缺少环境变量: {', '.join(missing)}（配置说明见 docs/13-产品使用手册.md）")
+            raise GenError(ai_setup_hint(missing))
         if os.environ.get("GEN_PROMPT"):
             prompt_path: Path | None = Path(os.environ["GEN_PROMPT"])
         elif server:
@@ -793,7 +799,7 @@ class GenClient:
         else:
             prompt_path = promptstore.resolve("gen") or Path("prompts/gen.prompt")
         return cls(
-            os.environ["GEN_BASE_URL"], os.environ["GEN_API_KEY"],
+            os.environ["GEN_BASE_URL"], os.environ.get("GEN_API_KEY", ""),
             os.environ.get("GEN_MODEL", ""), prompt_path,
             prompt_mode="server" if server else "local",
         )
@@ -1010,9 +1016,11 @@ class GenClient:
             payload["seed"] = _env_opt_int("GEN_SEED")
         # T59：GEN_TIMEOUT 显式设置优先；未设时用任务级自动预算（describe 大批量实测 60s 不够）
         timeout = _env_opt_int("GEN_TIMEOUT") or getattr(self, "timeout_override", None) or 60
-        from .offline import require_online
-        # 带上端点：本机端点（127.0.0.1 / localhost）不出网，离线模式放行
-        require_online(f"{context}（BYOK 端点）", endpoint=self.base_url)
+        from . import egress
+
+        purpose = f"{context}（BYOK 端点）"
+        # 私有端点（本机 / MAT_PRIVATE_HOSTS）离线放行
+        egress.check(self.base_url, purpose)
         min_interval = _env_float("MAT_REQUEST_MIN_INTERVAL", 0.0)
         # 路径兼容（2026-11-02 实测）：厂商 API 与多数本机服务是 `/chat/completions`
         # （智谱的 base 甚至是 `/api/paas/v4`），而 mlx / vlm_judge_server 这类本机
@@ -1029,11 +1037,11 @@ class GenClient:
                     if wait > 0:
                         time.sleep(wait)
                 _last_request_at[0] = time.monotonic()
-                resp = requests.post(
-                    req_url,
-                    headers={"Auth" "orization": "Bearer " + self.api_key},
-                    json=payload, timeout=timeout,
-                )
+                # 私有端点允许不配 Key（内网网关常不校验）；空 Key 时不要发空 Bearer
+                req_headers = ({"Auth" "orization": "Bearer " + self.api_key}
+                               if self.api_key else {})
+                resp = egress.post(req_url, purpose=purpose, headers=req_headers,
+                                   json=payload, timeout=timeout)
                 if resp.status_code == 404 and fallback_url and not url_switched["done"]:
                     # 只在没试过时切一次：404 基本只能是路径不对，重发同一个请求即可。
                     url_switched["done"] = True

@@ -5,7 +5,7 @@ display_name_en: Mobile App UI Testing
 description: Runs AI-assisted mobile UI tests against a connected Android device via the MAT CLI — generates test cases from natural language, executes them with screenshot-backed evidence, heals broken locators after an app update, explores an app into a page graph, and attributes failures with an LLM. Use when testing an Android app on a real device or emulator; when the user mentions UI tests, regression, smoke tests, 真机测试, 冒烟, or 移动端自动化; or when an existing mobile test case broke after a UI change.
 description_zh: 在本机 Android 真机或模拟器上跑 AI 辅助的 UI 测试：一句话生成用例、带截图证据执行、App 改版后自愈定位、遍历探索生成页面图谱，并对失败步骤做归因。
 description_en: AI-assisted UI testing on a real Android device or emulator through the mat CLI — cases from one sentence, runs with screenshot evidence, locator self-healing after an app update, exploration into a page graph, and LLM failure attribution.
-version: "0.7.16"
+version: "0.8.0"
 author: "vlmpilot"
 license: Complete terms in LICENSE.txt
 examples_zh:
@@ -98,9 +98,22 @@ Task → Is there an existing test case (cases/*.json)?
 
 **AI capability tiers** (what a fresh install can do): with **no API key** configured,
 `run` / `explore` / `index` / `heal` / `devices` / `summary` all work — execution,
-evidence, and locator self-healing are local. `gen` and `diagnose` need a key: see
-the "AI 接入" item in `mat doctor` (your own OpenAI-compatible key in the workspace
-`.env`, or the official proxy token).
+evidence, and locator self-healing are local. `gen` and `diagnose` need a model endpoint.
+
+**When AI is not configured**: `gen` / `diagnose` fail with a `缺少环境变量` message that
+itself carries a ready-to-paste `.env` snippet (both options below) plus the **absolute
+path** of the workspace `.env` to write (`mat_doctor` also returns it as `env_path`) —
+write it there, then re-run `mat doctor` ("AI 接入" item) to confirm before retrying.
+Check current state first with `mat status` (AI line) or `mat doctor`; do not guess.
+
+- **BYOK** (recommended; prompts assembled locally — content goes only to *your* endpoint,
+  never to the MAT server): `GEN_BASE_URL` + `GEN_API_KEY` + `GEN_MODEL`, any
+  OpenAI-compatible endpoint (DashScope / Zhipu / DeepSeek / OpenAI / in-house gateway).
+- **Official proxy** (no model setup): `GEN_BASE_URL=https://mobileaitest.com` +
+  `GEN_API_KEY=<proxy token>` + `GEN_PROMPT_MODE=server`. Get a proxy token from the
+  WeChat official account "Mobile AI Test". The server then assembles prompts and forwards
+  content (screenshots only when vision fallback is explicitly enabled) to its cloud model
+  provider, which retains data under its own terms. Server mode needs no `GEN_MODEL`.
 
 **Before generating cases or relying on them long-term**: run `mat index <pkg>`
 once to crawl the app into a page graph. With an index, locator renames — the

@@ -12,14 +12,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import platform
 import re
 import sys
 import threading
 from datetime import UTC, datetime
-from urllib.request import Request, urlopen
 
 from .. import __version__
 
@@ -51,9 +49,12 @@ def _upgrade_command() -> str:
 
 def _check_once() -> str:
     """查询 PyPI 最新版本号；任何网络/解析异常向上抛（调用方静默吞掉）。"""
-    req = Request(_PYPI_URL, headers={"User-Agent": f"mat-uitest/{__version__}"})
-    with urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310 —— URL 是写死的常量，无注入面
-        data = json.loads(resp.read().decode("utf-8"))
+    from .. import egress
+
+    resp = egress.get(_PYPI_URL, purpose="新版本检查",
+                      headers={"User-Agent": f"mat-uitest/{__version__}"}, timeout=_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
     return str((data.get("info") or {}).get("version") or "")
 
 

@@ -57,13 +57,16 @@ def plan_label(plan: str) -> str:
 
 # -- 权益矩阵（P0-3，2026-10-19）----------------------------------------------
 #
-# 本地核心能力对所有档开放（获客根基，永不加锁）；协作/云端/离线交付按档解锁。
+# 本地核心能力**与离线模式**对所有档开放（获客根基，永不加锁）；协作/云端按档解锁。
+# ⚠️ 离线不是私有化专属：`MAT_OFFLINE=1` 对所有档位开放，所以这里刻意**不声明**
+# `offline` 特性——此前声明过，但全仓没有任何门控调用，读代码的人会误以为「离线要
+# 私有化档」（2026-11-23 外部评审 P2-21）。
 # 单一事实源在本模块；`entitlements.py` 只做读取与门控封装。
 FEATURE_CORE = frozenset({
     "run", "gen", "heal", "report", "api_assert", "promote", "maestro_import",
 })
 FEATURE_TEAM = FEATURE_CORE | {"team_share", "report_share", "audit_log"}
-FEATURE_PRIVATE = FEATURE_TEAM | {"private_deploy", "offline"}
+FEATURE_PRIVATE = FEATURE_TEAM | {"private_deploy"}
 
 
 def plan_features(plan: str) -> frozenset:

@@ -418,7 +418,9 @@ def run_verify(root: Path, case_path: Path, *, serial: str | None = None,
     刻意复用 `cmd_run` 的**同一批**私有辅助（连设备、前置条件判据）：验证与执行必须是
     同一套语义，否则 agent 会看到「run 说环境错、verify 说定位失败」这种互相矛盾的结果。
 
-    落盘放在这个薄壳里而不是每个 `return` 前面：函数有 8 个出口，逐个加必然漏。
+    落盘与调用计量放在这个薄壳里而不是每个 `return` 前面：函数有 8 个出口，
+    逐个加必然漏。计量只记元数据（时间 / 判定 / 退出码），不记用例内容，
+    也不上传（见 `verify_usage`）——CLI 单条、CLI 批量、MCP 单条都走这里。
     """
     code, verdict = _run_verify(root, case_path, serial=serial, platform=platform,
                                 artifacts=artifacts, allow_unmet=allow_unmet,
@@ -426,6 +428,9 @@ def run_verify(root: Path, case_path: Path, *, serial: str | None = None,
                                 apk=apk, package=package, reinstall=reinstall,
                                 execute_timeout_s=execute_timeout_s)
     _persist_verdict(verdict)
+    from . import verify_usage
+
+    verify_usage.record(verdict, code)
     return code, verdict
 
 

@@ -194,6 +194,20 @@ def test_post_api_blocked_without_key(locked_server):
     assert r.status_code == 401
 
 
+def test_auth_rejects_oversized_body(locked_server):
+    """鉴权口也不能无界读 body：与其余端点同款 413，且客户端不吃到连接重置。
+
+    /api/auth 在通用限长分支之前就 return，此前是唯一绕过 MAX_BODY_BYTES 的路径。
+    body 刻意给到 8MB（同 test_web_api.py 的 flaky 说明）：稳定超过 socket 缓冲，
+    服务端不先读掉就必然让客户端吃到 RST。
+    """
+    base, _ = locked_server
+    web_server.ConsoleHandler._AUTH_FAILS.clear()
+    big = {"key": "a1b2c3", "padding": "x" * 8_000_000}
+    r = requests.post(f"{base}/api/auth", json=big, timeout=30)
+    assert r.status_code == 413
+
+
 # -- 触发者身份 -----------------------------------------------------------------------
 
 def test_jobs_return_operator(open_server, tmp_path):

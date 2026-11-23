@@ -64,16 +64,18 @@ class Check:
 
 
 def _local_endpoint_down(endpoint: str) -> bool | None:
-    """本机端点**没在监听**？True=连不上 / False=能连 / None=不在本机或无法解析。
+    """私有端点**没在监听**？True=连不上 / False=能连 / None=不是私有端点或无法解析。
 
     只给诊断提示用，不参与执行：超时 0.3s，宁可判"未知"也不拖住配置台整页检测
     （纪律见模块头：进页面自动检测，任何探测挂死都会拖住整页）。
     """
     from urllib.parse import urlsplit
 
-    from .offline import is_loopback
+    from .offline import is_private_endpoint
 
-    if not is_loopback(endpoint):
+    # 只探私有端点（本机 / MAT_PRIVATE_HOSTS）：公网端点的连通性不该由 doctor
+    # 主动去建连（既是出网，也会拖住整页检测）。
+    if not is_private_endpoint(endpoint):
         return None
     try:
         parts = urlsplit(endpoint if "://" in endpoint else "//" + endpoint)
@@ -286,6 +288,46 @@ def _prompt_is_template_copy(name: str, resolved: Path) -> bool:
         return False
 
 
+def offline_check() -> Check:
+    """离线模式与私有端点（2026-11-23）：让「离线开没开、放行谁」在体检里可见。
+
+    `ok=False` 只表示「声明有写法问题、被忽略了」，不阻塞执行（离线本身是合法状态）。
+    追加在 `android_checks()` 末尾而不是开头：CLI 的退出码只看前 4 项
+    （`cmd_doctor` 的 critical 计算），插到前面会改变既有语义。
+    """
+    from .offline import ENV_PRIVATE_HOSTS, is_offline, private_hosts
+
+    if not is_offline():
+        return Check(
+            id="offline", label="离线模式(关)", ok=True,
+            detail=f"需要「内容不出网」时设 MAT_OFFLINE=1；内网端点用 {ENV_PRIVATE_HOSTS} 声明",
+        )
+    ph = private_hosts()
+    entries = ph.describe()
+    problems = list(ph.invalid) + list(ph.rejected)
+    if problems:
+        listed = "；".join(f"{item}（{reason}）" for item, reason in problems[:3])
+        more = f"等 {len(problems)} 条" if len(problems) > 3 else ""
+        return Check(
+            id="offline", label="离线模式(开) · 私有端点声明有问题", ok=False,
+            detail=f"已忽略{more}：{listed}",
+            hint=f"{ENV_PRIVATE_HOSTS} 只写主机名/IP/网段"
+                 "（如 10.0.0.0/8,gpu-gw.corp.local,.corp.local）；"
+                 "不要协议/端口/通配符，0.0.0.0/0 等于关闭离线模式",
+        )
+    if not entries:
+        return Check(
+            id="offline", label="离线模式(开)", ok=True,
+            detail="只允许本机回环；内网模型/业务接口/webhook/内网服务端需加 "
+                   f"{ENV_PRIVATE_HOSTS}",
+        )
+    shown = "，".join(entries[:4]) + ("…" if len(entries) > 4 else "")
+    return Check(
+        id="offline", label=f"离线模式(开) · 私有端点 {len(entries)} 条", ok=True,
+        detail=f"放行：{shown}",
+    )
+
+
 def android_checks() -> list[Check]:
     checks: list[Check] = []
 
@@ -440,14 +482,14 @@ def android_checks() -> list[Check]:
     # 步骤级 onFailure: heal 是改用例不是改配置）；全局授权=ok。模型名不上 UI（发起人 2026-10-12）。
     # 提示按模式分类（发起人 2026-10-14）：官方代理模式下视觉模型由服务端决定，
     # 本地不需要 GEN_VL_MODEL——照抄「加 GEN_VL_MODEL」配了也不生效，必须分开说。
-    from .offline import is_loopback
+    from .offline import is_private_endpoint
     from .vision import endpoint
 
     vl = os.environ.get("GEN_VL_MODEL")
-    # 端点在本机时模型名必须由本地给（本机服务不会替我们选模型）——对齐
-    # `vision.enabled()`；官方代理的「模型服务端决定」在本机端点上不成立。
+    # 端点是私有端点（本机 / 内网模型）时模型名必须由本地给——对齐
+    # `vision.enabled()`；官方代理的「模型服务端决定」在这里不成立。
     vl_ep = endpoint()
-    vl_local = is_loopback(vl_ep)
+    vl_local = is_private_endpoint(vl_ep)
     vl_usable = bool(vl and gen_ok) if (vl_local or not server_mode) else gen_ok
     vl_authorized = os.environ.get("GEN_VL_FALLBACK") == "1"
     # 「已启用」只说明配置齐了。端点在本机而服务没起时，每次定位失败都是 ConnectionError
@@ -491,6 +533,7 @@ def android_checks() -> list[Check]:
 
     # scrcpy 独立投屏检测暂时下架（发起人 2026-10-12）：可选能力易被误读为缺失告警；
     # 浏览器内投屏不依赖它。ACTIONS 里的 install-scrcpy 保留，需要时再恢复卡片。
+    checks.append(offline_check())
     return checks
 
 
@@ -726,7 +769,8 @@ def run(platform: str = "all") -> list[Check]:
     if platform == "android":
         return android_checks()
     if platform == "ios":
-        return ios_checks()
+        return [offline_check()] + ios_checks()
     if platform == "harmony":
-        return harmony_checks()
+        return [offline_check()] + harmony_checks()
+    # android_checks() 已含 offline_check()，全平台聚合时不重复
     return android_checks() + ios_checks() + harmony_checks()

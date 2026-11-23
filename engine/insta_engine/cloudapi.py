@@ -40,23 +40,27 @@ def cloud_url() -> str:
 
 def request(method: str, path: str, payload: dict | None = None,
             bearer: str | None = None) -> dict:
-    from .offline import is_offline
-
-    if is_offline():
-        # P0-4：离线模式在**发起请求前**拒绝——不等超时，也不产生半个网络包。
-        raise CloudError(
-            "离线模式（MAT_OFFLINE=1）：此步骤需要联网，已按离线策略拒绝；"
-            "本地执行/回放/自愈/报告不受影响。")
-    import requests
+    from . import egress
+    from .offline import OfflineError
 
     url = f"{cloud_url()}{path}"
+    purpose = f"轻云 {method} {path}"
+    try:
+        # 私有端点（本机 / MAT_PRIVATE_HOSTS）离线放行；公网仍按离线策略拒绝。
+        # 在发起请求前快速失败，不等超时、不产生半个网络包。
+        egress.check(url, purpose)
+    except OfflineError as exc:
+        raise CloudError(str(exc)) from exc
     headers = {"Content-Type": "application/json"}
     if bearer:
         # 头名运行时拼装：避免「鉴权头冒号运行时值」的静态形态被安全扫描误判
         # （源码本无密钥；拆拼处置经用户 2026-10-19 批准，同 invite.py 的 secret 先例）
         headers["Auth" "orization"] = "Bearer " + bearer
     try:
-        resp = requests.request(method, url, json=payload, headers=headers, timeout=_TIMEOUT)
+        resp = egress.request(method, url, purpose=purpose, json=payload,
+                              headers=headers, timeout=_TIMEOUT)
+    except OfflineError as exc:   # 重定向跳到了非私有主机
+        raise CloudError(str(exc)) from exc
     except Exception as exc:      # requests 的异常层次很杂，一律转成可行动的一句话
         raise CloudError(
             f"连不上轻云（{url}）—— 这一步需要联网：{type(exc).__name__}。"

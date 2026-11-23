@@ -15,7 +15,7 @@
 
 | 层 | 判据 | 能证明什么 |
 |---|---|---|
-| `strong` | `not-exists` / `text`(等于/包含) / `selected` / `enabled` / `disabled` / `count` | 业务结果对错 |
+| `strong` | `not-exists` / `text`(等于/包含) / `selected` / `enabled` / `disabled`（以 `dsl.AssertionType` 的 8 种为准） | 业务结果对错 |
 | `exists` | `exists` 且目标是**别的**控件（页面内容/独有入口） | 某个控件在（可能是页面骨架）|
 | `skeleton` | `exists` 且目标是**页面骨架**（排序/筛选栏、搜索框、导航 tab、页面标题） | **只能证明"到了某页"**：搜什么词、提交成没成功，它都在 |
 | `tautology` | `exists` 且目标就是**本步刚操作的那个**控件（R23） | **什么都不能**：能点到它就说明它在 |

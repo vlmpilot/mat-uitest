@@ -109,13 +109,16 @@ def prepare_image(screenshot_png: bytes) -> tuple[bytes, dict]:
 
 
 def enabled() -> bool:
-    if not os.environ.get("GEN_API_KEY"):
-        return False
     from . import promptstore
-    from .offline import is_loopback
+    from .offline import is_private_endpoint
 
-    if is_loopback(endpoint()):
-        # 端点在本机：模型名必须由本地配置给（本机服务不会替我们选模型），
+    private = is_private_endpoint(endpoint())
+    # 私有端点（本机 / MAT_PRIVATE_HOSTS）常是内网网关，可能不校验 Key：不强制要求。
+    # 公网端点（官方代理由服务端校验、BYOK 由厂商校验）仍要 Key。
+    if not private and not os.environ.get("GEN_API_KEY"):
+        return False
+    if private:
+        # 私有端点的模型名必须由本地配置给（本机/内网服务不会替我们选模型），
         # 所以 `GEN_PROMPT_MODE=server` 的"模型服务端决定"在这里不成立。
         return bool(os.environ.get("GEN_VL_MODEL"))
     if promptstore.is_server():  # 服务端决定 VL 模型，本地无需 GEN_VL_MODEL
@@ -139,24 +142,26 @@ def endpoint() -> str:
 def default_client():
     from . import promptstore
     from .ai_client import GenClient
-    from .offline import is_loopback
+    from .offline import is_private_endpoint
 
     # 端点可单独指定（`GEN_VL_BASE_URL`）：`GEN_BASE_URL` 是全局单值，没有这个开关，
     # 「生成走云端、视觉兜底走本地小模型」这种最常见的混合部署就表达不出来——
     # 只能两个都本地（生成质量掉）或两个都云端（截图出本机）。缺省仍回落全局值，
     # 只配 GEN_BASE_URL 的老配置行为不变。
     base_url = endpoint()
-    # 🔴 端点在本机 ⇒ **强制走 OpenAI 兼容协议 + 本地 prompt**，与 `GEN_PROMPT_MODE` 无关。
+    # 🔴 端点是私有端点（本机 / MAT_PRIVATE_HOSTS）⇒ **强制走 OpenAI 兼容协议 + 本地 prompt**，
+    # 与 `GEN_PROMPT_MODE` 无关。内网 GPU 机与本机同语义：它们都只提供 OpenAI 兼容端点，
+    # 走官方代理的私有协议会固定 404（2026-10-26 本机、2026-11-23 内网同一类 bug）。
     # `GEN_PROMPT_MODE=server` 的原意是「生成任务的 prompt 由服务端下发」，对视觉兜底
     # 唯一合理的影响是"模型由服务端选"；但 prompt_mode 一旦跟着变 server，请求就会发到
     # `{base_url}/mat/complete`（MAT 私有代理协议）——本机小模型服务（mlx-vlm / ollama /
     # LM Studio）只有 OpenAI 兼容端点，没有这个路径，于是固定 404、兜底一次也调不出去。
     # 2026-10-26 实测：`GEN_PROMPT_MODE=server` + `GEN_VL_BASE_URL=127.0.0.1:8915` 时
     # 客户端 prompt_mode 仍是 server（POST /v1/mat/complete ⇒ 404）。
-    local = is_loopback(base_url)
+    local = is_private_endpoint(base_url)
     server = promptstore.is_server() and not local
     return GenClient(
-        base_url, os.environ["GEN_API_KEY"],
+        base_url, os.environ.get("GEN_API_KEY", ""),
         os.environ.get("GEN_VL_MODEL", ""),
         None if server else Path("prompts/vision-locate.prompt"),
         prompt_mode="server" if server else "local",

@@ -327,12 +327,19 @@ def test_set_text_skips_verification_for_password_fields():
     assert drv.fallback_calls == [] and element.note is None
 
 
-def test_clear_text_raises_on_point_locator():
-    """坐标定位没有可清空的节点 —— 必须报错而不是静默空操作。"""
+def test_clear_text_on_point_locator_never_silently_succeeds():
+    """坐标定位没有可清空的节点 —— 但**也不能静默空操作**。
+
+    旧实现直接 `raise RuntimeError`，本意是防静默空操作，实际把「按键已经清空」
+    也判死（2026-11-22 真机 A/B：`gen-184020-3` / `gen-191453-3` 各 3 个 run）。
+    新契约：有按键通道就真清空（见下一条测试）；没有通道（无 drv / iOS）必须留
+    `note`，由 runner 落 `result.warning` —— 判据从「抛不抛」换成「有没有交代」。
+    """
     from insta_engine.locator import Element
 
-    with pytest.raises(RuntimeError, match="坐标定位"):
-        Element(strategy="point", value="100,200", point=(100, 200)).clear_text()
+    element = Element(strategy="point", value="100,200", point=(100, 200))
+    element.clear_text()  # 不抛
+    assert element.note, "没有按键通道时不能静默返回——必须留下不可信标记"
 
 
 # -- 5. 输入/清空的**后置校验**（2026-10-27 假绿根因） -------------------------------
@@ -494,3 +501,61 @@ def test_clear_text_records_note_when_nothing_clears():
     element = Element(strategy="text→contains", value="搜索,", node=_Frozen(), drv=_Drv())
     element.clear_text()  # 不抛
     assert element.note and "清空后回读仍为" in element.note
+
+
+# -- 5. 坐标定位的清空：不能抛，走按键通道（2026-11-22 真机 A/B 实测） ----------------
+
+
+def test_clear_text_coordinate_uses_key_events():
+    """坐标定位（视觉兜底 / 纯视觉执行器）没有 node，必须走按键通道而不是抛异常。
+
+    2026-11-22 真机 A/B 现场：`s2_leg_b` 已用 `clear_by_keyevents` 真清空，runner 随后调
+    `clear_text()`，旧实现第一行 `if self.node is None: raise RuntimeError` 把整步判红
+    —— `gen-184020-3` / `gen-191453-3` 各 3 个 run 全卡在这（6/11 个失败 run）。
+    """
+    from insta_engine.locator import Element
+
+    class _Drv:
+        platform = "android"
+
+        def __init__(self):
+            self.calls: list[int] = []
+
+        def clear_by_keyevents(self, count):
+            self.calls.append(count)
+            return True
+
+    drv = _Drv()
+    element = Element(strategy="vision-llm", value="(405,271)", point=(405, 271), drv=drv)
+    element.clear_text()  # 不抛
+    assert drv.calls == [40], "坐标定位必须走按键通道，且给足 DEL 余量"
+    assert element.note is None, "按键通道成功时不该留不可信标记"
+
+
+def test_clear_text_coordinate_without_key_channel_records_note():
+    """iOS 没有按键通道（`clear_by_keyevents` 返回 False）⇒ 记 note，不抛。
+
+    抛异常会让「视觉兜底 + clear 步」在 iOS 上必然红；记 note 则交给 runner 落
+    `result.warning`，让复核的人知道这一步的清空不可信。这与本方法既有的
+    「三级都不变时记 note」是同一套判据。
+    """
+    from insta_engine.locator import Element
+
+    class _IosDrv:
+        platform = "ios"
+
+        def clear_by_keyevents(self, _count):
+            return False
+
+    element = Element(strategy="vision-llm", value="(405,271)", point=(405, 271), drv=_IosDrv())
+    element.clear_text()  # 不抛
+    assert element.note and "按键清空通道" in element.note
+
+
+def test_clear_text_coordinate_without_driver_records_note():
+    """连 drv 都没有（纯坐标、无设备句柄）⇒ 记 note，不抛。"""
+    from insta_engine.locator import Element
+
+    element = Element(strategy="vision-llm", value="(1,1)", point=(1, 1))
+    element.clear_text()  # 不抛
+    assert element.note and "按键清空通道" in element.note

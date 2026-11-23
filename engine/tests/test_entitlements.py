@@ -59,13 +59,25 @@ def test_v2_team_unlocks_team_features(tmp_path, monkeypatch):
         entitlements.require("private_deploy")
 
 
-def test_v2_private_unlocks_offline(tmp_path, monkeypatch):
+def test_v2_private_unlocks_private_deploy(tmp_path, monkeypatch):
     monkeypatch.setenv("INSTA_HOME", str(tmp_path))
     _issue_v2(tmp_path, monkeypatch, "private", FEATURE_PRIVATE, 10)
 
     ent = entitlements.current()
     assert ent.plan == "private" and ent.features == FEATURE_PRIVATE
     entitlements.require("private_deploy")
-    entitlements.require("offline")
     with pytest.raises(entitlements.EntitlementError):
         entitlements.require("nonexistent_feature")
+
+
+def test_offline_is_not_license_gated():
+    """离线是环境变量能力（`MAT_OFFLINE=1`），对所有档开放，不在授权矩阵里声明。
+
+    2026-11-23 外部评审 P2-21：此前 `FEATURE_PRIVATE` 声明了 `offline`，但全仓
+    没有任何门控调用——读代码的人会误以为「离线要私有化档」，而实际所有档都能用。
+    """
+    from insta_engine import licensing
+
+    assert "offline" not in licensing.FEATURE_PRIVATE
+    assert "offline" not in licensing.FEATURE_TEAM
+    assert "offline" not in licensing.FEATURE_CORE

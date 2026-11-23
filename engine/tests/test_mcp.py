@@ -241,6 +241,7 @@ def test_mat_doctor_returns_structured_checks(tmp_path, monkeypatch):
     assert {c["id"] for c in out["blocking"]} <= ids
     assert {c["id"] for c in out["warnings"]} <= ids
     assert out["ok"] is (not out["blocking"])
+    assert out["env_path"] == str(tmp_path / ".env"), "结构化返回必须带 .env 绝对路径（AI 修复目标）"
 
 
 def test_mat_doctor_rejects_unknown_platform(tmp_path, monkeypatch):
@@ -322,3 +323,18 @@ def test_mat_verify_needs_exactly_one_mode(tmp_path, monkeypatch):
     assert "error" in tool.fn(case="a.json", subset="smoke")
     assert "error" in tool.fn()
     assert "package" in tool.fn(subset="smoke")["error"]
+
+
+def test_mat_generate_case_fails_fast_without_env(tmp_path, monkeypatch):
+    """AI 未配置时提交前就给可执行引导，而不是让 agent 等后台 job 失败再查一次。"""
+    pytest.importorskip("mcp")
+    for key in ("GEN_BASE_URL", "GEN_API_KEY", "GEN_MODEL", "GEN_PROMPT_MODE"):
+        monkeypatch.delenv(key, raising=False)
+    tool = build_server(tmp_path)._tool_manager.get_tool("mat_generate_case")
+
+    result = tool.fn(nl="打开设置页", package="com.example.app")
+    assert "error" in result
+    assert "GEN_PROMPT_MODE=server" in result["error"], "必须自带官方代理的可粘贴片段"
+    assert "mat doctor" in result["error"], "必须告诉 agent 配完怎么复检"
+    assert "缺少环境变量: " in result["error"], "缺哪些键要一眼可见"
+    assert str(tmp_path / ".env") in result["error"], "必须点名写到哪个文件——agent 不该靠猜"

@@ -589,6 +589,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                                 f"请 {int(cooldown) + 1} 秒后重试",
                                                 "auth": True})
                 length = int(self.headers.get("Content-Length") or 0)
+                if length > MAX_BODY_BYTES:
+                    # 鉴权口在通用限长分支之前就 return，是唯一绕过去的写端点。
+                    # 与下方 do_POST 通用分支同款：先有界读掉再回 413，否则客户端
+                    # 写 body 时吃到 RST，看到的是连接重置而不是干净的 413。
+                    self.close_connection = True
+                    remaining = min(length, _DRAIN_LIMIT)
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                    return self._json(413, {"error": "body too large"})
                 body = json.loads(self.rfile.read(length) or b"{}") if length else {}
                 given = str(body.get("key") or "")
                 if key is not None and hmac.compare_digest(given, key):

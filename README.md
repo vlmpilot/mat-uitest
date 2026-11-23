@@ -46,6 +46,11 @@ mat run cases/example-settings.json   # 跑通第一条用例
 > 设备信任证书、在 Xcode 里 ⌘U 一次），然后 `mat run --platform ios --serial <udid>`。
 > 真机限制：仅 USB、须保持解锁且自动锁定设为「永不」、免费证书 7 天过期、不支持录屏；
 > `index` / `explore` / `arrival` 在 iOS 上明确拦截。
+>
+> **鸿蒙（beta）**：`mat run --platform harmony`，`index` / `explore` 同样支持（要求 `hdc`
+> 在 PATH，控件树走 `uitest dumpLayout`）。当前边界：不支持 xpath 定位（请用 text / res-id）、
+> 不采集 hilog 日志、不支持录屏与最近任务；`index` / `explore` 里少数 Android 专属路径
+> （自动拉起、崩溃检测）在鸿蒙上可能不可用，探索结果仅作参考。
 
 ### 接入 AI
 
@@ -118,7 +123,7 @@ GEN_PROMPT_MODE=server
 ## AI 编程助手接入
 
 - **skill**（教助手何时跑用例、何时探索、怎么读结果）：`mat skill install` —— 把随包的 `mobileapp-testing` 装进 AI 助手的 skill 目录（默认 `~/.claude/skills/`；WorkBuddy 用 `--target workbuddy`，其他助手用 `--dir <目录>`）；`mat skill path` 打印包内位置供手动复制。装完开新会话才会加载。助手不能执行终端命令时，从 [mat-skill](https://github.com/vlmpilot/mat-skill) 取 `mobileapp-testing/` 目录直接导入（手动拷贝的副本不会自动更新）
-- **MCP**（让 Cursor / Codex / WorkBuddy 等直接驱动 `mat`）：装带 `[mcp]` extra 的包，再一条命令注册进助手
+- **MCP**（让 Cursor / Trae / Claude Desktop / WorkBuddy 直接驱动 `mat`）：装带 `[mcp]` extra 的包，再一条命令注册进助手
   - Windows：`py -m pip install --user "mat-uitest[mcp]"`
   - macOS / Linux：`uv tool install 'mat-uitest[mcp]'`（已装过普通版再跑这条即可带上 MCP 依赖；pipx 用户等价写法 `pipx install 'mat-uitest[mcp]'`）
   - 注册：`mat mcp install` —— **不用说你用的是哪个助手**，它自己检测本机装的是 Cursor / Trae / Claude Desktop / WorkBuddy，写进对应配置并告诉你写到了哪、旧文件备份在哪、怎么撤销（`mat mcp uninstall`）。装了多个会列出可选的 `--target`；一个都没检测到说明客户端还没装或没启动过

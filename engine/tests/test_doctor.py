@@ -80,8 +80,9 @@ def test_run_merges_groups():
                                       + len(doctor.ios_checks())
                                       + len(doctor.harmony_checks()))
     assert len(doctor.run("android")) == len(doctor.android_checks())
-    assert len(doctor.run("ios")) == len(doctor.ios_checks())
-    assert len(doctor.run("harmony")) == len(doctor.harmony_checks())
+    # 离线/私有端点是主机级配置：iOS / 鸿蒙组各补一条；all 不重复（android 已含）
+    assert len(doctor.run("ios")) == len(doctor.ios_checks()) + 1
+    assert len(doctor.run("harmony")) == len(doctor.harmony_checks()) + 1
 
 
 def test_wda_server_downgrades_without_lib(monkeypatch):
@@ -232,3 +233,39 @@ def test_account_not_blocking_when_signed_runner(monkeypatch):
 
     row = {c.id: c for c in doctor.ios_checks()}["xcode-account"]
     assert row.fix is None and row.ok is True
+
+
+# -- 离线模式 / 私有端点（2026-11-23） -----------------------------------------
+
+
+def test_offline_check_reports_disabled(monkeypatch):
+    monkeypatch.delenv("MAT_OFFLINE", raising=False)
+    c = doctor.offline_check()
+    assert c.ok and "关" in c.label
+    assert "MAT_PRIVATE_HOSTS" in c.detail
+
+
+def test_offline_check_lists_private_hosts(monkeypatch):
+    monkeypatch.setenv("MAT_OFFLINE", "1")
+    monkeypatch.setenv("MAT_PRIVATE_HOSTS", "10.0.0.0/8,gpu-gw.corp.local")
+    c = doctor.offline_check()
+    assert c.ok
+    assert "私有端点 2 条" in c.label
+    assert "10.0.0.0/8" in c.detail
+
+
+def test_offline_check_warns_on_bad_private_hosts(monkeypatch):
+    """写错的声明必须被发现——否则用户以为放行了、实际被静默忽略。"""
+    monkeypatch.setenv("MAT_OFFLINE", "1")
+    monkeypatch.setenv("MAT_PRIVATE_HOSTS", "0.0.0.0/0,*.corp")
+    c = doctor.offline_check()
+    assert not c.ok and c.status == "warn"
+    assert "已忽略" in c.detail
+    assert "0.0.0.0/0" in c.detail
+
+
+def test_offline_check_appears_once_in_every_platform(monkeypatch):
+    monkeypatch.setenv("MAT_OFFLINE", "1")
+    for platform in ("android", "ios", "harmony", "all"):
+        ids = [c.id for c in doctor.run(platform)]
+        assert ids.count("offline") == 1, f"{platform}: {ids}"

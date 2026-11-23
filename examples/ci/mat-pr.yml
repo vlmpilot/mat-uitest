@@ -23,20 +23,19 @@ jobs:
           cases-dir: cases              # 你的用例目录（MAT DSL JSON）
           artifact-name: mat-report-${{ github.event.pull_request.number }}
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mat-report
-          path: artifacts/run/
-
       - name: PR 评论（测试结果 + 报告链接）
         if: always()
         uses: actions/github-script@v7
+        env:
+          ARTIFACT_NAME: ${{ steps.mat.outputs.artifact-name }}
         with:
           script: |
             const fs = require('fs');
-            const summary = fs.readFileSync('pr-summary.md', 'utf8');
+            const summary = fs.existsSync('pr-summary.md')
+              ? fs.readFileSync('pr-summary.md', 'utf8')
+              : '本次运行未生成摘要，请看本次 run 的日志。';
             const body = summary + '\n\n📄 报告 artifact：' +
-              '${{ steps.mat.outputs.artifact-name }}（在本次 run 的 Artifacts 区下载）';
+              (process.env.ARTIFACT_NAME || 'mat-report') + '（在本次 run 的 Artifacts 区下载）';
             if (context.issue.number) {
               await github.rest.issues.createComment({
                 ...context.repo, issue_number: context.issue.number, body,

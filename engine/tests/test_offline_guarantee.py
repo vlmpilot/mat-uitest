@@ -5,24 +5,47 @@ from __future__ import annotations
 import socket
 
 import pytest
+from test_v1 import FakeDriver  # noqa: E402
 
-from insta_engine.dsl import TestCase
+# 预热导入：urllib3 在 import 时会做 IPv6 能力探测（`socket(AF_INET6)` + bind，
+# 不 connect），那是本地探测不是出网。若等守卫生效后再 import，会被误判成出网。
+from insta_engine.__main__ import cmd_status  # noqa: E402
+from insta_engine.dsl import TestCase  # noqa: E402
+from insta_engine.runner import Runner  # noqa: E402
+
+_ATTEMPTS: list[tuple] = []
 
 
-class _Boom:
-    """任何 socket 构造都让测试失败——零出网断言的核心（比 patch connect 更严）。"""
+class _NetworkAccessed(BaseException):
+    """离线模式下发生了 socket 构造。
 
-    def __init__(self, *a, **k):
-        raise AssertionError("离线模式下发生了 socket 连接（run 路径出网）")
+    刻意继承 `BaseException` 而不是 `AssertionError`：业务代码里有多处
+    `except Exception`（`__main__._server_usage` 就是），`AssertionError` 会被
+    它们一起吞掉——测试看起来"通过"，出网却已经发生（2026-11-23 实测）。
+    """
 
 
-def test_run_makes_no_network_calls(tmp_path, monkeypatch):
-    from test_v1 import FakeDriver  # 复用既有最小设备桩
+def _guard_socket(*a, **k):
+    _ATTEMPTS.append(a)
+    raise _NetworkAccessed(f"离线模式下发生了 socket 连接：{a[:2]}")
 
-    from insta_engine.runner import Runner
 
+@pytest.fixture
+def zero_egress(monkeypatch):
+    """零出网守卫：记录每次 socket 构造，用例结束时断言记录为空。
+
+    用 fixture 而不是每条测试自己 patch：patch 与断言必须成对出现，漏掉断言
+    就等于把"允许出网"写进了测试。
+    """
+    _ATTEMPTS.clear()
+    monkeypatch.setattr(socket, "socket", _guard_socket)
+    yield
+    assert not _ATTEMPTS, (
+        f"离线模式下发生了 {len(_ATTEMPTS)} 次 socket 构造：{_ATTEMPTS[:3]}")
+
+
+def test_run_makes_no_network_calls(zero_egress, tmp_path, monkeypatch):
     monkeypatch.setenv("MAT_OFFLINE", "1")
-    monkeypatch.setattr(socket, "socket", _Boom)
     monkeypatch.setattr("insta_engine.adb.logcat_clear", lambda *a, **k: True)
     monkeypatch.setattr("insta_engine.adb.logcat_tail", lambda *a, **k: "")
     case = TestCase.model_validate({
@@ -36,6 +59,22 @@ def test_run_makes_no_network_calls(tmp_path, monkeypatch):
     })
     run = Runner(FakeDriver(), tmp_path).run(case)
     assert run.status == "passed", [(s.step_id, s.status, s.error) for s in run.steps]
+
+
+def test_status_makes_no_network_calls_offline(tmp_path, monkeypatch, zero_egress):
+    """`mat status` 也必须零出网——此前 `_server_usage` 没有任何离线检查。
+
+    2026-11-23 修复前实测：本机假代理在 `MAT_OFFLINE=1` 下收到了 `GET /usage`，
+    请求头带 `GEN_API_KEY`。旧测试桩抛 `AssertionError`，被该函数的
+    `except Exception` 吞掉，所以即使补测试也抓不到。
+    """
+    monkeypatch.setenv("INSTA_HOME", str(tmp_path))
+    monkeypatch.setenv("MAT_OFFLINE", "1")
+    monkeypatch.setenv("GEN_PROMPT_MODE", "server")
+    monkeypatch.setenv("GEN_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv("GEN_API_KEY", "k")
+    monkeypatch.delenv("MAT_ROUTE", raising=False)
+    assert cmd_status(None) == 0
 
 
 def test_offline_blocks_generation_fast(monkeypatch):

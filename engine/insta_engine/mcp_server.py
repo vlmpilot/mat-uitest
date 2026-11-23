@@ -82,6 +82,8 @@ def build_server(root: Path):
         - `blocking[]` / `warnings[]`：按状态分好的子集，`hint` 就是**下一步该做什么**；
         - `duration_ms`：这次探测花了多久（所有探测都有超时，不会挂死）。
         常见阻塞：adb 不在 PATH、没有设备、AI 配置缺失、用例质量闸不通过。
+        返回顶层带 `env_path`（工作区 `.env` 绝对路径）——AI 配置类阻塞的修复目标
+        就是这个文件（不存在可自建），agent 直接写文件即可，不用猜位置。
 
         ⚠️ `platform` 拼错**不会**报错兜底成 android，而是直接返回 `error`：
         `doctor.run()` 对未知取值一律返回**全平台**检查（`doctor.py:696`），
@@ -101,7 +103,8 @@ def build_server(root: Path):
         return {"ok": not blocking, "platform": plat,
                 "blocking": blocking, "warnings": warnings,
                 "checks": checks, "ran_at": obj.get("ran_at"),
-                "duration_ms": obj.get("duration_ms")}
+                "duration_ms": obj.get("duration_ms"),
+                "env_path": str(root / ".env")}
 
     @mcp.tool()
     def mat_cred(action: str = "list", name: str | None = None,
@@ -156,7 +159,17 @@ def build_server(root: Path):
 
         建议先对被测 App 执行过 mat index/explore（有页面图谱时生成更准）。
         返回 job_id，用 mat_job 查进度与结果文件名。
+        AI 未配置时**不提交任务**，直接返回 error + 可粘贴的 .env 片段（两种接入方式），
+        并给出本工作区 `.env` 的绝对路径（`env_path` 字段同理）。
         """
+        from .ai_setup import ai_setup_hint, missing_env_vars
+
+        missing = missing_env_vars()
+        if missing:
+            # 提交前预检：否则配置错误藏在后台 job 里，agent 要再查一次 mat_job 才
+            # 发现是配置问题。生成是此工具的唯一目的，缺配置时立即给最短反馈路径；
+            # 带上 env_path 绝对路径，agent 用自己的文件工具直接写，不用猜位置。
+            return {"error": ai_setup_hint(missing, env_path=str(root / ".env"))}
         code, obj = ws.api_gen(root, {"nl": nl, "package": package})
         return obj if code == 200 else {"error": obj}
 

@@ -19,13 +19,17 @@ inputs:
     description: "报告 artifact 名称"
     required: false
     default: "mat-report"
+  version:
+    description: "mat-uitest 版本（钉死，避免 action 行为随发行版漂移）"
+    required: false
+    default: "0.8.0"
 outputs:
   junit-xml:
     description: "JUnit XML 路径"
-    value: ${{ steps.run.outputs.junit }}
+    value: ${{ steps.summary.outputs.junit }}
   report-dir:
     description: "报告产物目录（含自包含 HTML 报告）"
-    value: ${{ steps.run.outputs.report }}
+    value: ${{ steps.summary.outputs.report }}
   passed:
     description: "通过的用例数"
     value: ${{ steps.summary.outputs.passed }}
@@ -35,6 +39,9 @@ outputs:
   summary:
     description: "PR 评论 Markdown 文件"
     value: ${{ steps.summary.outputs.summary }}
+  artifact-name:
+    description: "本次上传的报告 artifact 名称"
+    value: ${{ inputs.artifact-name }}
 runs:
   using: "composite"
   steps:
@@ -42,33 +49,58 @@ runs:
       with:
         python-version: "3.12"
     - name: 安装 MAT
-      run: pip install mat-uitest
-      shell: bash
-    - name: 环境自检（adb / 设备 / 驱动）
-      run: mat doctor
-      shell: bash
-    - name: 运行用例
-      id: run
-      run: |
-        mat run "${{ inputs.cases-dir }}" --app "${{ inputs.package }}" \
-          ${serial:+--serial "$serial"} \
-          --artifacts "artifacts/run" --junit-xml "${{ inputs.junit-xml }}" --json
       shell: bash
       env:
+        MAT_VERSION: ${{ inputs.version }}
+      run: |
+        python -m pip install "mat-uitest==${MAT_VERSION}"
+    - name: 环境自检（adb / 设备 / 驱动）
+      shell: bash
+      run: |
+        mat doctor
+    - name: 运行用例
+      id: run
+      shell: bash
+      env:
+        MAT_CASES_DIR: ${{ inputs.cases-dir }}
+        MAT_PACKAGE: ${{ inputs.package }}
+        MAT_JUNIT_XML: ${{ inputs.junit-xml }}
         serial: ${{ inputs.serial }}
+      run: |
+        mat run "${MAT_CASES_DIR}" --app "${MAT_PACKAGE}" \
+          ${serial:+--serial "$serial"} \
+          --artifacts "artifacts/run" --junit-xml "${MAT_JUNIT_XML}" --json
     - name: 摘要（JSON + Markdown）
       id: summary
+      if: always()
+      shell: bash
+      env:
+        MAT_JUNIT_XML: ${{ inputs.junit-xml }}
       run: |
-        python -m insta_engine.junit_summary "${{ inputs.junit-xml }}" > summary.json
-        python -m insta_engine.junit_summary "${{ inputs.junit-xml }}" --markdown > pr-summary.md
-        echo "junit=${{ inputs.junit-xml }}" >> "$GITHUB_OUTPUT"
+        if [ -f "${MAT_JUNIT_XML}" ]; then
+          python -m insta_engine.junit_summary "${MAT_JUNIT_XML}" > summary.json \
+            || printf '{"total":0,"passed":0}\n' > summary.json
+          python -m insta_engine.junit_summary "${MAT_JUNIT_XML}" --markdown > pr-summary.md || true
+        else
+          printf '{"total":0,"passed":0}\n' > summary.json
+        fi
+        if [ ! -s pr-summary.md ]; then
+          printf '本次运行未生成 JUnit XML（用例未执行或被拒绝），请看本次 run 的日志与 artifact。\n' > pr-summary.md
+        fi
+        echo "junit=${MAT_JUNIT_XML}" >> "$GITHUB_OUTPUT"
         echo "report=artifacts/run" >> "$GITHUB_OUTPUT"
         echo "summary=pr-summary.md" >> "$GITHUB_OUTPUT"
-        echo "passed=$(python -c "import json;print(json.load(open('summary.json'))['passed'])")" >> "$GITHUB_OUTPUT"
-        echo "total=$(python -c "import json;print(json.load(open('summary.json'))['total'])")" >> "$GITHUB_OUTPUT"
-      shell: bash
+        passed=$(python -c 'import json;print(json.load(open("summary.json")).get("passed",0))')
+        total=$(python -c 'import json;print(json.load(open("summary.json")).get("total",0))')
+        echo "passed=${passed}" >> "$GITHUB_OUTPUT"
+        echo "total=${total}" >> "$GITHUB_OUTPUT"
     - name: 上传报告
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.artifact-name }}
-        path: artifacts/run/
+        path: |
+          artifacts/run/
+          summary.json
+          pr-summary.md
+        if-no-files-found: warn

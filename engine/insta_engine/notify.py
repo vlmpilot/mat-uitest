@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import os
 
-import requests
-
 
 def configured() -> bool:
     return bool(os.environ.get("MAT_WEBHOOK_URL"))
@@ -28,12 +26,12 @@ def send_run_finished(summary: str, webhook_url: str | None = None,
     url = webhook_url or os.environ.get("MAT_WEBHOOK_URL")
     if not url:
         return False
-    from .offline import is_offline
-    if is_offline():
-        return False  # 离线模式（P0-4）：通知是尽力而为的出网动作，直接跳过
+    from . import egress
+
     fmt = (fmt or os.environ.get("MAT_NOTIFY_FORMAT", "generic")).lower()
     try:
-        resp = requests.post(url, json=_payload(fmt, summary), timeout=5)
+        resp = egress.post(url, purpose="运行结果通知（webhook）",
+                           json=_payload(fmt, summary), timeout=5)
         return resp.status_code < 400
-    except Exception:
+    except Exception:  # 含 OfflineError：通知是尽力而为，离线 + 非私有主机即跳过
         return False
