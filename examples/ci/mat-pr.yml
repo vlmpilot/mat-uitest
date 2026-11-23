@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: vlmpilot/mat-uitest@main
+      - uses: vlmpilot/mat-uitest@v0.8.0   # 钉版本：@main 会让 CI 行为随上游漂移
         id: mat
         with:
           package: com.example.shop     # 你的被测 App 包名

@@ -41,3 +41,12 @@ jobs:
         # 不在这里设覆盖率门禁：原来的 65% 是**两个包合并**的口径，只算本仓这一个包
         # 会变成另一条（更严或更松）的线。合并门禁原样留在闭源侧那份 workflow。
         run: pytest engine/tests -q
+      - name: 依赖审计
+        # 只在 3.12 跑一遍：两个版本装的依赖相同，重复审计没有增量。
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          # editable 安装的本包会被 skip，只审计第三方依赖。
+          # 若因上游尚未发修复版而红：用 --ignore-vuln <ID> 显式豁免，并在 PR 写明理由
+          # 与复查条件——不要直接删掉这一步。
+          pip-audit --skip-editable
