@@ -5,6 +5,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # 手动触发：只跑构建与校验，**不发布**（publish job 只在 tag 上跑）。
+  # 用途：改动 release.yml 后先手动验证一遍，别等下次打 tag 才发现构建脚本坏了。
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -50,7 +53,7 @@ jobs:
 
   publish:
     needs: build
-    if: github.repository == 'vlmpilot/mat-uitest'
+    if: github.repository == 'vlmpilot/mat-uitest' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
       name: pypi
