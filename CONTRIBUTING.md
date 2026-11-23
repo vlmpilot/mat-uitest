@@ -74,6 +74,18 @@ API 形状变更要同步核对 web_server.py 的路由清单。
   （不要用带内部资料的开发树）。脚本自动完成：前端构建 → 源码同步 → `console_dist` 补齐
   → wheel + twine check（三件套内嵌于脚本）。⚠️ 该脚本属维护者内部发布工具，
   **不在公开仓库内**（公开仓的验证路径见上：`pip install -e './engine[dev]'` + ruff + pytest）。
+- **推荐：tag 触发的自动发布（2026-11-23 起）**。公开仓 `.github/workflows/release.yml`
+  在 `v*` tag 上构建并发布到 PyPI，走 Trusted Publishing（OIDC），不需要长期 token，
+  并附构建来源证明（attestation）。**一次性前提**（维护者在 PyPI 网页配置）：
+  Project → Publishing → Add a new publisher → GitHub，Owner `vlmpilot`、
+  Repository `mat-uitest`、Workflow `release.yml`、Environment `pypi`。
+  流程：发版提交 → 同步公开仓 → 在公开仓打 `v<版本>` tag 并 push → Actions 自动构建发布。
+  改了 workflow 先用 `workflow_dispatch` 手动跑一次（只构建校验、不发布）。
+  这条路径下 **tag 即发布**；失败时先删远端 tag（`git push origin :v<版本>`）再修，
+  **不要**对已成功上传的版本重打 tag。
+- **仍可用：本地构建 + 手动上传**（`build_release.sh` → `twine upload`），适合网络受限
+  或 PyPI 侧尚未配置 Trusted Publisher 时。这条路径仍是「上传成功后再打 tag」。
+  两条路径的产物必须一致：都从对外发布用的源码树构建。
 - 版本号：向后兼容修复升 patch（0.4.x）；新增用户可见能力升 minor（0.5.0）。
 - **版本 tag（2026-11-03 起）**：发版时在 `chore(release): X.Y.Z` 那个提交上打 annotated tag，
   命名 `v<版本号>`——与 PyPI 上的版本号一一对应：
