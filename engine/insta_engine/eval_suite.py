@@ -122,6 +122,23 @@ def summarize(results: list[dict], repeat: int, threshold: float) -> dict:
     overall["heal"] = {"triggered": heal_triggered, "recovered": heal_recovered,
                        "rate": round(heal_recovered / heal_triggered, 4)
                        if heal_triggered else None}
+    # 假绿 / 误愈（2026-11-23）：只统计带 `expect: fail` 标签的任务（缺陷检出集）。
+    # 假绿 = 标注「应失败」却 passed；误愈 = 假绿里至少一步是靠自愈救回的
+    # （把真 bug 当成控件变化放过去了）。没标签 ⇒ rate=None，不冒充 0。
+    labelled = [r for r in results if r.get("expect") == "fail"
+                and not r.get("blocked") and not r.get("env_error")]
+    green = [r for r in labelled if r.get("status") == "passed"]
+    healed = [r for r in green if (r.get("heal_recovered") or 0) > 0]
+    overall["false_green"] = {
+        "labelled": len(labelled), "passed": len(green),
+        "rate": round(len(green) / len(labelled), 4) if labelled else None,
+        "tasks": sorted({r["task"] for r in green}),
+    }
+    overall["false_heal"] = {
+        "count": len(healed),
+        "rate": round(len(healed) / len(labelled), 4) if labelled else None,
+        "tasks": sorted({r["task"] for r in healed}),
+    }
     # 性能聚合（best-effort 采集，缺值不进统计）：任务级中位
     launches = [r["perf"]["launch_ms"] for r in results
                 if (r.get("perf") or {}).get("launch_ms") is not None]
@@ -178,6 +195,7 @@ def _run_task(task: dict, serial: str | None, suite: dict, run_idx: int, repeat:
     except Exception as exc:  # noqa: BLE001 —— 驱动异常统一按环境问题处置（T60）
         return {"task": task["id"], "run": run_idx, "status": "device-error",
                 "passed": 0, "total": len(case.steps), "blocked": None,
+                "expect": task.get("expect"),
                 "env_error": f"{type(exc).__name__}: {exc}"}
     render_html(run, artifacts)
     ok = sum(s.status == "passed" for s in run.steps)
@@ -200,6 +218,7 @@ def _run_task(task: dict, serial: str | None, suite: dict, run_idx: int, repeat:
         version, fp = "", ""
     return {"task": task["id"], "run": run_idx, "passed": ok, "total": len(run.steps),
             "status": run.status, "blocked": risk, "artifacts": str(artifacts),
+            "expect": task.get("expect"),
             "app_version": version,
             "app_apk_sha256": fp,
             "perf": {"launch_ms": run.perf.get("launch_ms"),
@@ -406,6 +425,13 @@ def summary_line(report: dict) -> str:
     if crash.get("task_runs"):
         parts.append(f"崩溃 {crash['task_runs']} 个「任务×遍」"
                      f"（{'、'.join((crash.get('tasks') or [])[:4])}）")
+    fg = (report.get("overall") or {}).get("false_green") or {}
+    if fg.get("rate") is not None:
+        seg = f"缺陷检出：假绿 {fg.get('passed', 0)}/{fg.get('labelled', 0)}"
+        fh = (report.get("overall") or {}).get("false_heal") or {}
+        if fh.get("count"):
+            seg += f"（其中误愈 {fh['count']}）"
+        parts.append(seg)
     mix = {k: int(v or 0) for k, v in (report.get("route_mix") or {}).items()}
     if sum(mix.values()):
         local, maas, unknown = mix.get("local", 0), mix.get("maas", 0), mix.get("unknown", 0)

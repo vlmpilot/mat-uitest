@@ -1,6 +1,9 @@
 # benchmarks
 
-任务集目录。从 spike-5 起步，按既定裁剪路线（8 App）逐步扩充；标注规范（双人标注+仲裁）与指标定义属内部评测资料，不随源码公开。
+任务集目录。从 spike-5 起步，按既定裁剪路线（8 App）逐步扩充。
+
+**指标定义已公开**（见 [`METRICS.md`](METRICS.md)）——定义公开、真实跑测数据内部，两者不冲突；
+标注规范（双人标注 + 仲裁）的**数据**不随源码发布。
 
 ## spike-5-tasks.json
 
@@ -8,6 +11,27 @@
 - **t1~t4**：依赖 `examples/demo-app` 靶场（构建规格见该目录 README，Android Studio 约半天）
 - 通过标准：**步骤成功率 ≥80%**，由 `scripts/spike_check.py` 自动判定
 - 每个 task = `nl`（自然语言描述）+ `case`（gold DSL，与 `insta_engine.dsl` 同 schema）
+
+## public-subset.json（可对外复现的最小评测子集）
+
+- **靶场**：`examples/demo-app`（源码自带白屏缺陷，`BlankActivity` 注释写明**勿修**）。
+  从当前源码构建的 debug APK 就是"带缺陷版"；参考构建指纹见 JSON 的 `apps` 段
+  （仅用于核对是否同一棵树，以你本地构建为准）。
+- **13 条任务**：10 条常规流程（`expect: pass`）+ 3 条公告页缺陷（`expect: fail`）。
+  `expect: fail` 的任务**通过 = 假绿**；若靠自愈救回，计**误愈**。
+- **复现**：
+
+  ```bash
+  cd examples/demo-app && gradle :app:assembleDebug
+  adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+  cd ../..
+  mat eval run benchmarks/tasks/public-subset.json --repeat 3 --serial <你的设备>
+  ```
+
+- **看什么**：`overall.median`（通过率）、`overall.false_green.rate`（缺陷检出是否可信）、
+  `overall.false_heal`（自愈有没有放过缺陷）。口径见 `METRICS.md`。
+- 3 条缺陷任务**预期失败**是正常的：整体 `pass_threshold` 因此为 0.7，不是 1.0。
 
 ## 约定
 

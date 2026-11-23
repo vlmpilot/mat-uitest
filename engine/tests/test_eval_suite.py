@@ -273,3 +273,53 @@ def test_eval_gen_alias_saves_metrics_report(tmp_path, monkeypatch):
     data = json.loads(saved.read_text(encoding="utf-8"))
     assert data["total"] == 1 and data["passed"] == 1 and data["per_case"][0]["k_ratio"] == 1.0
 
+
+
+def test_summarize_reports_false_green_and_false_heal():
+    """标注「应失败」的任务 passed 即假绿；其中靠自愈救回的算误愈（真 bug 被放过）。
+
+    没有 `expect: fail` 标签时不冒充 0——`rate` 必须是 None，否则「没测」会被读成
+    「测了且没问题」（2026-11-23 公开子集口径）。
+    """
+    rs = [
+        dict(_r("defect-a", 1, "passed", 3, 3), expect="fail",
+             heal_triggered=1, heal_recovered=1),
+        dict(_r("defect-b", 1, "failed", 2, 3), expect="fail"),
+        dict(_r("normal", 1, "passed", 3, 3), expect="pass"),
+    ]
+    sm = summarize(rs, 1, 0.7)
+    fg = sm["overall"]["false_green"]
+    assert fg["labelled"] == 2 and fg["passed"] == 1 and fg["rate"] == 0.5
+    assert fg["tasks"] == ["defect-a"]
+    fh = sm["overall"]["false_heal"]
+    assert fh["count"] == 1 and fh["rate"] == 0.5 and fh["tasks"] == ["defect-a"]
+
+
+def test_summarize_false_green_is_none_without_labels():
+    sm = summarize([_r("a", 1, "passed", 3, 3)], 1, 0.7)
+    assert sm["overall"]["false_green"]["rate"] is None
+    assert sm["overall"]["false_heal"]["rate"] is None
+
+
+def test_public_subset_is_valid_and_labelled():
+    """公开子集是对外承诺的复现入口：DSL 必须能解析、标签必须合法、必须含缺陷任务。
+
+    这条测试在公开仓同样生效（public-subset.json 随源码导出）——外部按 README 跑之前，
+    CI 已经替他们验证过套件本身没坏。
+    """
+    import pathlib
+
+    from insta_engine.dsl import TestCase
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    suite = json.loads(
+        (root / "benchmarks" / "tasks" / "public-subset.json").read_text(encoding="utf-8"))
+    tasks = suite.get("tasks") or []
+    assert len(tasks) >= 10, "公开子集任务太少，不足以说明任何事"
+    labels = [t.get("expect") for t in tasks]
+    assert set(labels) <= {"pass", "fail"}, f"非法标签：{set(labels)}"
+    assert labels.count("fail") >= 1, "没有『应失败』任务 ⇒ 假绿率无法计算"
+    for t in tasks:
+        TestCase.model_validate(t["case"])  # DSL 结构必须合法
+        assert t["case"]["target"]["package"] == "com.insta.demo"
+    assert 0 < float(suite.get("pass_threshold", 0)) <= 1

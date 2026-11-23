@@ -1,0 +1,1472 @@
+{
+ "name": "public-subset",
+ "comment": "可对外复现的最小评测子集：自建靶场（examples/demo-app，源码自带白屏缺陷）+ 公开 DSL + 预期标签。指标定义见 benchmarks/METRICS.md，复现步骤见 README。",
+ "apps": {
+  "com.insta.demo": {
+   "source": "examples/demo-app（完整 Gradle 工程；源码即为带缺陷版，勿修 BlankActivity）",
+   "expect_build": "由当前源码构建的 debug APK",
+   "reference_apk": {
+    "name": "demo-app-broken.apk",
+    "sha256": "c70d815b826fbbd7abfca29bbb1f1b412d3df6fadf4ef48aa9dec7e3fde77fb1",
+    "note": "参考构建产物，仅用于核对『是否同一棵树』；以你按当前源码构建的结果为准"
+   }
+  }
+ },
+ "pass_threshold": 0.7,
+ "labels": {
+  "pass": "常规流程，应通过",
+  "fail": "源码自带缺陷，应失败（通过 = 假绿）"
+ },
+ "tasks": [
+  {
+   "id": "demo-f01-login-ok",
+   "nl": "打开 demo，输入账号 alice 与密码 pass1234 登录，应进入列表页并显示欢迎文案",
+   "case": {
+    "caseId": "case_demof01",
+    "name": "核心流程：登录成功",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "断言欢迎文案含账号名",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "text-contains",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/welcome_text"
+        },
+        "expected": "alice"
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-f02-search-bluetooth",
+   "nl": "登录后搜索「蓝牙」，列表应恰好剩 2 项（蓝牙耳机 Pro、蓝牙音箱）",
+   "case": {
+    "caseId": "case_demof02",
+    "name": "核心流程：搜索命中",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "点搜索框",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "输入「蓝牙」",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "蓝牙"
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s10",
+      "intent": "断言命中「蓝牙耳机 Pro」",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "蓝牙耳机 Pro"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s11",
+      "intent": "断言命中「蓝牙音箱」",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "蓝牙音箱"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s12",
+      "intent": "断言**不含**「机械键盘 87键」（验证真的过滤了）",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "text",
+         "value": "机械键盘 87键"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-f03-search-headphone",
+   "nl": "登录后搜索「耳机」，列表应恰好剩 2 项（蓝牙耳机 Pro、降噪头戴耳机）",
+   "case": {
+    "caseId": "case_demof03",
+    "name": "核心流程：搜索「耳机」",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "点搜索框",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "输入「耳机」",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "耳机"
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s10",
+      "intent": "断言「蓝牙耳机 Pro」在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "蓝牙耳机 Pro"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s11",
+      "intent": "断言「降噪头戴耳机」在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "降噪头戴耳机"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s12",
+      "intent": "断言**不含**「蓝牙音箱」",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "text",
+         "value": "蓝牙音箱"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-f04-search-no-hit",
+   "nl": "登录后搜索一个不存在的词，列表应为空（原首项应消失）",
+   "case": {
+    "caseId": "case_demof04",
+    "name": "边界：搜索无命中",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "点搜索框",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "输入不存在的词",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "不存在的商品ZZZ"
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s10",
+      "intent": "断言原首项已消失（列表空）",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "text",
+         "value": "蓝牙耳机 Pro"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-f05-search-then-detail",
+   "nl": "登录 → 搜索「蓝牙」→ 点第一项，详情页标题应是「蓝牙耳机 Pro」",
+   "case": {
+    "caseId": "case_demof05",
+    "name": "核心流程：搜索结果进详情",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "点搜索框",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "输入「蓝牙」",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "蓝牙"
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s10",
+      "intent": "点第一项",
+      "action": "tap",
+      "target": {
+       "strategy": "xpath",
+       "value": "(//*[@resource-id=\"com.insta.demo:id/item_text\"])[1]"
+      }
+     },
+     {
+      "id": "s11",
+      "intent": "等详情页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s12",
+      "intent": "断言详情标题 = 蓝牙耳机 Pro",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "text-contains",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/detail_title"
+        },
+        "expected": "蓝牙耳机 Pro"
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-e01-wrong-password",
+   "nl": "用错误密码登录，应出现错误提示且不进入列表页",
+   "case": {
+    "caseId": "case_demoe01",
+    "name": "边界：密码错误",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入错误密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "wrong"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "断言出现错误提示",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "text-contains",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/error_text"
+        },
+        "expected": "账号或密码错误"
+       }
+      ]
+     },
+     {
+      "id": "s8",
+      "intent": "断言**未**进入列表页（欢迎文案不在）",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/welcome_text"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-e02-empty-password",
+   "nl": "只填账号不填密码登录，应出现错误提示",
+   "case": {
+    "caseId": "case_demoe02",
+    "name": "边界：空密码",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "只输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "点登录（密码留空）",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "等",
+      "action": "wait",
+      "params": {
+       "ms": 2000
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "断言出现错误提示",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "text-contains",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/error_text"
+        },
+        "expected": "账号或密码错误"
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-e03-search-case-sensitive",
+   "nl": "搜索小写「usb」，应**搜不到**（列表项是大写 USB-C）——验证匹配是大小写敏感的",
+   "case": {
+    "caseId": "case_demoe03",
+    "name": "边界：大小写敏感",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "点搜索框",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "输入小写 usb",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/search_box"
+      },
+      "params": {
+       "text": "usb"
+      }
+     },
+     {
+      "id": "s9",
+      "intent": "等过滤",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s10",
+      "intent": "断言大写项**未**被匹配到（列表空）",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "not-exists",
+        "target": {
+         "strategy": "text",
+         "value": "USB-C 扩展坞"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-a01-login-elements",
+   "nl": "断言登录页的账号、密码、登录按钮都在",
+   "case": {
+    "caseId": "case_demoa01",
+    "name": "断言：登录页元素",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "断言账号框在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/username"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s4",
+      "intent": "断言密码框在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/password"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s5",
+      "intent": "断言登录按钮在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/login_btn"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-a02-list-elements",
+   "nl": "登录后断言列表页有欢迎文案、搜索框、且列表非空",
+   "case": {
+    "caseId": "case_demoa02",
+    "name": "断言：列表页元素",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "等登录页",
+      "action": "wait",
+      "params": {
+       "ms": 3000
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 2500
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "断言欢迎文案在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/welcome_text"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s8",
+      "intent": "断言搜索框在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/search_box"
+        }
+       }
+      ]
+     },
+     {
+      "id": "s9",
+      "intent": "断言列表首项在（列表非空）",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "text",
+         "value": "蓝牙耳机 Pro"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "expect": "pass"
+  },
+  {
+   "id": "demo-b01-announce-title",
+   "expect": "fail",
+   "nl": "登录后点「查看公告」，公告页应显示标题（源码自带白屏缺陷，本条应失败）",
+   "case": {
+    "caseId": "case_demob01",
+    "name": "缺陷检出：公告页标题",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "点查看公告",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/announce_btn"
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "等公告页",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "断言公告标题在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/announce_title"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "demo-b02-announce-body",
+   "expect": "fail",
+   "nl": "登录后点「查看公告」，公告页应显示正文（源码自带白屏缺陷，本条应失败）",
+   "case": {
+    "caseId": "case_demob02",
+    "name": "缺陷检出：公告正文",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "点查看公告",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/announce_btn"
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "等公告页",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "断言公告正文在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/announce_body"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "demo-b03-announce-back",
+   "expect": "fail",
+   "nl": "登录后点「查看公告」再确认列表可回（白屏页无返回入口，本条应失败）",
+   "case": {
+    "caseId": "case_demob03",
+    "name": "缺陷检出：公告页不可返回",
+    "target": {
+     "package": "com.insta.demo"
+    },
+    "steps": [
+     {
+      "id": "s1",
+      "intent": "启动",
+      "action": "launch",
+      "params": {
+       "package": "com.insta.demo",
+       "cold": true
+      }
+     },
+     {
+      "id": "s2",
+      "intent": "输入账号",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/username"
+      },
+      "params": {
+       "text": "alice"
+      }
+     },
+     {
+      "id": "s3",
+      "intent": "输入密码",
+      "action": "input",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/password"
+      },
+      "params": {
+       "text": "pass1234"
+      }
+     },
+     {
+      "id": "s4",
+      "intent": "点登录",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/login_btn"
+      }
+     },
+     {
+      "id": "s5",
+      "intent": "等列表页",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s6",
+      "intent": "点查看公告",
+      "action": "tap",
+      "target": {
+       "strategy": "res-id",
+       "value": "com.insta.demo:id/announce_btn"
+      }
+     },
+     {
+      "id": "s7",
+      "intent": "等公告页",
+      "action": "wait",
+      "params": {
+       "ms": 1500
+      }
+     },
+     {
+      "id": "s8",
+      "intent": "断言列表欢迎文案仍在",
+      "action": "wait",
+      "params": {
+       "ms": 300
+      },
+      "assertions": [
+       {
+        "type": "exists",
+        "target": {
+         "strategy": "res-id",
+         "value": "com.insta.demo:id/welcome_text"
+        }
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}
