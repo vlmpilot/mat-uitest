@@ -2,7 +2,7 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号规则：向后兼容修复升 patch，新增用户可见能力升 minor。
 
-## [未发布]
+## [0.8.1] - 2026-11-24
 
 ### Fixed
 
