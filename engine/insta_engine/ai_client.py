@@ -342,6 +342,13 @@ def _messages_from(text: str, images: list[bytes] | None = None,
 _JSON_MODE_STATE: dict[str, bool] = {"unsupported": False}
 
 
+#: 模型 → 实测的 max_tokens 上限（400 时学到，后续请求直接用，不再多吃一次 400）。
+#: 为什么需要（2026-11-24 实测）：某 GUI 专用模型上限 2048，MAT 默认发 4096 ⇒ 每次都 400，
+#: 而 `raise_for_status` 只抛 "400 Client Error: Bad Request"——真因（range [1,2048]）
+#: 在响应体里被丢掉，用户看到的是一个和模型能力完全无关的错误。
+_MAX_TOKENS_CAPS: dict[str, int] = {}
+
+
 def _json_mode_unsupported() -> bool:
     """本进程内是否已确认端点不支持 response_format（探测结果缓存，避免每次都撞 400）。"""
     return _JSON_MODE_STATE["unsupported"]
@@ -1010,6 +1017,10 @@ class GenClient:
             payload["max_tokens"] = parsed_override
         else:
             payload["max_tokens"] = _env_int("GEN_MAX_TOKENS_DEFAULT", 4096)
+        _cap = _MAX_TOKENS_CAPS.get(str(payload["model"]))
+        if _cap and int(payload["max_tokens"]) > _cap:
+            # 显式配置也不越过端点上限：越过去只会换回一个 400，没有任何收益
+            payload["max_tokens"] = _cap
         if _env_opt_float("GEN_TOP_P") is not None:
             payload["top_p"] = _env_opt_float("GEN_TOP_P")
         if _env_opt_int("GEN_SEED") is not None:
@@ -1047,12 +1058,30 @@ class GenClient:
                     url_switched["done"] = True
                     req_url = fallback_url
                     continue
-                if resp.status_code == 400 and "response_format" in payload:
-                    # 端点不支持结构化输出 → **记下来并降级**（去掉该字段重试），
-                    # 而不是把 400 抛给用户。降级事实写入模块状态，可被 status/doctor 反映。
-                    _JSON_MODE_STATE["unsupported"] = True
-                    payload.pop("response_format", None)
-                    continue
+                if resp.status_code == 400:
+                    err_text = ""
+                    try:
+                        err_text = resp.text or ""
+                    except Exception:  # noqa: BLE001 —— 读不到响应体也不影响判定
+                        pass
+                    # ① 端点不支持结构化输出 → 记下来并降级（去掉该字段重试）
+                    if "response_format" in payload:
+                        _JSON_MODE_STATE["unsupported"] = True
+                        payload.pop("response_format", None)
+                        continue
+                    # ② max_tokens 超上限 → 按端点给的上限裁一次并记住（见 _MAX_TOKENS_CAPS）
+                    cap = re.search(r"max_tokens[^0-9]{0,40}\[\s*1\s*,\s*(\d+)\s*\]", err_text)
+                    if cap and "max_tokens" in payload:
+                        limit = int(cap.group(1))
+                        if int(payload["max_tokens"]) > limit:
+                            _MAX_TOKENS_CAPS[str(payload["model"])] = limit
+                            payload["max_tokens"] = limit
+                            continue
+                    # ③ 其余 400：把响应体带进异常。裸 raise_for_status 只说 "Bad Request"，
+                    #    真因（参数名、范围、字段缺失）全在 body 里，隐藏它等于让用户猜。
+                    detail = " ".join(err_text.split())[:300]
+                    raise GenError(f"{context}: 端点拒绝请求（400）——"
+                                   f"{detail or '响应体为空，无法判断原因'}")
                 if resp.status_code == 403:
                     # 限流/鉴权拒绝与**业务失败**分开报错：裸 HTTPError 会让用户
                     # 以为是用例问题。实测批量高频 ~55 次/半小时触发、约 1 小时自动恢复 ⇒ 不重试

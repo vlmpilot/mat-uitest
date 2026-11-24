@@ -2494,3 +2494,72 @@ def test_strong_assertion_passed_is_not_captured_even_when_opted_in(tmp_path):
     run = Runner(FakeDriver(), tmp_path, capture_weak_assertions=True).run(case)
     assert run.steps[0].assertion_layer == "strong"
     assert run.steps[0].screenshot is None
+
+
+# -- 端点 400 的两类可自愈情况（2026-11-24 实测补充） ---------------------------
+
+
+def _stub_resp(code: int, text: str = "") -> object:
+    class _Resp:
+        status_code = code
+
+        def __init__(self):
+            self.text = text
+
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    return _Resp()
+
+
+def test_max_tokens_cap_is_learned_and_applied(monkeypatch):
+    """端点 max_tokens 上限低于默认值时：按上限裁一次、记住，后续直接用。
+
+    实测来源（2026-11-24）：某 GUI 专用模型上限 2048，MAT 默认发 4096 ⇒ 每次 400，
+    而 `raise_for_status` 只报 "Bad Request"，真因在响应体里被丢掉。
+    """
+    from insta_engine import ai_client
+
+    monkeypatch.setenv("GEN_JSON_MODE", "off")   # 排除 response_format 分支干扰
+    ai_client._MAX_TOKENS_CAPS.clear()
+    payloads: list[dict] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        payloads.append(dict(json))
+        if json.get("max_tokens", 0) > 2048:
+            return _stub_resp(400, '{"error":{"message":'
+                                   '"Range of max_tokens should be [1, 2048]"}}')
+        return _stub_resp(200)
+
+    monkeypatch.setattr(ai_client.requests, "post", fake_post)
+    client = ai_client.GenClient("http://stub", "k", "gui-plus")
+    assert client.complete_raw_text([{"role": "user", "content": "x"}]) == "{}"
+
+    assert payloads[0]["max_tokens"] == 4096, "首次按默认预算发"
+    assert payloads[1]["max_tokens"] == 2048, "400 后按端点上限重试"
+    assert ai_client._MAX_TOKENS_CAPS["gui-plus"] == 2048, "上限要记住"
+
+    client.complete_raw_text([{"role": "user", "content": "y"}])
+    assert payloads[2]["max_tokens"] == 2048, "后续请求直接用学到的上限，不再吃一次 400"
+    ai_client._MAX_TOKENS_CAPS.clear()
+
+
+def test_400_with_unknown_cause_reports_body(monkeypatch):
+    """其余 400 必须把响应体带出来——裸 raise_for_status 只说 "Bad Request"。"""
+    from insta_engine import ai_client
+
+    monkeypatch.setenv("GEN_JSON_MODE", "off")
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _stub_resp(400, '{"error":{"message":"InvalidParameter: temperature 非法"}}')
+
+    monkeypatch.setattr(ai_client.requests, "post", fake_post)
+    client = ai_client.GenClient("http://stub", "k", "m")
+    with pytest.raises(Exception) as exc:
+        client.complete_raw_text([{"role": "user", "content": "x"}])
+    assert "temperature 非法" in str(exc.value), f"真因要带出来：{exc.value}"
