@@ -123,6 +123,10 @@ GEN_PROMPT_MODE=server
 | `mat explore <pkg> --minutes 2`              | 探索测试，发现问题附复现路径                                                |
 | `mat index <pkg>`                            | 爬取页面控件清单（生成防幻觉底座 + 定位改名自愈）                                    |
 | `mat console`                                | 本地控制台（`http://127.0.0.1:7420`，仅本机监听）——**工具所有功能和配置均可在本地控制台操作** |
+| `mat flaky [--days 30]`                      | 稳定性统计：哪条用例反复跑时稳不稳（与判定分布互补）                                   |
+| `mat promote <explore.json> --path N`        | 探索路径 → 可回放用例（自动补一条"到了目标页"的断言）                                  |
+| `mat heal list/apply/ledger`                 | 查看/应用自愈提案（不覆盖原用例）；台账看同一处自愈出现过几次                          |
+| `mat grounding-eval --data <集合> [--model X]` | 视觉定位准确率复测：在自己的 App 上判断该选哪个模型                                |
 
 ## CI
 
