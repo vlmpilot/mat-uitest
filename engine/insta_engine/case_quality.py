@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from .dsl import LocatorStrategy
+from .dsl import NO_TARGET_TYPES, LocatorStrategy
 
 __all__ = [
     "BLOCK", "INFO", "RULES", "STATE_ASSERTION_TYPES", "WARN", "clean_locator", "ensure_launch",
@@ -304,6 +304,10 @@ def sanitize_splash_steps(raw_case: dict) -> list[str]:
     return issues
 
 
+#: 不需要 target 的断言类型（与 `dsl.NO_TARGET_TYPES` 同源，这里要按字符串比较）
+_NO_TARGET_VALUES = frozenset(t.value for t in NO_TARGET_TYPES)
+
+
 def sanitize_assertions(raw_case: dict) -> list[str]:
     """断言消毒：**缺定位的断言不许留到运行期**（返回要记录的 issues）。
 
@@ -324,6 +328,12 @@ def sanitize_assertions(raw_case: dict) -> list[str]:
         kept: list[dict] = []
         for assertion in assertions:
             if not isinstance(assertion, dict):
+                continue
+            # 视觉/语义断言**本来就不需要 target**（2026-11-24 评审 #14）：判据是整屏
+            # 或一句话。旧逻辑会把它们当"缺定位"→ 继承本步 target 或直接删掉，
+            # 结果是一条已经写好的视觉断言在跑之前就消失了（实测踩到：layer 变 none）。
+            if assertion.get("type") in _NO_TARGET_VALUES:
+                kept.append(assertion)
                 continue
             if isinstance(assertion.get("target"), dict):
                 kept.append(assertion)

@@ -130,6 +130,16 @@ def classify_step(step: dict, case_labels: set[str] | None = None) -> tuple[str,
         target = assertion.get("target") or {}
         value = str((target or {}).get("value") or "").strip()
         if atype in STRONG_TYPES:
+            # 视觉/语义断言的"目标"不是控件（评审 #14）：用断言语句/区域当标识，
+            # 并把「模型判定」显式写进理由——它和控件断言同为 strong，但可信来源不同：
+            # 前者是概率性的，复核的人必须知道这一点。
+            if atype == AssertionType.SEMANTIC.value:
+                claim = str(assertion.get("expected") or "")[:24]
+                return "strong", f"semantic({claim}·模型判定)"
+            if atype == AssertionType.VISUAL_CHANGED.value:
+                region = assertion.get("region")
+                return "strong", ("visual-changed(全屏)" if not region
+                                  else f"visual-changed({region})")
             return "strong", f"{atype}({value})"
         if atype in EXISTS_TYPES:
             if value and value in labels:

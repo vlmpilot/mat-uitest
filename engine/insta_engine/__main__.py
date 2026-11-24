@@ -450,6 +450,23 @@ def cmd_verify(args) -> int:
     return code
 
 
+def cmd_flaky(args) -> int:
+    """`mat flaky`：日常 flaky 统计（评审 #16）。
+
+    与 `mat verify-stats` 互补：那个看判定分布，这个看**同一用例反复跑稳不稳**。
+    """
+    from .flaky import load_rows, render, summarize
+
+    summary = summarize(load_rows(Path(args.history) if getattr(args, "history", None) else None),
+                        min_runs=args.min_runs, days=args.days,
+                        include_stubs=args.all, exclude=args.exclude)
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=1))
+    else:
+        print(render(summary))
+    return 0
+
+
 def cmd_grounding_eval(args) -> int:
     """`mat grounding-eval`：视觉定位命中率评测（用自己的数据判断该选哪个模型）。
 
@@ -3406,6 +3423,16 @@ def main(argv: list[str] | None = None) -> None:
                      help="设备排队等待上限（秒，不含用例执行时长）。超时 ⇒ exit=1 + "
                           "queued=true——这是排队不是用例失败，不要改用例")
     ver.set_defaults(func=cmd_verify)
+
+    flk = sub.add_parser("flaky", help="日常 flaky 统计：同一条用例反复跑时稳不稳")
+    flk.add_argument("--min-runs", type=int, default=3, help="至少跑过几次才统计（默认 3）")
+    flk.add_argument("--days", type=int, default=30, help="时间窗（天，默认 30；0=全部）")
+    flk.add_argument("--history", help="执行历史文件（默认 state_home/history.jsonl）")
+    flk.add_argument("--all", action="store_true", help="包含疑似测试桩记录")
+    flk.add_argument("--exclude", default="",
+                     help="正则：排除 case_id 命中的记录（排已知噪声，如 ^c1$|^selfheal_")
+    flk.add_argument("--json", action="store_true", help="机器可读输出")
+    flk.set_defaults(func=cmd_flaky)
 
     gev = sub.add_parser(
         "grounding-eval",

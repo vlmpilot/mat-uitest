@@ -150,6 +150,14 @@ class AssertionType(StrEnum):
     DISABLED = "disabled"
     CHECKED = "checked"
     SELECTED = "selected"
+    #: 画面与本步动作**前**不同（2026-11-24 评审 #14）。
+    #: 自绘界面（canvas / WebView / Flutter）的内容不进控件树，控件属性断言在那里
+    #: 什么也证明不了——"点了之后画面变了"是唯一可用的确定性判据。不调模型。
+    VISUAL_CHANGED = "visual-changed"
+    #: 自然语言断言，如「页面展示了下单成功」（评审 #14）。
+    #: 由视觉模型判定，**必须显式开启**（`MAT_SEMANTIC_ASSERT=1`）：它引入模型的不确定性，
+    #: 不能像控件断言那样默认信任；结论在报告与断言强度里单独标注。
+    SEMANTIC = "semantic"
 
 
 #: **不使用 `expected` 的断言类型**（T56）。模型经常给它们带上 `expected`——
@@ -160,13 +168,22 @@ _NO_EXPECTED = frozenset({
     AssertionType.EXISTS, AssertionType.NOT_EXISTS,
     AssertionType.ENABLED, AssertionType.DISABLED,
     AssertionType.CHECKED, AssertionType.SELECTED,
+    AssertionType.VISUAL_CHANGED,
 })
+
+#: **不需要 target** 的断言类型（2026-11-24）：视觉/语义断言的判据是"整屏"或一句话，
+#: 没有要定位的控件。runner 的 `_check_assertions` 据此跳过"缺 target 就报错"。
+NO_TARGET_TYPES = frozenset({AssertionType.VISUAL_CHANGED, AssertionType.SEMANTIC})
 
 
 class Assertion(BaseModel):
     type: AssertionType
     target: Locator | None = None
     expected: str | None = None
+    #: 视觉断言的比较区域 `[x1, y1, x2, y2]`（像素，可选）。给区域能显著降低噪声：
+    #: 全屏比较时状态栏时钟/电量每 60 秒变一次，可能把"没变"误判成"变了"。
+    #: 只对 `visual-changed` 有意义，其余类型忽略。
+    region: list[int] | None = None
 
     @model_validator(mode="before")
     @classmethod

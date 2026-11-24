@@ -21,7 +21,16 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from .dsl import Action, AssertionType, Locator, LocatorStrategy, OnFailure, TestCase, dump_dsl
+from .dsl import (
+    NO_TARGET_TYPES,
+    Action,
+    AssertionType,
+    Locator,
+    LocatorStrategy,
+    OnFailure,
+    TestCase,
+    dump_dsl,
+)
 from .locator import Element, LocateFailed, heal_by_hints, heal_fuzzy, resolve, try_resolve
 from .off_page import off_page_kind
 from .perf import am_start_w, mem_pss_mb
@@ -66,11 +75,15 @@ FRAME_DIFF_RATIO = 0.005
 FRAME_DIFF_GRAY = 8
 
 
-def _frame_signature(drv) -> bytes | None:
+def _frame_signature(drv, region: list[int] | None = None) -> bytes | None:
     """内容区的粗粒度灰度指纹；失败返回 None（调用方按"无法判断"处理）。
 
-    裁掉顶部 5% 与底部 7%：状态栏时钟、电量、系统导航栏的变化与页面内容无关，
+    默认裁掉顶部 5% 与底部 7%：状态栏时钟、电量、系统导航栏的变化与页面内容无关，
     留在指纹里会把"什么都没发生"读成"画面动过"。
+
+    `region=[x1,y1,x2,y2]`（可选）只比较该区域——自绘界面里"整个屏幕有一半是固定的"
+    时（如画布 + 固定工具栏），只看变化的那块能显著降噪。区域过小（任一边 < 8px）
+    返回 None：那基本是写错了坐标，不该静默给出"没变"的结论。
     """
     try:
         from PIL import Image
@@ -81,10 +94,17 @@ def _frame_signature(drv) -> bytes | None:
         if image is None:
             return None
         width, height = image.size
-        top, bottom = int(height * 0.05), int(height * 0.93)
-        if bottom <= top:
-            return None
-        return image.crop((0, top, width, bottom)).convert("L").resize(
+        if region and len(region) == 4:
+            x1, y1, x2, y2 = (int(v) for v in region)
+            box = (max(0, x1), max(0, y1), min(width, x2), min(height, y2))
+            if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+                return None
+        else:
+            top, bottom = int(height * 0.05), int(height * 0.93)
+            if bottom <= top:
+                return None
+            box = (0, top, width, bottom)
+        return image.crop(box).convert("L").resize(
             FRAME_SAMPLE, Image.BILINEAR).tobytes()
     except Exception:  # 截图失败不能影响判定，交给调用方按 None 处理
         return None
@@ -953,6 +973,11 @@ class Runner:
         # 失败时的"动作前"控件树（证据落盘要用）。在 try 外初始化：`wait_stable_xml`
         # 自己也可能抛，那时它没有值 —— 若在 except 里才赋值就会 NameError 把证据也吞掉。
         xml_before = ""
+        # 视觉断言的「动作前」画面（评审 #14）。**必须在 try 之前初始化**：
+        # 定位失败会跳到 except 的自愈分支，那里也会执行断言（`_check_assertions`）——
+        # 若只在 `resolve()` 之后赋值，自愈路径读到的是未绑定变量（实测 UnboundLocalError，
+        # 且错误信息变成"兜底后执行失败"，把真实原因盖掉了）。
+        assert_before: bytes | None = None
 
         try:
             # iOS：系统弹窗可能在任何时刻盖住前台，每步开头清一次（Android 上无操作）
@@ -973,6 +998,12 @@ class Runner:
                 result.used_strategy = element.strategy
 
             before = hashlib.md5(xml_before.encode()).hexdigest()  # 复用空闲判定的最后一次 dump
+            # 视觉断言要「动作前」的画面（评审 #14）：只在本步**确有**该断言时截一张，
+            # 不为所有步骤付这次成本（真机一次 screenshot ~200ms）。
+            _visual = next((a for a in step.assertions
+                            if a.type == AssertionType.VISUAL_CHANGED), None)
+            if _visual is not None:
+                assert_before = _frame_signature(self.drv, _visual.region)
             # ⚠️ `result=` 只在**第一次**执行时传：落点/冷启动是"这一次启动发生了什么"的证据，
             # 重放（953）与自愈（1066）再执行一次**不该覆盖**它（第二眼的屏幕可能已经不是
             # 起点那一屏了）。那两处刻意不传，也顺便让替身 `_act` 的签名保持原样。
@@ -1017,7 +1048,8 @@ class Runner:
                         result.warning = (f"{result.warning}；{_no_replay}"
                                           if result.warning else _no_replay)
 
-            self._check_assertions(step, variables, step.timeout_ms)
+            self._check_assertions(step, variables, step.timeout_ms,
+                                   before_frame=assert_before)
             result.status = "passed"
         except Exception as exc:
             raw_error = f"{type(exc).__name__}: {exc}"
@@ -1119,7 +1151,8 @@ class Runner:
                             # 立刻判死会把"只是没来得及变"误判成"点空了"。
                             _pause(SELF_HEAL_SETTLE_EXTRA_SECONDS)
                             after_heal = self._tree_hash()
-                        self._check_assertions(step, variables)
+                        self._check_assertions(step, variables,
+                                               before_frame=assert_before)
                         result.used_strategy = healed.strategy
                         # 树没变 ⇒ 再用画面指纹区分「自绘界面点中了」与「真点空了」。
                         frame_state: bool | None = None
@@ -1737,8 +1770,40 @@ class Runner:
         else:
             raise ValueError(f"未实现动作: {action.value}")
 
-    def _check_assertions(self, step, variables: dict[str, str], timeout_ms: int = 3000) -> None:
+    def _check_semantic(self, assertion, variables: dict[str, str]) -> None:
+        """语义断言（评审 #14）：调视觉模型判一句自然语言是否成立。
+
+        未启用时**失败并说清**怎么启用——静默跳过会造出"以为在验、其实没验"的绿灯。
+        """
+        from . import semantic
+
+        claim = substitute_vars(assertion.expected or "", variables).strip()
+        if not claim:
+            raise AssertionError("断言失败: semantic 断言缺少 expected（要断言的那句话）")
+        if not semantic.enabled():
+            raise AssertionError(
+                f"断言失败: 语义断言未启用（设 {semantic.ENV_FLAG}=1）——"
+                "它是模型判定，不默认信任，必须显式开启")
+        ok, reason = semantic.judge(self.drv, claim)
+        if not ok:
+            raise AssertionError(f"断言失败: 语义断言不成立——{reason}")
+
+    def _check_assertions(self, step, variables: dict[str, str], timeout_ms: int = 3000,
+                          before_frame: bytes | None = None) -> None:
         for assertion in step.assertions:
+            # 视觉/语义断言的判据是整屏或一句话，没有要定位的控件（评审 #14）
+            if assertion.type in NO_TARGET_TYPES:
+                if assertion.type == AssertionType.VISUAL_CHANGED:
+                    after = _frame_signature(self.drv, assertion.region)
+                    if before_frame is None or after is None:
+                        raise AssertionError(
+                            "断言失败: 无法比较画面（动作前画面或本次截图不可用）")
+                    if not _frame_changed(before_frame, after):
+                        raise AssertionError(
+                            "断言失败: 画面与动作前相同（预期发生变化）")
+                    continue
+                self._check_semantic(assertion, variables)
+                continue
             if assertion.target is None:
                 raise AssertionError(f"断言 {assertion.type.value} 缺少 target")
             # 用 try_resolve 而不是 resolve：`not-exists` 的正常情况就是找不到，

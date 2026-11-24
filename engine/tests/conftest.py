@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 @pytest.fixture(autouse=True)
-def _unit_tests_never_call_real_adb(monkeypatch):
+def _unit_tests_never_call_real_adb(monkeypatch, tmp_path):
     """单测一律不打真机 adb。
 
     为什么必须打桩：`explore()` 每一轮循环都抓一次 logcat，而相关用例的时间预算只有
@@ -58,6 +58,13 @@ def _unit_tests_never_call_real_adb(monkeypatch):
     monkeypatch.setattr("insta_engine.adb.logcat_tail", lambda *a, **k: "")
     monkeypatch.setattr("insta_engine.adb.logcat_clear", lambda *a, **k: True)
     monkeypatch.setattr("insta_engine.page_index._pause", lambda s: None)
+    # 执行历史隔离（2026-11-24 评审 #16）：`Runner._persist` 会往
+    # `state_home()/history.jsonl` 追加一行。单测不隔离的话，`mat flaky` 会把
+    # 测试跑测当成"用例稳定性统计"——本机实测 1.7 万条历史里 2137 条是单测写的
+    # `c1`/`n` 一类桩（还有 selfheal_noop 这类看起来像真用例的）。
+    from insta_engine import runner as _runner
+
+    monkeypatch.setattr(_runner, "_state_home", lambda: tmp_path / "_state")
 
 
 # -- P0-2 过渡：旧语义用例的定向跳过 -----------------------------------------
