@@ -22,7 +22,7 @@ inputs:
   version:
     description: "mat-uitest 版本（钉死，避免 action 行为随发行版漂移）"
     required: false
-    default: "0.8.1"
+    default: "0.8.2"
 outputs:
   junit-xml:
     description: "JUnit XML 路径"

@@ -127,11 +127,11 @@ GEN_PROMPT_MODE=server
 ## CI
 
 ```yaml
-- uses: vlmpilot/mat-uitest@v0.8.1   # 钉 tag：@main 会让 CI 行为随上游漂移
+- uses: vlmpilot/mat-uitest@v0.8.2   # 钉 tag：@main 会让 CI 行为随上游漂移
   with:
     package: com.example.shop
     cases-dir: cases
-    version: "0.8.1"                  # Action 内部安装的引擎版本（默认与 Action 同版）
+    version: "0.8.2"                  # Action 内部安装的引擎版本（默认与 Action 同版）
 ```
 
 - **有真机**：self-hosted runner（labels: `self-hosted, android`），完整 PR 门禁示例见
