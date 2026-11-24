@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import UTC, datetime
@@ -91,6 +92,28 @@ def _rel(artifacts: Path, value: str | None) -> str | None:
         return p.relative_to(artifacts).as_posix()
     except ValueError:
         return p.name
+
+
+def _console_url(report: Path | None, artifacts: Path) -> str | None:
+    """报告页的可点击地址（评审 #11：验证结论里此前只有本地路径，agent 打不开）。
+
+    只有当 `MAT_CONSOLE_URL` 配了（控制台在跑）时才给 URL；否则给 None——**不猜端口**，
+    猜错会给出一个打不开的链接，比没有更坏。本地路径仍在 `artifacts.report` 里。
+
+    字段放在 `artifacts` 里而不是 verdict 顶层：顶层是 `additionalProperties: false`，
+    加键会让 agent 用我们自己发布的 schema 校验失败。
+    """
+    base = (os.environ.get("MAT_CONSOLE_URL") or "").strip().rstrip("/")
+    if not base or report is None:
+        return None
+    # URL 要相对**artifacts 根**才拼得对：`artifacts` 既可能是根（批量模式传
+    # root/artifacts），也可能是单次执行目录（case_t1）。按目录名判断，不按调用方约定猜。
+    root_dir = artifacts if artifacts.name == "artifacts" else artifacts.parent
+    try:
+        rel = Path(report).resolve().relative_to(root_dir.resolve())
+    except ValueError:
+        return None
+    return f"{base}/artifacts/{rel.as_posix()}"
 
 
 def build_verdict(payload: dict, exit_code: int, artifacts: Path,
@@ -192,6 +215,9 @@ def build_verdict(payload: dict, exit_code: int, artifacts: Path,
             "dir": str(artifacts),
             "run_json": str(artifacts / "run.json"),
             "report": str(report) if report else None,
+            # 可点击地址（仅当 MAT_CONSOLE_URL 已配置）。`artifacts` 在 schema 里是
+            # additionalProperties: true，加键不影响协议校验。
+            "report_url": _console_url(report, artifacts),
         },
         "notes": notes,
         "verified_at": datetime.now(UTC).isoformat(timespec="seconds"),

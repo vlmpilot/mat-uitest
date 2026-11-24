@@ -12,7 +12,13 @@ from ..preconditions import refused_result, unprovisionable
 from ..recording import make_recorder
 from ..report import render_html
 from ..runner import Runner, RunResult
-from .runtime import _require_fresh_code, device_lock, get_driver, operator_of, start_job
+from .runtime import (
+    _require_fresh_code,
+    acquire_device,
+    get_driver,
+    operator_of,
+    start_job,
+)
 
 #: 拆分生成单次落盘条数上限（prompt 约束 ≤5 条，代码再兜一层失控输出；2026-10-13）
 MAX_SPLIT = 8
@@ -157,11 +163,10 @@ def api_run(root: Path, body: dict) -> tuple[int, dict]:
                 # 先 emit 再抛：worker 会把 job 置 error，但**事件流要非空**才可查
                 emit("run", "error", f"设备不可用：{type(exc).__name__}: {exc}")
                 raise
-        lock = device_lock(serial)
-        if not lock.acquire(blocking=False):
-            default_dev = serial or "默认设备"
-            emit("run", "queued", f"设备忙（{default_dev}），排队等待前一任务完成")
-            lock.acquire()  # 串行等待（评审 P1-4：同设备并发=互抢点击→不可信报告）
+        # 串行等待（评审 P1-4：同设备并发=互抢点击→不可信报告），但**有上限**：
+        # 无限等待等于让用户的界面一直转圈（评审 #11）。
+        lock = acquire_device(serial, on_queued=lambda m: emit("run", "queued", m),
+                              label="执行")
         try:
             emit("run", "running", case_path.name)
 
@@ -334,10 +339,10 @@ def api_explore(root: Path, body: dict) -> tuple[int, dict]:
         from ..explore import explore as _explore
         from ..report import render_explore_html
         _require_fresh_code()
-        lock = device_lock(serial)
-        if not lock.acquire(blocking=False):
-            emit("explore", "queued", f"设备忙（{serial or '默认设备'}），排队等待")
-            lock.acquire()
+        # 与 index 同一口径（2026-11-24 评审 #11）：排队最多 60s，超时给去向，
+        # 不再无限阻塞（旧行为让前端转圈到 10 分钟上限）。
+        lock = acquire_device(serial, on_queued=lambda m: emit("explore", "queued", m),
+                              label="探索")
         try:
             explore_id = datetime.now(UTC).strftime("%H%M%S") + "-" + _uuid.uuid4().hex[:4]
             artifacts = root / "artifacts" / "explore" / explore_id

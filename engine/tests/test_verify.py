@@ -1146,3 +1146,35 @@ def test_strict_heal_does_not_touch_clean_green(tmp_path):
     steps = [_step("s1", "passed")]
     out = v.build_verdict(_heal_payload(steps=steps), 0, tmp_path, strict_heal=True)
     assert out["verdict"] == "pass"
+
+
+def test_artifacts_report_url_only_when_console_configured(tmp_path, monkeypatch):
+    """报告页可点击地址（评审 #11）。
+
+    只在 `MAT_CONSOLE_URL` 配了时给 URL——**不猜端口**：猜错给出一个打不开的链接，
+    比没有更坏。本地路径始终在 `artifacts.report` 里。
+    """
+    art = tmp_path / "artifacts" / "case_t1"
+    art.mkdir(parents=True)
+    report = art / "report.html"
+    report.write_text("<html></html>", encoding="utf-8")
+
+    monkeypatch.delenv("MAT_CONSOLE_URL", raising=False)
+    out = v.build_verdict(_payload(steps=[_step("s1", "passed")]), 0, art, report)
+    assert out["artifacts"]["report_url"] is None
+    assert out["artifacts"]["report"] == str(report), "本地路径不能丢"
+
+    monkeypatch.setenv("MAT_CONSOLE_URL", "http://127.0.0.1:7420/")
+    out = v.build_verdict(_payload(steps=[_step("s1", "passed")]), 0, art, report)
+    assert out["artifacts"]["report_url"] == "http://127.0.0.1:7420/artifacts/case_t1/report.html"
+
+
+def test_report_url_is_none_when_report_outside_artifacts(tmp_path, monkeypatch):
+    """报告不在产物目录下时不给 URL（拼出来的地址一定打不开）。"""
+    art = tmp_path / "artifacts"
+    art.mkdir()
+    outside = tmp_path / "report.html"
+    outside.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setenv("MAT_CONSOLE_URL", "http://127.0.0.1:7420")
+    out = v.build_verdict(_payload(steps=[_step("s1", "passed")]), 0, art, outside)
+    assert out["artifacts"]["report_url"] is None

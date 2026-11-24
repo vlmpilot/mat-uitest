@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .runtime import _require_fresh_code, device_lock, get_driver, operator_of, start_job
+from .runtime import _require_fresh_code, acquire_device, get_driver, operator_of, start_job
 
 
 def api_index(root: Path, body: dict) -> tuple[int, dict]:
@@ -40,15 +40,8 @@ def api_index(root: Path, body: dict) -> tuple[int, dict]:
         from ..page_index import load_or_crawl
 
         _require_fresh_code()
-        lock = device_lock(serial)
-        if not lock.acquire(blocking=False):
-            emit("index", "queued", f"设备忙（{serial or '默认设备'}），排队等待")
-            # 排队上限 60s（2026-10-12 用户报「重建一直转圈」）：先下发的任务占着
-            # 设备锁时，无限阻塞会让本任务 running 数分钟、前端转圈到 10 分钟上限。
-            # 超时快速失败并给去向，比无限排队诚实。
-            if not lock.acquire(timeout=60):
-                raise RuntimeError("设备忙（另一任务执行中，等待 60s 未释放）——请在执行中心"
-                                   "确认当前任务完成后再重建，或稍后重试")
+        lock = acquire_device(serial, on_queued=lambda m: emit("index", "queued", m),
+                              label="重建页面图谱")
         try:
             emit("index", "running", f"{package}（refresh={refresh}）")
             index_path = root / "artifacts" / "page_index" / f"{package}.json"

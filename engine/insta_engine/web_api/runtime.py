@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -104,6 +105,29 @@ _DEVICE_LOCKS: dict[str, threading.Lock] = {}
 _DEVICE_LOCKS_GUARD = threading.Lock()
 
 
+def acquire_device(serial: str | None, *, on_queued=None, timeout: float = 60,
+                   label: str = "执行任务") -> threading.Lock:
+    """获取设备锁；忙时先发排队事件，**最多等 timeout 秒**，超时抛可行动的错。
+
+    为什么必须统一（2026-11-24 评审 #11）：同一把锁此前有四种等法——
+    `index` 等 60s 并给去向，`explore` / `run` **无限等待**，`verify` 自己算 wait_ms。
+    无限等待的后果是前端"一直转圈到 10 分钟上限"，用户不知道在等什么、该做什么。
+    """
+    lock = device_lock(serial)
+    if lock.acquire(blocking=False):
+        return lock
+    if on_queued is not None:
+        try:
+            on_queued(f"设备忙（{serial or '默认设备'}），排队等待前一任务完成")
+        except Exception:  # noqa: BLE001 —— 事件回调失败不该影响等锁
+            pass
+    if not lock.acquire(timeout=timeout):
+        raise RuntimeError(
+            f"设备忙（另一任务执行中，等待 {int(timeout)}s 未释放）——请在执行中心确认"
+            f"当前任务完成后再{label}，或稍后重试")
+    return lock
+
+
 def device_lock(serial: str | None) -> threading.Lock:
     """每设备一把锁：同 serial 的任务**串行**执行（评审 P1-4）。
 
@@ -143,6 +167,49 @@ def _append_event(job_id: str, step_id: str, status: str, detail: str = "",
                        "detail": detail, "screenshot": screenshot})
 
 
+def _job_dir() -> Path:
+    """任务元数据落盘目录（`state_home()/jobs`，与凭据/配额同一套 home）。"""
+    from ..state import state_home
+
+    return state_home() / "jobs"
+
+
+def persist_job(job_id: str, job: dict) -> None:
+    """把任务元数据落盘（评审 #11：任务注册表只在内存里，关掉 IDE 就"从未存在过"）。
+
+    只落**可序列化的元数据**：`cancel` 是线程句柄、事件可能有几千条——对"这个任务
+    跑完没有、结论是什么"这两个问题没有帮助，反而会把文件撑大。
+
+    失败不抛：落盘是观测设施，写不进去不该影响任务本身。
+    """
+    data = {k: v for k, v in job.items() if k not in ("cancel", "events")}
+    data["job_id"] = job_id
+    data["events_count"] = len(job.get("events") or [])
+    try:
+        path = _job_dir() / f"{job_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_persisted_job(job_id: str) -> dict | None:
+    """读落盘的任务元数据（内存里没有时用）。读不到/坏文件返回 None。"""
+    if not job_id or "/" in job_id or ".." in job_id:
+        return None
+    try:
+        path = _job_dir() / f"{job_id}.json"
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    data["persisted"] = True
+    data["note"] = ("该任务已结束，这条来自落盘记录：进程重启后事件明细不再可用，"
+                    "但结论（status/summary/error/link）是完整的")
+    return data
+
+
 def start_job(kind: str, fn, meta: dict | None = None) -> str:
     """启动后台任务。fn(emit, cancel) 接收两个句柄：
     - emit(step_id, status, detail="", duration_ms=None, screenshot=None)：追加步骤事件（seq 单调递增）；
@@ -170,13 +237,17 @@ def start_job(kind: str, fn, meta: dict | None = None) -> str:
                 # （否则 UI 上的"已超时"会自己消失）。任务也可能已被上限淘汰。
                 if job is not None and job.get("status") != "error":
                     job.update(status=("cancelled" if cancel.is_set() else "done"),
-                               summary=summary, link=link)
+                               summary=summary, link=link,
+                               finished_at=_now(), finished_ts=time.time())
+                    persist_job(job_id, job)
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             with _JOB_LOCK:
                 job = _JOBS.get(job_id)
                 if job is not None:
-                    job.update(status="error", error=err)
+                    job.update(status="error", error=err,
+                               finished_at=_now(), finished_ts=time.time())
+                    persist_job(job_id, job)
             # 失败原因进事件流（2026-10-13 用户反馈：事件日志只停在最后一条 running，
             # 失败原因只躺在 /api/job 的 error 字段里，前端执行日志区完全看不到）
             _append_event(job_id, "job", "error", err[:300])
@@ -226,6 +297,12 @@ def sweep_stale_jobs(timeout_seconds: int = JOB_TIMEOUT_SECONDS) -> int:
             swept.append(job_id)
     for job_id in swept:  # 锁外追加（_append_event 自行拿锁，嵌套会死锁）
         _append_event(job_id, "job", "error", str(_JOBS.get(job_id, {}).get("error") or "")[:300])
+        # 超时也是终态：同样落盘（否则重启后这次超时"从未发生"）
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job["finished_at"] = _now()
+            job["finished_ts"] = time.time()
+            persist_job(job_id, job)
     return len(swept)
 
 

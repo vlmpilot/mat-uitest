@@ -155,7 +155,9 @@ _ENV_KEYS = ("GEN_BASE_URL", "GEN_API_KEY", "GEN_MODEL", "GEN_VL_MODEL",
              # 生成走哪一侧（2026-11-02）：默认自部署，`cloud` 才走云端模型商。
              # 不登记的话控制台改完 .env 不生效——reload_env 只清这份名单里的键。
              "MAT_ROUTE",
-             "GEN_DISABLE_THINKING")
+             "GEN_DISABLE_THINKING",
+             # 控制台地址（2026-11-24 评审 #11）：验证结论里的 report_url 只在它配了时给。
+             "MAT_CONSOLE_URL")
 
 _RELOADED: dict = {"mtime": None, "path": ""}  # 上次重载的 .env mtime（节流标记）
 

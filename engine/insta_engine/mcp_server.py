@@ -318,11 +318,124 @@ def build_server(root: Path):
         }
 
     @mcp.tool()
+    def mat_promote(explore_file: str, path_index: int | None = None,
+                    max_depth: int = 8, out: str | None = None,
+                    name: str | None = None) -> dict:
+        """把**探索路径**转成可回放用例（promote）——探索预算变成回归资产。
+
+        两种用法（评审 #11：助手此前只能看到探索报告，没法接着把它变成用例）：
+        - 不给 `path_index`：列出可提升的路径（编号 / 摘要 / 是否可重放）；
+        - 给 `path_index`：把第 N 条落成用例（默认写到 `cases/`，文件名取 `name`）。
+
+        `max_depth` 必须与枚举时一致，否则编号会错位（同一份 explore.json 先列表再提升，
+        用同一个值即可）。返回里的 `notes` 是「需人工确认」的事项——坐标兜底跳、
+        截断跳、回放起点假设，别当噪音忽略。
+        """
+        from .promote import list_paths, load_explore, promote_path, save_case
+
+        p = Path(explore_file)
+        if not p.is_absolute():
+            p = root / p
+        try:
+            explore = load_explore(p)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        paths = list_paths(explore, max_hops=max_depth)
+        if path_index is None:
+            if not paths:
+                return {"explore": str(p), "paths": 0,
+                        "error": "没有可提升的路径（探索一轮无跳转？检查探索预算）"}
+            return {
+                "explore": str(p), "paths": len(paths),
+                "candidates": [{"index": i, "summary": x.summary(),
+                                "replayable": bool(x.replayable)}
+                               for i, x in enumerate(paths)][:30],
+                "note": "选一条把 path_index 传回来即可落成用例",
+            }
+        if not (0 <= path_index < len(paths)):
+            return {"error": f"path_index 越界（0..{len(paths) - 1}）"}
+        case, notes = promote_path(explore, path_index, name=name, max_hops=max_depth)
+        target = Path(out) if out else root / "cases" / f"{case.case_id}.json"
+        if not target.is_absolute():
+            target = root / target
+        saved = save_case(case, target)
+        return {"explore": str(p), "case_id": case.case_id, "name": case.name,
+                "saved": str(saved), "steps": len(case.steps), "notes": notes,
+                "next": f"用 mat_verify 跑一遍：case={saved.name}（探索路径不保证一次全通）"}
+
+    @mcp.tool()
+    def mat_heal(action: str = "list", run_dir: str | None = None,
+                 case: str | None = None, out: str | None = None) -> dict:
+        """查看 / 应用**自愈提案**（评审 #11：助手看到"提案待人工确认"后没法接着处理）。
+
+        - `action="list"`：不带 `run_dir` 列出所有带提案的执行（执行目录 + 提案数）；
+          带 `run_dir` 列出该次执行的逐条提案（原定位 → 新定位）。
+        - `action="apply"`：需要 `case` + `run_dir`，生成 `-healed.json` 新用例
+          （**不覆盖原用例**）；`out` 可指定输出路径。
+
+        回写会说明哪些**不能自动回写**（视觉兜底给的是坐标，会随分辨率失效）——
+        这是设计而非遗漏，别硬改成坐标定位。
+        """
+        from .dsl import TestCase as _Case
+        from .heals import apply_heals, collect_proposals
+
+        if action not in ("list", "apply"):
+            return {"error": "action 只能是 list 或 apply"}
+
+        if action == "list":
+            if not run_dir:
+                code, obj = ws.api_heal_list(root)
+                return obj if code == 200 else {"error": obj}
+            try:
+                proposals = collect_proposals(root / run_dir if not Path(run_dir).is_absolute()
+                                              else Path(run_dir))
+            except ValueError as exc:
+                return {"error": str(exc)}
+            if not proposals:
+                return {"run_dir": run_dir, "proposals": [],
+                        "note": "该执行没有自愈提案"}
+            return {"run_dir": run_dir, "proposals": proposals,
+                    "note": "用 action=apply + case 落成 -healed.json（不覆盖原用例）"}
+
+        if not run_dir or not case:
+            return {"error": "apply 需要 run_dir 与 case 两个参数"}
+        case_path = Path(case) if Path(case).is_absolute() else root / case
+        run_path = Path(run_dir) if Path(run_dir).is_absolute() else root / run_dir
+        try:
+            original = _Case.model_validate_json(case_path.read_text(encoding="utf-8"))
+            proposals = collect_proposals(run_path)
+        except (ValueError, OSError) as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        new_case, notes = apply_heals(original, proposals)
+        applied = [n for n in notes if "跳过" not in n]
+        if not applied:
+            return {"error": "没有可回写的提案（原定位与提案不匹配，或已回写过）",
+                    "notes": notes}
+        target = (Path(out) if out else case_path.with_name(case_path.stem + "-healed.json"))
+        if not target.is_absolute():
+            target = root / target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        from .dsl import dump_dsl
+
+        target.write_text(dump_dsl(new_case), encoding="utf-8")
+        return {"saved": str(target), "applied": len(applied), "notes": notes,
+                "next": "人工看一眼再替换原用例（回写只提议，不覆盖）"}
+
+    @mcp.tool()
     def mat_job(job_id: str, since: int = 0) -> dict:
         """查询任务进度：状态、摘要、增量步骤事件（since=已见过的最大 seq）。"""
         code, obj = ws.api_job_events({"id": job_id, "since": since})
         if code != 200:
-            return {"error": "任务不存在或已随上次 MCP 会话结束——"
+            # 落盘回退（2026-11-24 评审 #11）：任务注册表在内存里，关掉 IDE 后
+            # 再问同一个 job 会「从未存在过」。改成读落盘元数据——结论完整，
+            # 只是事件明细不再可用。
+            from .web_api.runtime import load_persisted_job
+
+            saved = load_persisted_job(job_id)
+            if saved is not None:
+                return saved
+            return {"error": "任务不存在（内存与落盘记录都没有）——"
                     "长任务请用 mat console 提交（独立于本进程存活）"}
         jobs = ws.api_jobs_list()[1]["jobs"]
         info = next((j for j in jobs if j["id"] == job_id), None)

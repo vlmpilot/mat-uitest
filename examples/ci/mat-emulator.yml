@@ -1,0 +1,90 @@
+# MAT UI 测试 · 托管 runner + Android 模拟器 + 分片并行（示例）
+#
+# 与 mat-pr.yml 的区别：那条路要一台插着真机的 self-hosted runner；这条只用
+# GitHub 托管的 ubuntu-latest + 模拟器，适合"没有设备但想在 PR 上跑 UI 测试"的团队。
+#
+# 两个前提必须满足，否则会**看起来在跑、实际跑不动**：
+#   1) 模拟器需要 KVM 硬件加速——GitHub 托管 runner 默认没开，下面第一步就是开它。
+#      不开的结果是模拟器启动超时，日志里只有一句 "emulator: ERROR: x86 emulation
+#      currently requires hardware acceleration"，和 MAT 无关。
+#   2) 你的 App 必须能被 adb install 装进模拟器（带 native 库的要注意 abiFilters 含 x86_64）。
+#
+# 分片：strategy.matrix.shard 与 `mat run --shard K/N` 配合。产物目录自动带
+# `-shardK-N` 后缀，多片互不覆盖；合并时把各片 artifact 一起下载即可（见最后一步）。
+
+name: MAT UI Test (emulator)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ui-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # 一片失败不要掐掉其它片（否则看不出是普遍问题还是个例）
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 开启 KVM（模拟器硬件加速）
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # ↓↓↓ 换成你自己的构建步骤（产出可安装的 APK）↓↓↓
+      # - name: 构建被测 App
+      #   run: ./gradlew assembleDebug
+
+      - name: 起模拟器并跑第 ${{ matrix.shard }} 片
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          disable-animations: true     # 动画会让"点了没反应"和"还没渲染完"分不开
+          script: |
+            adb wait-for-device
+            python -m pip install "mat-uitest==0.8.1"
+            mat doctor || true          # 环境自检：失败不拦（模拟器上偶发项多），日志留证
+            # ↓ 装你的 APK（如已在上一步产出）
+            # adb install -r app/build/outputs/apk/debug/app-debug.apk
+            mat run cases --app com.example.shop \
+              --shard ${{ matrix.shard }}/2 \
+              --junit-xml junit-${{ matrix.shard }}.xml \
+              --artifacts artifacts/shard-${{ matrix.shard }}
+
+      - name: 上传本片产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mat-shard-${{ matrix.shard }}
+          path: |
+            artifacts/
+            junit-*.xml
+          if-no-files-found: warn
+
+  # 可选：把各片合起来出一份总览（顺序执行，等 ui-test 全部完成）
+  merge:
+    needs: ui-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mat-shard-*
+          merge-multiple: true       # 各片目录并到一处：artifacts/ 下按分片子目录区分
+          path: merged
+      - name: 汇总各片 JUnit
+        run: |
+          python -m pip install "mat-uitest==0.8.1"
+          ls -R merged | head -50
+          # 各片 junit-*.xml 汇总（按需换成你的报告工具）。
+          # 注意：YAML 块里不能嵌缩进敏感的 heredoc，所以这里用单行 -c。
+          python -c "import glob, xml.etree.ElementTree as ET; s=[e for p in glob.glob('merged/junit-*.xml') for e in ET.parse(p).getroot().iter('testsuite')]; t=sum(int(x.get('tests',0)) for x in s); f=sum(int(x.get('failures',0))+int(x.get('errors',0)) for x in s); print(f'分片汇总：{t-f}/{t} 通过（{len(set(x.get(\'name\') or \'\' for x in s))} 组）') if s else print('没有找到分片 JUnit（可能各片都没跑）')"

@@ -1,5 +1,9 @@
 # MAT UI 测试接入 PR 门禁（示例）——放在你仓库的 .github/workflows/ 下
 # 前置：一台插着 Android 测试机的 self-hosted runner（labels: [self-hosted, android]）
+#
+# 没有真机？用 examples/ci/mat-emulator.yml（托管 runner + 模拟器）。
+# 用例多、想并行？给 job 加 matrix.shard: [1,2,3]，并在 mat run 里传 --shard ${{ matrix.shard }}/3
+# ——产物目录会自动带 -shard<K>-<N> 后缀，多片互不覆盖。
 name: MAT UI Test
 
 on:

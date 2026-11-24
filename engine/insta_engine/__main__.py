@@ -344,6 +344,21 @@ def _fresh_install_ios(args) -> int:
     return 0
 
 
+def _shard_files(files: list, spec: str) -> list:
+    """按 `K/N` 分片（1-based，含 K=N）。
+
+    排序键是**文件名**：不同 runner 必须切出同一个划分。用 mtime 或 glob 顺序，
+    各 runner 的分片会漂移——合起来看是"全跑了"，实际漏测/重测都没人发现。
+    """
+    try:
+        k, n = (int(x) for x in str(spec).split("/", 1))
+    except ValueError as exc:
+        raise ValueError(f"--shard 形如 1/3（第几片/共几片）：{spec!r}") from exc
+    if n < 1 or not (1 <= k <= n):
+        raise ValueError(f"--shard 非法：{spec}（要求 1 <= K <= N）")
+    return sorted(files, key=lambda p: Path(p).name)[k - 1::n]
+
+
 def _write_batch_suite(package: str, files: list[Path]) -> Path:
     """把「某 App 的全部用例」写成一个临时套件文件，返回路径。
 
@@ -471,13 +486,28 @@ def cmd_run(args) -> int:
         if not matched:
             print(f"目录 {case_path} 中没有 target.package={args.app} 的用例")
             return 1
+        _shard = getattr(args, "shard", None)
+        if _shard:
+            try:
+                matched = _shard_files(matched, _shard)
+            except ValueError as exc:
+                print(str(exc))
+                return 1
+            if not matched:
+                print(f"本分片（{_shard}）没有用例——用例数少于分片数？"
+                      f"其它分片会跑完，本分片直接成功")
+                return 0
         args.case = _write_batch_suite(args.app, matched).as_posix()
         # **只有用户没指定 --artifacts 时才用默认目录**：此前无条件覆盖 ⇒ 显式传的目录
         # 被忽略、三轮评测互相覆盖（2026-10-20 实测：v7-r1/r2/r3 全是空的，实际都写进了
         # artifacts/app_<pkg>），数字无法从磁盘复核，还会混进上一批的残留用例目录。
         if not args.artifacts:
-            args.artifacts = f"artifacts/app_{args.app.replace('.', '_')}"
-        print(f"批量执行 {len(matched)} 条 {args.app} 用例")
+            # 分片时必须带后缀：否则 N 个并行 job 写同一个默认目录，后跑的覆盖先跑的，
+            # 合并报告时看起来"只跑了一片"（评审 #10 的并行项要能真并行）。
+            suffix = f"-shard{str(_shard).replace('/', '-')}" if _shard else ""
+            args.artifacts = f"artifacts/app_{args.app.replace('.', '_')}{suffix}"
+        print(f"批量执行 {len(matched)} 条 {args.app} 用例"
+              + (f"（分片 {_shard}）" if _shard else ""))
     try:
         kind, payload = load_case_or_suite(Path(args.case))
     except FileNotFoundError:
@@ -3308,6 +3338,9 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--artifacts",
                      help="产物目录（缺省：单条 artifacts/<用例名>-<UTC时间戳>；"
                           "套件 artifacts/<套件名>/<NN>_<用例名>）")
+    run.add_argument("--shard", metavar="K/N",
+                     help="按用例分片：把选中的用例切成 N 份、只跑第 K 份（1-based）。"
+                          "配合 CI 矩阵并行，产物目录自动带 -shardK-N 后缀（互不覆盖）")
     run.add_argument("--capture-weak-assertions", action="store_true",
                      help="通过但断言证明不了结果（骨架/平凡/无断言）的步骤也留截图——"
                           "事后复核这类绿灯只能靠截图")

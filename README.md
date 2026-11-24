@@ -127,13 +127,22 @@ GEN_PROMPT_MODE=server
 ## CI
 
 ```yaml
-- uses: vlmpilot/mat-uitest@main   # self-hosted runner + Android 设备
+- uses: vlmpilot/mat-uitest@v0.8.1   # 钉 tag：@main 会让 CI 行为随上游漂移
   with:
     package: com.example.shop
     cases-dir: cases
+    version: "0.8.1"                  # Action 内部安装的引擎版本（默认与 Action 同版）
 ```
 
-任意 CI 系统：`mat run --junit-xml artifacts/mat-junit.xml`；完整 PR 门禁示例见 [examples/ci/mat-pr.yml](examples/ci/mat-pr.yml)。
+- **有真机**：self-hosted runner（labels: `self-hosted, android`），完整 PR 门禁示例见
+  [examples/ci/mat-pr.yml](examples/ci/mat-pr.yml)。
+- **没有真机**：托管 runner + Android 模拟器，见
+  [examples/ci/mat-emulator.yml](examples/ci/mat-emulator.yml)（含 KVM 开启——不开会以
+  "模拟器启动超时"告终，且日志里看不到和 MAT 有关的原因）。
+- **分片并行**：`mat run cases --app <包名> --shard 2/3` 只跑第 2 片（按文件名稳定切分，
+  各片不重不漏），配合 CI 矩阵；产物目录自动带 `-shard2-3` 后缀，多片互不覆盖。
+
+任意 CI 系统：`mat run --junit-xml artifacts/mat-junit.xml`。
 
 ## AI 编程助手接入
 
