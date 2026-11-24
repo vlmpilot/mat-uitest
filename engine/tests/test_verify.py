@@ -37,7 +37,9 @@ def test_pass_verdict_has_no_next_actions(tmp_path):
     assert out["schema"] == "mat.verify/1"
     assert (out["verdict"], out["ok"], out["exit_code"]) == ("pass", True, 0)
     assert out["next_actions"] == []
-    assert out["steps"] == {"total": 1, "passed": 1, "failed": 0}
+    # healed 是 2026-11-24 新增的开放字段（评审 #6：靠自愈通过的步骤要能单独数出来），
+    # 不影响协议版本——消费方按需读，缺省 0。
+    assert out["steps"] == {"total": 1, "passed": 1, "failed": 0, "healed": 0}
 
 
 def test_fail_verdict_gives_actions_ordered_by_frequency(tmp_path):
@@ -1085,3 +1087,62 @@ def test_subset_persists_aggregate(tmp_path, monkeypatch):
                        .read_text(encoding="utf-8"))
     assert saved["verdict"] == out["verdict"] == "pass"
     assert saved["summary"] == out["summary"]
+
+
+# -- 自愈两态与严格模式（评审 #6，2026-11-24） ---------------------------------
+
+
+def _healed(step_id: str = "s1", recovered: bool = True) -> dict:
+    return {"step_id": step_id, "action": "tap", "status": "passed",
+            "category": None, "error": None, "screenshot": None, "screen": None,
+            "heal": {"original": "res-id=com.x:id/login_btn_v2",
+                     "match": "text=登录", "via": "index-hints",
+                     "recovered": recovered}}
+
+
+def _heal_payload(steps, cats=None):
+    return {"case_id": "c1", "case_name": "用例", "status":
+            "passed" if all(s["status"] == "passed" for s in steps) else "failed",
+            "steps": steps, "failed_categories": cats or {}}
+
+
+def test_healed_steps_are_counted_separately(tmp_path):
+    """靠自愈通过的步骤必须单独计数——否则 CI 分不出「真绿」和「靠兜底变绿」。
+
+    评审 #6 的第一条：状态不区分。`steps.passed` 仍然包含它（它确实通过了），
+    但 `steps.healed` 要能数出来。
+    """
+    steps = [_step("s1", "passed"), _healed("s2")]
+    out = v.build_verdict(_heal_payload(steps=steps), 0, tmp_path)
+    assert out["verdict"] == "pass"
+    assert out["steps"] == {"total": 2, "passed": 2, "failed": 0, "healed": 1}
+    text = "；".join(out["notes"])
+    assert "靠自愈通过" in text, f"要说明绿里有一份来自兜底：{text}"
+    assert "strict-heal" in text, "要告诉 CI 怎么严格判定"
+
+
+def test_open_proposal_is_not_counted_as_healed(tmp_path):
+    """只留提案、没救回的步骤：仍是失败，且不能被算进 healed。"""
+    steps = [_healed("s1", recovered=False)]
+    steps[0]["status"] = "failed"
+    out = v.build_verdict(_payload(steps=steps, cats={"locate-fail": 1}), 2, tmp_path)
+    assert out["steps"]["healed"] == 0
+    text = "；".join(out["notes"])
+    assert "未救回" in text and "仍是失败" in text
+
+
+def test_strict_heal_turns_green_into_fail(tmp_path):
+    """严格模式：有步骤靠自愈通过 ⇒ 本次判 fail（CI 用）。"""
+    steps = [_step("s1", "passed"), _healed("s2")]
+    loose = v.build_verdict(_heal_payload(steps=steps), 0, tmp_path)
+    strict = v.build_verdict(_heal_payload(steps=steps), 0, tmp_path, strict_heal=True)
+    assert loose["verdict"] == "pass" and loose["ok"] is True
+    assert strict["verdict"] == "fail" and strict["ok"] is False
+    assert "严格模式" in "；".join(strict["notes"])
+
+
+def test_strict_heal_does_not_touch_clean_green(tmp_path):
+    """没有自愈时严格模式不改变判定（不能把正常绿灯也判红）。"""
+    steps = [_step("s1", "passed")]
+    out = v.build_verdict(_heal_payload(steps=steps), 0, tmp_path, strict_heal=True)
+    assert out["verdict"] == "pass"

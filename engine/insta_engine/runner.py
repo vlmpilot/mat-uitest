@@ -524,6 +524,7 @@ class Runner:
                 steps=results,
             )
             self._persist(case, run_result)
+            self._record_heal_ledger(case, run_result)
             return run_result
         finally:
             try:
@@ -623,6 +624,26 @@ class Runner:
             self.drv.wake_and_unlock()
         except Exception:
             pass  # 桩未实现契约（单测）/真机唤醒失败，都不阻塞执行
+
+    def _record_heal_ledger(self, case: TestCase, run_result: RunResult) -> None:
+        """把本次自愈追加进跨次台账（评审 #6）。
+
+        台账回答的是「这处自愈出现过几次、在哪些 App 版本上」——单次 run.json 答不了。
+        **任何异常都吞掉**：台账是观测设施，写不进去不该让一次真机运行失败。
+        """
+        if not any(getattr(step, "heal", None) for step in run_result.steps):
+            return
+        try:
+            from .driver import app_version
+            from .heal_ledger import record_run
+
+            pkg = (case.target or {}).get("package", "") if isinstance(case.target, dict) else ""
+            record_run(run_result, app_package=pkg or "",
+                       app_version=app_version(self.drv, pkg) if pkg else "",
+                       # 产物目录即这次运行的唯一标识（重跑会换带时间戳的目录）
+                       run_uid=str(self.artifacts))
+        except Exception:  # noqa: BLE001 —— 观测设施不许影响主流程
+            pass
 
     def _persist(self, case: TestCase, run_result: RunResult) -> None:
         """run.json（配置台/自愈回写/趋势的数据源）+ 本地执行历史（透明性设计：产物可自行打开核对）。"""
@@ -1059,6 +1080,11 @@ class Runner:
                             "original": f"{step.target.strategy.value}={step.target.value}",
                             "match": f"{healed.strategy}={healed.value}",
                             "via": via,
+                            #: 自愈后的动作**是否真的生效**。True=靠兜底通过了（绿色里
+                            #: 有一份来自这里）；False=只留了提案、这步仍是失败。
+                            #: 2026-11-24：此前没有这个字段，verify/CI 只能看 status，
+                            #: 分不出「真绿」和「靠兜底变绿」——评审 #6 的第一条。
+                            "recovered": False,
                         }
                         before_heal = self._tree_hash()
                         # 视觉兜底是**按坐标点击**，落点可能在 canvas / WebView / 自绘控件上
@@ -1098,6 +1124,7 @@ class Runner:
                         else:
                             result.status = "passed"
                             result.error = None
+                            result.heal["recovered"] = True
                             if after_heal == before_heal:
                                 # 自绘界面命中：树没动但画面动过，必须写清依据，
                                 # 否则事后看报告会以为是旧版那种"无变化也记成功"。

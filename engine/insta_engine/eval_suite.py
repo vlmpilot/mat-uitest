@@ -225,7 +225,11 @@ def _run_task(task: dict, serial: str | None, suite: dict, run_idx: int, repeat:
                      "mem_pss_mb": run.perf.get("mem_pss_mb")},
             "categories": dict(run.failed_categories),
             "heal_triggered": sum(1 for s in run.steps if s.heal),
-            "heal_recovered": sum(1 for s in run.steps if s.heal and s.status == "passed")}
+            # 显式字段优先；老产物没有 recovered 时退回「status==passed」的旧口径
+            # （两者语义相同：界面没动会被置 failed，见 runner 的自愈分支）
+            "heal_recovered": sum(
+                1 for s in run.steps
+                if s.heal and s.heal.get("recovered", s.status == "passed"))}
 
 
 def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,

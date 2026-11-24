@@ -94,7 +94,7 @@ def _rel(artifacts: Path, value: str | None) -> str | None:
 
 
 def build_verdict(payload: dict, exit_code: int, artifacts: Path,
-                  report: Path | None = None) -> dict:
+                  report: Path | None = None, strict_heal: bool = False) -> dict:
     """把一次执行结果摊成 `mat.verify/1`。
 
     `payload` 就是 `RunResult.model_dump()`（或 run.json 里的 `run` 段）——这样同一套
@@ -123,6 +123,12 @@ def build_verdict(payload: dict, exit_code: int, artifacts: Path,
             },
         })
 
+    # 自愈两态必须分开（评审 #6）：`recovered=True` 是「靠兜底通过了」——绿色里有一份
+    # 来自兜底；只有提案、没救回的步骤仍是失败。此前两者都只看 status，CI 分不出来。
+    healed_steps = [s for s in steps if (s.get("heal") or {}).get("recovered")]
+    open_proposals = [s for s in steps
+                      if (s.get("heal") or {}) and not (s.get("heal") or {}).get("recovered")]
+
     categories = dict(payload.get("failed_categories") or {})
     verdict = verdict_of(exit_code)
     # 分类频次从高到低：先修最主要的那个，别让一个偶发分类排在最前面
@@ -143,8 +149,18 @@ def build_verdict(payload: dict, exit_code: int, artifacts: Path,
         notes.append(f"退出码是 0 但 run.status={payload.get('status')}——产物与判定不一致，已按产物记")
     if any(f["false_red"] for f in failed_steps):
         notes.append("存在假红（分类 env-failure 但 App 实际在前台）：统计时单独计，别当环境噪声")
-    if any(s.get("heal") for s in steps):
-        notes.append("有自愈提案待确认：`mat heal list <产物目录>` 查看，原用例未被改动")
+    if healed_steps:
+        notes.append(
+            f"{len(healed_steps)} 个步骤靠自愈通过（原定位失败、由兜底命中）："
+            "要区分「真绿」与「靠兜底变绿」，CI 加 --strict-heal 会把这类步骤判为失败")
+    if open_proposals:
+        notes.append(
+            f"{len(open_proposals)} 条自愈提案未救回（该步仍是失败，只是留了候选）："
+            "`mat heal list <产物目录>` 查看，原用例未被改动")
+    if strict_heal and healed_steps and verdict == "pass":
+        verdict = "fail"
+        notes.append(
+            f"严格模式（--strict-heal）：{len(healed_steps)} 个步骤靠自愈通过，本次按失败计")
     if any(f.get("off_page") for f in failed_steps):
         notes.append("有步骤跑到了别的页（off_page）：先判断是 App 自己跳走还是用例前置没到位")
 
@@ -166,7 +182,8 @@ def build_verdict(payload: dict, exit_code: int, artifacts: Path,
         "duration_ms": payload.get("duration_ms"),
         "steps": {"total": len(steps),
                   "passed": len(steps) - len(failed_steps),
-                  "failed": len(failed_steps)},
+                  "failed": len(failed_steps),
+                  "healed": len(healed_steps)},
         "failed_categories": categories,
         "failed_steps": failed_steps,
         "next_actions": next_actions,
@@ -407,7 +424,8 @@ def run_verify(root: Path, case_path: Path, *, serial: str | None = None,
                allow_unmet: bool = False, quality_gate: bool = True,
                timeout_s: float | None = 180, apk: Path | None = None,
                package: str | None = None, reinstall: bool = False,
-               execute_timeout_s: float | None = None) -> tuple[int, dict]:
+               execute_timeout_s: float | None = None,
+               strict_heal: bool = False) -> tuple[int, dict]:
     """跑一条用例并返回 `(exit_code, verdict)`；判定同时落盘 `verify.json`。
 
     `timeout_s` 是**排队**上限（等设备锁）；`execute_timeout_s` 是**执行**上限
@@ -426,7 +444,8 @@ def run_verify(root: Path, case_path: Path, *, serial: str | None = None,
                                 artifacts=artifacts, allow_unmet=allow_unmet,
                                 quality_gate=quality_gate, timeout_s=timeout_s,
                                 apk=apk, package=package, reinstall=reinstall,
-                                execute_timeout_s=execute_timeout_s)
+                                execute_timeout_s=execute_timeout_s,
+                                strict_heal=strict_heal)
     _persist_verdict(verdict)
     from . import verify_usage
 
@@ -439,7 +458,8 @@ def _run_verify(root: Path, case_path: Path, *, serial: str | None = None,
                 allow_unmet: bool = False, quality_gate: bool = True,
                 timeout_s: float | None = 180, apk: Path | None = None,
                 package: str | None = None, reinstall: bool = False,
-                execute_timeout_s: float | None = None) -> tuple[int, dict]:
+                execute_timeout_s: float | None = None,
+                strict_heal: bool = False) -> tuple[int, dict]:
     """`run_verify` 的实现体（不落盘）；外部一律走 `run_verify`。"""
     from .__main__ import _blocked_preconditions, _connect_driver
     from .dsl import TestCase
@@ -574,7 +594,12 @@ def _run_verify(root: Path, case_path: Path, *, serial: str | None = None,
         code = EXIT_INCOMPLETE
     else:
         code = EXIT_FAIL
-    verdict = build_verdict(run.model_dump(), code, art, report)
+    verdict = build_verdict(run.model_dump(), code, art, report, strict_heal=strict_heal)
+    if verdict["verdict"] == "fail" and code == EXIT_PASS:
+        # 严格模式把绿灯按失败计：**退出码必须同步**。否则 CI 只看退出码仍然是 0，
+        # 这个开关等于没生效（2026-11-24 真机实测踩到：verdict=fail 但 echo $? 是 0）。
+        code = EXIT_FAIL
+        verdict["exit_code"] = code
     if run.status == "cancelled":
         verdict["notes"].append(
             "执行被中止（超出 execute_timeout 或调用方取消）——已完成的步骤证据保留，"

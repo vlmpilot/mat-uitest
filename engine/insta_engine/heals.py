@@ -1,8 +1,14 @@
 """自愈提案回写（「确认自愈回写」动作的引擎侧实现）。
 
 回写原则：默认仅提议；回写由用户显式触发（heal apply），不覆盖原用例。
-v0 仅支持本地模糊线索回写（textContains/descriptionContains → text/description 精确定位），
-云端视觉自愈（vision-llm）落地后按同一机制回写并附截图证据。
+
+支持两种自愈来源（2026-11-24 补全，评审 #6「回写不全」）：
+- 本地模糊（`fuzzy:textContains` / `fuzzy:descriptionContains`）→ text / description；
+- 图谱提示（`index-hints`，res-id 改名后用历史文案重定位）→ 命中的是 TEXT 策略，
+  回写成 `text=历史文案`。此前它被当成「未知类型」跳过——最该自动回写的一类反而丢了。
+
+视觉兜底（`vision-llm`）**不回写**：它给的是像素坐标，坐标随分辨率/布局变化失效，
+写成 point 只会把不稳定的东西固化进用例。这种情况明确说明原因并建议人工改。
 """
 
 from __future__ import annotations
@@ -12,9 +18,21 @@ from pathlib import Path
 
 from .dsl import Locator, LocatorStrategy, TestCase
 
-_FUZZY_MAP = {
-    "fuzzy:textContains": LocatorStrategy.TEXT,
+_STRATEGY_MAP = {
+    # contains 语义必须原样保留：映射成精确 `text` 会让回写后的用例失效——
+    # 实测 `fuzzy:textContains=登录` 是匹配到「立即登录」的，写成 `text=登录` 就再也点不中。
+    "fuzzy:textContains": LocatorStrategy.TEXT_CONTAINS,
+    # description 没有对应的 contains 策略，退回精确（DSL 未提供 descriptionContains）
     "fuzzy:descriptionContains": LocatorStrategy.DESCRIPTION,
+    # 图谱提示：`heal_by_hints` 走 TEXT 策略，match 形如 `text=登录`。
+    "text": LocatorStrategy.TEXT,
+    "description": LocatorStrategy.DESCRIPTION,
+}
+
+#: 明确"不能自动回写"的来源（不是"不认识"，是"认识了但不该写"）。
+_NO_REWRITE_REASON = {
+    "vision-llm": "视觉兜底给的是像素坐标，坐标会随分辨率/布局失效；"
+                  "建议人工改成该控件的 text/description 后再替换",
 }
 
 
@@ -58,7 +76,10 @@ def apply_heals(case: TestCase, proposals: list[dict]) -> tuple[TestCase, list[s
         if not proposal:
             return loc
         match_strategy, _, match_value = str(proposal["match"]).partition("=")
-        new_strategy = _FUZZY_MAP.get(match_strategy)
+        if match_strategy in _NO_REWRITE_REASON:
+            notes.append(f"{proposal.get('step', '?')}: 跳过回写——{_NO_REWRITE_REASON[match_strategy]}")
+            return loc
+        new_strategy = _STRATEGY_MAP.get(match_strategy)
         if new_strategy is None:
             notes.append(f"{proposal.get('step', '?')}: 未知自愈匹配类型 {match_strategy}，跳过回写")
             return loc

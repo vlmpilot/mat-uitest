@@ -426,6 +426,7 @@ def cmd_verify(args) -> int:
         package=getattr(args, "package", None),
         reinstall=getattr(args, "reinstall", False),
         quality_gate=not getattr(args, "no_quality_gate", False),
+        strict_heal=getattr(args, "strict_heal", False),
     )
     if args.json:
         print(json.dumps(verdict, ensure_ascii=False, indent=1))
@@ -2450,6 +2451,28 @@ def cmd_summary(args) -> int:
 
 
 def cmd_heal(args) -> int:
+    if args.heal_cmd == "ledger":
+        from .heal_ledger import ledger_path, summarize
+
+        rows = summarize()
+        if getattr(args, "json", False):
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+            return 0
+        if not rows:
+            print(f"自愈台账为空（{ledger_path()}）——发生过自愈后才会有记录")
+            return 0
+        print(f"自愈台账（{ledger_path()}）：{len(rows)} 处")
+        for g in rows[:20]:
+            print(f"  {g['case_id']}/{g['step_id']}  {g['count']} 次"
+                  f"（救回 {g['recovered']} / 未救回 {g['missed']}）")
+            print(f"    {g['original']} → {' | '.join(g['matches']) or '（无）'}"
+                  f"  via {'/'.join(g['via']) or '?'}")
+            if g["versions"]:
+                print(f"    App 版本: {', '.join(g['versions'])}"
+                      f"　首次 {g['first_seen'][:10]}　最近 {g['last_seen'][:10]}")
+        if len(rows) > 20:
+            print(f"  … 另有 {len(rows) - 20} 处，用 --json 看全量")
+        return 0
     if args.heal_cmd == "list":
         try:
             proposals = collect_proposals(Path(args.run_dir))
@@ -3281,6 +3304,9 @@ def main(argv: list[str] | None = None) -> None:
                      help="产物目录（缺省 artifacts/<用例名>-<UTC时间戳>，与单条 run 同构）")
     ver.add_argument("--json", action="store_true", help="输出 mat.verify/1 JSON（agent 用这个）")
     ver.add_argument("--no-quality-gate", action="store_true", help="跳过用例质量闸门")
+    ver.add_argument("--strict-heal", action="store_true",
+                     help="严格模式：有步骤靠自愈通过就把本次判为失败（CI 用，"
+                          "区分「真绿」与「靠兜底变绿」）")
     ver.add_argument("--allow-unmet-preconditions", action="store_true",
                      help="放行「前置条件 MAT 无法置备」的用例（默认拒跑，退出码 3）")
     ver.add_argument("--apk", help="被测 App 的 APK 路径(仅 Android;须在工作区内)——先装再验")
@@ -3306,6 +3332,10 @@ def main(argv: list[str] | None = None) -> None:
     heal_apply.add_argument("--run", required=True, help="执行产物目录")
     heal_apply.add_argument("-o", "--out", help="输出文件（默认 <用例名>-healed.json）")
     heal_apply.set_defaults(func=cmd_heal)
+    heal_ledger_p = heal_sub.add_parser(
+        "ledger", help="跨次自愈台账：同一处自愈出现过几次、在哪些 App 版本上")
+    heal_ledger_p.add_argument("--json", action="store_true", help="机器可读输出")
+    heal_ledger_p.set_defaults(func=cmd_heal)
 
     eval_p = sub.add_parser(
         "eval",

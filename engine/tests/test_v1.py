@@ -867,11 +867,59 @@ def test_collect_and_apply_heals(tmp_path):
     assert len(proposals) == 1
 
     new_case, notes = apply_heals(case, proposals)
-    assert new_case.steps[0].target.strategy == LocatorStrategy.TEXT
+    # contains 语义要原样保留：回写成精确 text 会让回写后的用例失效
+    # （2026-11-24 真机实测：fuzzy:textContains=登录 命中「立即登录」，写成 text=登录 就点不中）
+    assert new_case.steps[0].target.strategy == LocatorStrategy.TEXT_CONTAINS
     assert new_case.steps[0].target.value == "login btn"
     assert any("真机复核" in n for n in notes)
     # 原用例不被修改（回写原则：用户确认后才替换）
     assert case.steps[0].target.strategy == LocatorStrategy.RES_ID
+
+
+def test_apply_heals_rewrites_index_hint_proposal(tmp_path):
+    """图谱提示（res-id 改名、用历史文案重定位）必须能回写。
+
+    评审 #6「回写不全」：`heal_by_hints` 命中的是 TEXT 策略，match 形如 `text=登录`，
+    旧实现只在 `_FUZZY_MAP` 里找 `fuzzy:*` ⇒ 把它当「未知类型」跳过。
+    最该自动回写的一类（id 改名、文案还在）反而丢了。
+    """
+    case = TestCase.model_validate({
+        "caseId": "case_hint",
+        "steps": [{"id": "s1", "action": "tap",
+                   "target": {"strategy": "res-id", "value": "com.insta.demo:id/login_btn_v2"}}],
+    })
+    run_payload = {"run": {"steps": [{"step_id": "s1", "status": "passed",
+                                      "heal": {"original": "res-id=com.insta.demo:id/login_btn_v2",
+                                               "match": "text=立即登录", "via": "index-hints",
+                                               "recovered": True}}]}}
+    (tmp_path / "run.json").write_text(json.dumps(run_payload), encoding="utf-8")
+
+    new_case, notes = apply_heals(case, collect_proposals(tmp_path))
+    assert new_case.steps[0].target.strategy == LocatorStrategy.TEXT
+    assert new_case.steps[0].target.value == "立即登录"
+    assert any("真机复核" in n for n in notes)
+
+
+def test_apply_heals_refuses_vision_coordinate_with_reason(tmp_path):
+    """视觉兜底给的是坐标：不能回写成 point（会随分辨率失效），但必须说明原因。
+
+    「跳过」和「不认识所以跳过」要能区分——评审 #6 指的是后者被静默处理。
+    """
+    case = TestCase.model_validate({
+        "caseId": "case_vis",
+        "steps": [{"id": "s1", "action": "tap",
+                   "target": {"strategy": "res-id", "value": "com.insta.demo:id/login_btn"}}],
+    })
+    run_payload = {"run": {"steps": [{"step_id": "s1", "status": "passed",
+                                      "heal": {"original": "res-id=com.insta.demo:id/login_btn",
+                                               "match": "vision-llm=(540,1093)",
+                                               "via": "vision-llm", "recovered": True}}]}}
+    (tmp_path / "run.json").write_text(json.dumps(run_payload), encoding="utf-8")
+
+    new_case, notes = apply_heals(case, collect_proposals(tmp_path))
+    assert new_case.steps[0].target.strategy == LocatorStrategy.RES_ID, "坐标不该被固化进用例"
+    joined = " ".join(notes)
+    assert "跳过回写" in joined and "坐标" in joined, f"要说清为什么跳过：{joined}"
 
 
 # -- image-template：无 OpenCV 时优雅降级 --------------------------------------

@@ -477,7 +477,8 @@ def test_heals_skips_malformed_proposal(tmp_path):
     healed, notes = apply_heals(case, proposals)
     assert len(notes) == 1
     assert healed.steps[0].target.value == "登录"
-    assert healed.steps[0].target.strategy == LocatorStrategy.TEXT
+    # contains 语义要原样保留（2026-11-24）：映射成精确 text 会让回写后的用例失效
+    assert healed.steps[0].target.strategy == LocatorStrategy.TEXT_CONTAINS
 
 
 def test_visible_controls_hint_says_how_many_were_hidden(tmp_path):
