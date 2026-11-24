@@ -58,7 +58,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff==0.16.9", "pytest>=8", "pytest-cov>=5"]
+dev = ["ruff==0.16.9", "pytest>=8", "pytest-cov>=5", "hypothesis>=6"]
 image = ["opencv-python-headless>=4.8"]
 mcp = ["mcp>=2.0"]
 ios = ["facebook-wda>=1.5", "pymobiledevice3>=3.0"]
