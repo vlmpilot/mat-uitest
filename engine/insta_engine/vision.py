@@ -16,6 +16,7 @@ permille（≤1000 且屏幕边 >1000）→ pixel。
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 from collections import OrderedDict
@@ -35,7 +36,110 @@ MAX_EDGE_ENV = "MAT_VL_MAX_EDGE"
 EDGE_MARGIN = 12
 
 _CACHE: OrderedDict[str, tuple[int, int]] = OrderedDict()
-_CACHE_MAX = 200  # LRU 上限（整体 clear 会造成缓存抖动）
+_CACHE_MAX = 200  # 内存 LRU 上限（整体 clear 会造成缓存抖动）
+
+#: 缓存模式（评审 #12）：`memory`=仅进程内（默认，行为不变）；
+#: `disk`=额外落盘到 `state_home/vision_cache.json`（CI 复用，同一屏同一目标不重复付费）；
+#: `off`=不用缓存（调试"真的有没有调模型"时用）。
+CACHE_MODE_ENV = "MAT_VL_CACHE"
+_DISK_FILE = "vision_cache.json"
+_DISK_MAX = 5000  # 落盘上限：再多就是噪声（且 json 全量读写会变慢）
+_disk: dict | None = None          # 懒加载的落盘内容
+_disk_override: Path | None = None  # 测试注入路径
+
+
+def _cache_mode() -> str:
+    mode = (os.environ.get(CACHE_MODE_ENV) or "memory").strip().lower()
+    return mode if mode in ("memory", "disk", "off") else "memory"
+
+
+def _disk_path() -> Path:
+    if _disk_override is not None:
+        return _disk_override
+    from .state import state_home
+
+    return state_home() / _DISK_FILE
+
+
+def _load_disk() -> dict:
+    global _disk
+    if _disk is None:
+        try:
+            data = json.loads(_disk_path().read_text(encoding="utf-8"))
+            _disk = data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            _disk = {}
+    return _disk
+
+
+def _save_disk() -> None:
+    """落盘（失败不抛：缓存是省钱设施，写不进去不该让兜底失败）。"""
+    data = _load_disk()
+    if len(data) > _DISK_MAX:
+        # 按时间淘汰：坐标缓存的价值随时间下降（App 改版后旧条目再也不会命中）
+        oldest = sorted(data.items(), key=lambda kv: str(kv[1].get("ts", "")))[:-_DISK_MAX]
+        for key, _val in oldest:
+            data.pop(key, None)
+    try:
+        path = _disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _current_model() -> str:
+    return os.environ.get("GEN_VL_MODEL", "")
+
+
+def _cache_get(key: str) -> tuple[int, int] | None:
+    """缓存查询：内存 → （disk 模式）落盘。"""
+    mode = _cache_mode()
+    if mode == "off":
+        return None
+    if key in _CACHE:
+        _CACHE.move_to_end(key)
+        return _CACHE[key]
+    if mode == "disk":
+        entry = _load_disk().get(key)
+        # **换模型不混用**：不同模型的偏差不同，坐标不能跨模型复用。
+        if isinstance(entry, dict) and entry.get("model") == _current_model():
+            point = entry.get("point")
+            if isinstance(point, list) and len(point) == 2:
+                hit = (int(point[0]), int(point[1]))
+                _CACHE[key] = hit
+                _CACHE.move_to_end(key)
+                return hit
+    return None
+
+
+def _cache_put(key: str, point: tuple[int, int]) -> None:
+    mode = _cache_mode()
+    if mode == "off":
+        return
+    _CACHE[key] = point
+    _CACHE.move_to_end(key)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.popitem(last=False)
+    if mode == "disk":
+        from datetime import UTC, datetime
+
+        _load_disk()[key] = {
+            "point": [int(point[0]), int(point[1])],
+            "model": _current_model(),
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+        _save_disk()
+
+
+def reset_cache(mode: str | None = None) -> None:
+    """清空内存缓存（测试/切模型用）；`mode` 给定时顺带改缓存模式。"""
+    global _disk
+    _CACHE.clear()
+    if mode is not None:
+        os.environ[CACHE_MODE_ENV] = mode
+    if mode == "off":
+        _disk = None
 _LAST_IMAGE_INFO: dict = {}
 #: 最近一次判定的原因（诊断用）。`locate()` 只返回坐标或 None，调用方分不清
 #: 「模型说没找到」「找到了但置信度不够」「压根没调用」——三者曾被压成同一句
@@ -108,6 +212,32 @@ def prepare_image(screenshot_png: bytes) -> tuple[bytes, dict]:
                                 "scaled": False, "reason": "缩图失败"}
 
 
+#: 按模型名识别 GUI 专用模型族。**只映射输出格式已确认的**：GUI-Owl 之类暂不映射——
+#: 没见过它的真实输出，凭猜写解析器只会造出"看起来支持"的假象。
+_MODEL_FAMILIES: dict[str, tuple[str, ...]] = {
+    "uitars": ("ui-tars", "uitars", "ui_tars"),
+}
+
+
+def model_family(model: str) -> str:
+    """模型族（决定用哪份 prompt 与解析路径）；认不出返回 "generic"。"""
+    name = (model or "").lower()
+    for family, keys in _MODEL_FAMILIES.items():
+        if any(k in name for k in keys):
+            return family
+    return "generic"
+
+
+def prompt_name(model: str | None = None) -> str:
+    """该模型该用的 prompt 名（`vision-locate-<family>`，无专用模板时退回通用）。"""
+    from . import promptstore
+
+    family = model_family(model if model is not None else os.environ.get("GEN_VL_MODEL", ""))
+    if family != "generic" and promptstore.resolve(f"vision-locate-{family}") is not None:
+        return f"vision-locate-{family}"
+    return "vision-locate"
+
+
 def enabled() -> bool:
     from . import promptstore
     from .offline import is_private_endpoint
@@ -160,10 +290,16 @@ def default_client():
     # 客户端 prompt_mode 仍是 server（POST /v1/mat/complete ⇒ 404）。
     local = is_private_endpoint(base_url)
     server = promptstore.is_server() and not local
+    # 按模型族选模板（评审 #12）：GUI 专用模型有自己训练时的输出格式，通用 JSON prompt
+    # 发挥不出它的水平。专用模板不存在时退回通用——**不做静默降级之外的假装支持**。
+    prompt_path = None
+    if not server:
+        prompt_path = (promptstore.resolve(prompt_name())
+                       or Path("prompts/vision-locate.prompt"))
     return GenClient(
         base_url, os.environ.get("GEN_API_KEY", ""),
         os.environ.get("GEN_VL_MODEL", ""),
-        None if server else Path("prompts/vision-locate.prompt"),
+        prompt_path,
         prompt_mode="server" if server else "local",
     )
 
@@ -185,12 +321,14 @@ def locate(client, screenshot_png: bytes, intent: str, target: str,
     送模型的是 `prepare_image()` 处理过的图（`MAT_VL_MAX_EDGE` 设了才缩）；坐标换算
     始终拿**原图** `screenshot_png` 量尺寸——这是缩图不跑偏的唯一前提。
     """
-    if cache_key and cache_key in _CACHE:
-        _CACHE.move_to_end(cache_key)
-        _LAST_RESULT.clear()
-        _LAST_RESULT.update({"ok": True, "found": True, "confidence": None,
-                             "threshold": None, "reason": "同屏缓存命中（未调用模型）"})
-        return _CACHE[cache_key]
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            _LAST_RESULT.clear()
+            _LAST_RESULT.update({"ok": True, "found": True, "confidence": None,
+                                 "threshold": None,
+                                 "reason": "同屏缓存命中（未调用模型）"})
+            return cached
     if before_call is not None:
         before_call()
     from .ai_client import complete_task_text
@@ -207,10 +345,7 @@ def locate(client, screenshot_png: bytes, intent: str, target: str,
         extract_fields(content), screenshot_png, tree_evidence=tree_evidence, target=target
     )
     if parsed and cache_key:
-        _CACHE[cache_key] = parsed
-        _CACHE.move_to_end(cache_key)
-        while len(_CACHE) > _CACHE_MAX:
-            _CACHE.popitem(last=False)
+        _cache_put(cache_key, parsed)
     return parsed
 
 
@@ -237,6 +372,7 @@ def extract_fields(text: str) -> dict:
     fields["desc"] = (desc.group(1) if desc else "").strip()
 
     x_match = re.search(r'"?x"?\s*:\s*\[?\s*([\d.]+)(?:\s*,\s*([\d.]+))?', text)
+    fields["confidence_given"] = confidence is not None
     y_match = re.search(r'"?y"?\s*:\s*\[?\s*([\d.]+)', text)
     fields["x"] = float(x_match.group(1)) if x_match else None
     if y_match:
@@ -246,6 +382,25 @@ def extract_fields(text: str) -> dict:
         fields["y"] = float(x_match.group(2))
     else:
         fields["y"] = None
+
+    # GUI 专用模型（UI-TARS）的 box 输出：<|box_start|>(x1,y1),(x2,y2)<|box_end|>，
+    # 坐标是 0~1000 千分比。取 box 中心换算成**比例**（走 ① 分支，不受屏幕尺寸限制）。
+    if fields["x"] is None:
+        box = re.search(
+            r"<\|box_start\|>\s*\(?\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)?\s*,"
+            r"\s*\(?\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)?\s*<\|box_end\|>",
+            text,
+        )
+        if box:
+            x1, y1, x2, y2 = (float(g) for g in box.groups())
+            fields["box_permille"] = [x1, y1, x2, y2]
+            if x1 == x2 == y1 == y2 == 0:
+                # prompt 约定的"没找到"写法（全零 box）
+                fields["found"] = False
+            else:
+                fields["found"] = True
+                fields["x"] = ((x1 + x2) / 2) / 1000.0
+                fields["y"] = ((y1 + y2) / 2) / 1000.0
     return fields
 
 
@@ -297,9 +452,13 @@ def parse_vision_response(data: dict, screenshot_png: bytes,
                              "threshold": threshold, "reason": "置信度字段非法"})
         return None
     if confidence < threshold:
+        _hint = ""
+        if data.get("box_permille") and not data.get("confidence_given"):
+            _hint = ("（该模型只给了 box、没给 confidence：请在 prompt 里明确要求该字段；"
+                     "按红线拒绝——不盲点）")
         _LAST_RESULT.update({
             "ok": False, "found": True, "confidence": confidence, "threshold": threshold,
-            "reason": f"置信度 {confidence:g} 低于门禁 {threshold:g}（已拒绝，不盲点）",
+            "reason": f"置信度 {confidence:g} 低于门禁 {threshold:g}（已拒绝，不盲点）{_hint}",
         })
         return None
     x, y = data.get("x"), data.get("y")

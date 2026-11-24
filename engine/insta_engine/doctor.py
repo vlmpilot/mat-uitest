@@ -157,7 +157,9 @@ _ENV_KEYS = ("GEN_BASE_URL", "GEN_API_KEY", "GEN_MODEL", "GEN_VL_MODEL",
              "MAT_ROUTE",
              "GEN_DISABLE_THINKING",
              # 控制台地址（2026-11-24 评审 #11）：验证结论里的 report_url 只在它配了时给。
-             "MAT_CONSOLE_URL")
+             "MAT_CONSOLE_URL",
+             # 视觉缓存模式（评审 #12）：memory/disk/off，disk 时 CI 可复用同屏结果。
+             "MAT_VL_CACHE")
 
 _RELOADED: dict = {"mtime": None, "path": ""}  # 上次重载的 .env mtime（节流标记）
 

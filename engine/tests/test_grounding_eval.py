@@ -1,4 +1,4 @@
-"""grounding 评测脚本（`scripts/grounding_eval.py`）的契约测试。
+"""grounding 评测脚本（`insta_engine/grounding.py`，2026-11-24 从 scripts 转正）的契约测试。
 
 它守三件事：
 1. **命中判定是纯几何**——点在框内才算命中，容差是显式参数，不在别处偷偷放宽；
@@ -9,16 +9,11 @@
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 
 def _load_module():
-    path = Path(__file__).resolve().parents[2] / "scripts" / "grounding_eval.py"
-    spec = importlib.util.spec_from_file_location("grounding_eval", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    from insta_engine import grounding
+
+    return grounding
 
 
 BOX = [72, 781, 1008, 949]

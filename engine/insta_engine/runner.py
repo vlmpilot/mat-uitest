@@ -1285,7 +1285,11 @@ class Runner:
             tree_xml = self.drv.dump()
             tree_hash = hashlib.md5(tree_xml.encode()).hexdigest()
             target_text = self._subst(step.target, variables).value
-            cache_key = f"{tree_hash}:{step.id}:{target_text}"
+            # 键里**不放 step.id**（2026-11-24 评审 #12 的缓存项）：同一个屏、同一个目标
+            # 就是同一个控件，跨用例/跨 step 复用是正确且省钱的。带上 step.id 会让缓存
+            # 只在单条用例内有效，CI 每次都重新付费。
+            # 失效靠 `tree_hash`（屏内容指纹）：App 改版/界面变化 ⇒ 键变 ⇒ 自然失效。
+            cache_key = f"{tree_hash}:{target_text}"
             tree_evidence = bool(target_text) and target_text in tree_xml
             client = self.vision_client or vision.default_client()
             position = vision.locate(

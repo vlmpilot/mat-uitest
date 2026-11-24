@@ -450,6 +450,22 @@ def cmd_verify(args) -> int:
     return code
 
 
+def cmd_grounding_eval(args) -> int:
+    """`mat grounding-eval`：视觉定位命中率评测（用自己的数据判断该选哪个模型）。
+
+    实现在 `grounding.py`（2026-11-24 从 scripts 转正，评审 #12）。
+    """
+    from .grounding import main as g_main
+
+    argv = ["--data", args.data, "--repeat", str(args.repeat),
+            "--tolerance-px", str(args.tolerance_px)]
+    if getattr(args, "out", None):
+        argv += ["--out", args.out]
+    if getattr(args, "model", None):
+        argv += ["--model", args.model]
+    return g_main(argv)
+
+
 def cmd_fix_assertions(args) -> int:
     """`mat fix-assertions`：从真机失败现场给断言提候选（默认只看不改）。
 
@@ -3390,6 +3406,16 @@ def main(argv: list[str] | None = None) -> None:
                      help="设备排队等待上限（秒，不含用例执行时长）。超时 ⇒ exit=1 + "
                           "queued=true——这是排队不是用例失败，不要改用例")
     ver.set_defaults(func=cmd_verify)
+
+    gev = sub.add_parser(
+        "grounding-eval",
+        help="视觉定位命中率评测：用自己的截图集判断该选哪个模型（真值来自控件树）")
+    gev.add_argument("--data", required=True, help="shots.json（grounding-capture 的产物）")
+    gev.add_argument("--out", help="结果 JSON 路径")
+    gev.add_argument("--repeat", type=int, default=1, help="每目标重复次数（测抖动）")
+    gev.add_argument("--tolerance-px", type=int, default=0, help="真值框容差（像素）")
+    gev.add_argument("--model", help="覆盖 GEN_VL_MODEL，在同一份数据上换模型对比")
+    gev.set_defaults(func=cmd_grounding_eval)
 
     fixa = sub.add_parser(
         "fix-assertions",
