@@ -62,13 +62,15 @@ BASE_SEATS_PRIVATE = 10
 #: 兼容既有引用（服务端 `config.SEAT_BASE` 下发的是同一个值）。
 BASE_SEATS = BASE_SEATS_PRO
 
-#: 视觉兜底（标准版）月上限默认值：服务端未下发 `vision_base` 时用它
-#: （发起人 2026-10-14 定 300 并要求做成服务端可配置——与成员名额同一套主机配额机制）。
-#: ⚠️ 2026-10-24 评审 P1-5：**服务端的 vision 字段至今未实现**——`/seat/status`
-#: 不下发 `vision_base`，`seat_grants` 表也没有 vision 列。下面这套读取逻辑是为
-#: 该规划预留的**前向兼容接收端**（测试用合成缓存钉住行为）；当前实际效果是
-#: 「同步过 ⇒ 回落默认 100」，`.env` 的 `MAT_VISION_LIMIT` 只在**从未同步**时生效。
-#: 宣称按此口径讲，别对外说"服务端可配"。
+#: 视觉兜底（单人档）月上限的**本地默认值**：服务端未下发 `vision_base` 时用它。
+#:
+#: 2026-11-24 起服务端已在下发（`cloud/matcloud/config.VISION_BASE`，默认 100，
+#: 可用 `MATCLOUD_VISION_BASE` 覆盖；公网 `GET /seat/status` 的返回里能看到）。
+#: 所以下面这套读取逻辑**不再是"等不到数据的前向兼容接收端"**——同步过一次之后，
+#: 上限就由服务端决定；`.env` 的 `MAT_VISION_LIMIT` 只在从未同步时生效。
+#:
+#: 历史（2026-10-24 评审 P1-5 时的状态，供对照）：当时 `/seat/status` 不下发、
+#: `seat_grants` 也没有 vision 列，对外只能说"服务端未配置"。现在这条限制已解除。
 DEFAULT_VISION_LIMIT = 100
 
 

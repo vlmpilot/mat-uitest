@@ -31,8 +31,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .dsl import Action, Locator, LocatorStrategy, Step, TestCase
-from .page_index import BACK_HOP, hop_replayable
+from .dsl import Action, Assertion, AssertionType, Locator, LocatorStrategy, Step, TestCase
+from .page_index import BACK_HOP, hop_replayable, is_dynamic_text
 
 #: 路径枚举的最大跳数（防深图组合爆炸；探索默认深度 3–4，8 已宽裕）
 MAX_HOPS = 8
@@ -209,6 +209,70 @@ def _slug(text: str) -> str:
     return cleaned or "explore-case"
 
 
+#: 到达断言候选的最大长度：再长大概率是内容标题（跨运行会变），当断言就会假红。
+_ARRIVAL_LABEL_MAX = 12
+
+#: **混淆过的资源 id**：`0_resource_name_obfuscated` 这类由构建工具生成，
+#: 换一次加固/混淆策略就变 ⇒ 拿它当断言等于埋一颗定时假红。实测于某内容社区 App。
+_OBFUSCATED_RID = re.compile(r"obfuscated|:id/0_[0-9a-f_]+$", re.IGNORECASE)
+
+#: 结构性描述（容器/区域/布局）：它们是**页面骨架**，不是"到了目标页"的证据，
+#: 而且换版本时最容易改名。实测 `头图or头视频区容器` 就是被 key_elements 收进来的。
+_STRUCTURAL_LABEL = re.compile(r"容器|区域|布局|占位|container|layout|wrapper", re.IGNORECASE)
+
+
+def arrival_assertion(target_page: dict | None,
+                      start_page: dict | None = None) -> tuple[Assertion | None, str]:
+    """给「到达目标页」挑一条**有区分度**的断言（评审 #13：转出的用例此前没有任何断言）。
+
+    ## 判据（与 R24「动作前已成立」同一思路）
+
+    | 过滤 | 为什么 |
+    |---|---|
+    | 起点页也出现 | 恒真，证明不了"到了新页" |
+    | 动态文本（含数字/时间） | 跨运行会变，断言必然假红 |
+    | 超过 12 字 | 大概率是内容标题，同上 |
+    | 空文案 | 定位不了 |
+
+    优先 `res-id`：同一文案能在目标页控件里对到 rid 时用它——**文案会改，id 不改**。
+    选的是**最靠前**的一条（自顶向下），因为它通常是页面标题/首个特征控件，最稳定。
+    """
+    if not target_page:
+        return None, "目标页结构缺失（探索未记录该页）"
+    target_labels = [str(x).strip() for x in
+                     ((target_page.get("structure") or {}).get("key_elements") or [])]
+    start_labels = {str(x).strip() for x in
+                    ((start_page or {}).get("structure") or {}).get("key_elements") or []}
+    if not target_labels:
+        return None, "目标页没有可用的特征文案（key_elements 为空）"
+
+    controls = target_page.get("controls") or []
+    for label in target_labels:
+        if not label or len(label) > _ARRIVAL_LABEL_MAX:
+            continue
+        if label in start_labels:      # 起点页也有 ⇒ 无区分度
+            continue
+        if is_dynamic_text(label):     # 动态/含数字 ⇒ 跨运行会变
+            continue
+        if _STRUCTURAL_LABEL.search(label):  # 容器/区域描述 ⇒ 骨架，不是内容证据
+            continue
+        rid = next((str(c.get("res-id") or "").strip() for c in controls
+                    if str(c.get("res-id") or "").strip()
+                    and label in (str(c.get("text") or ""), str(c.get("desc") or ""))), "")
+        if rid and _OBFUSCATED_RID.search(rid):
+            # 混淆 id 不用，退到文案：它至少是人能看懂、随版本可核对的东西
+            rid = ""
+        if rid:
+            return (Assertion(type=AssertionType.EXISTS,
+                              target=Locator(strategy=LocatorStrategy.RES_ID, value=rid)),
+                    f"到达断言用 res-id({rid})——文案「{label}」能对上控件，id 比文案稳")
+        return (Assertion(type=AssertionType.EXISTS,
+                          target=Locator(strategy=LocatorStrategy.TEXT, value=label)),
+                f"到达断言用文案「{label}」——该页有、起点页没有")
+    return None, ("目标页与起点页没有可区分的稳定文案——"
+                  "该用例**证明不了**「到了目标页」，建议人工补一条断言")
+
+
 def promote_path(explore: dict, index: int, name: str | None = None,
                  case_id: str | None = None,
                  max_hops: int = MAX_HOPS) -> tuple[TestCase, list[str]]:
@@ -262,6 +326,17 @@ def promote_path(explore: dict, index: int, name: str | None = None,
         steps.append(Step(id=f"s{n}", intent=f"点击「{hop.label or hop.rid}」（探索观测路径）",
                           action=Action.TAP, target=target))
         current = hop.to_key
+
+    # 到达断言（评审 #13）：给最后一步补一条能证明「到了目标页」的断言。
+    # 没有断言的用例**可以回放但不可判定**——它会占着"通过"却什么也没证明，
+    # 与本项目"verify 数字要可信"直接冲突。
+    # 最后一步是系统返回时跳过：回到起点页不算"到达"，那条断言没有语义。
+    last_hop = path.hops[-1] if path.hops else None
+    if steps and last_hop is not None and last_hop.label != BACK_HOP:
+        arrival, why = arrival_assertion(pages.get(path.pages[-1]), pages.get(path.pages[0]))
+        if arrival is not None:
+            steps[-1].assertions = [arrival]
+        notes.append(why)
 
     name = _slug(name or f"explore-{_slug(explore.get('explore_id') or 'case')}-{index:02d}")
     case_id = _slug(case_id or name)
