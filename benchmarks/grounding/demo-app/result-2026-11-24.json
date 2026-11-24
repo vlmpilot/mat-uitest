@@ -1,0 +1,665 @@
+{
+ "schema_version": 1,
+ "data": "benchmarks/grounding/demo-app/shots.json",
+ "app": "com.insta.demo",
+ "apk_sha256": "9ffeefbf780c69b497d87896c7e163702a1058efa923099bec9f0c4384401427",
+ "device": {
+  "model": "ELE-AL00",
+  "os_version": "10",
+  "serial": "8KE5T19819001756"
+ },
+ "png_size": [
+  1080,
+  2340
+ ],
+ "model": "qwen3-vl-plus",
+ "repeat": 3,
+ "tolerance_px": 0,
+ "overall": {
+  "n": 27,
+  "hits": 26,
+  "rate": 0.963,
+  "wilson": [
+   0.8172,
+   0.9934
+  ],
+  "not_found": 0,
+  "errors": 0,
+  "by_bucket": {
+   "bottom": {
+    "n": 3,
+    "hits": 3,
+    "rate": 1.0,
+    "wilson": [
+     0.4385,
+     1.0
+    ]
+   },
+   "middle": {
+    "n": 12,
+    "hits": 11,
+    "rate": 0.9167,
+    "wilson": [
+     0.6461,
+     0.9851
+    ]
+   },
+   "top": {
+    "n": 12,
+    "hits": 12,
+    "rate": 1.0,
+    "wilson": [
+     0.7575,
+     1.0
+    ]
+   }
+  },
+  "by_kind": {
+   "button": {
+    "n": 9,
+    "hits": 9,
+    "rate": 1.0,
+    "wilson": [
+     0.7008,
+     1.0
+    ]
+   },
+   "container": {
+    "n": 3,
+    "hits": 3,
+    "rate": 1.0,
+    "wilson": [
+     0.4385,
+     1.0
+    ]
+   },
+   "input": {
+    "n": 9,
+    "hits": 8,
+    "rate": 0.8889,
+    "wilson": [
+     0.565,
+     0.9801
+    ]
+   },
+   "text": {
+    "n": 6,
+    "hits": 6,
+    "rate": 1.0,
+    "wilson": [
+     0.6097,
+     1.0
+    ]
+   }
+  }
+ },
+ "results": [
+  {
+   "shot_id": "login",
+   "target_id": "username",
+   "bucket": "top",
+   "kind": "input",
+   "bbox": [
+    72,
+    577,
+    1008,
+    745
+   ],
+   "point": [
+    539,
+    662
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 3299,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "username",
+   "bucket": "top",
+   "kind": "input",
+   "bbox": [
+    72,
+    577,
+    1008,
+    745
+   ],
+   "point": [
+    539,
+    662
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2712,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "username",
+   "bucket": "top",
+   "kind": "input",
+   "bbox": [
+    72,
+    577,
+    1008,
+    745
+   ],
+   "point": [
+    539,
+    662
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2425,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "password",
+   "bucket": "middle",
+   "kind": "input",
+   "bbox": [
+    72,
+    781,
+    1008,
+    949
+   ],
+   "point": [
+    1,
+    867
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": false,
+   "latency_ms": 2553,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "password",
+   "bucket": "middle",
+   "kind": "input",
+   "bbox": [
+    72,
+    781,
+    1008,
+    949
+   ],
+   "point": [
+    539,
+    866
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 3039,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "password",
+   "bucket": "middle",
+   "kind": "input",
+   "bbox": [
+    72,
+    781,
+    1008,
+    949
+   ],
+   "point": [
+    539,
+    866
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2542,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "login_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    72,
+    1021,
+    1008,
+    1165
+   ],
+   "point": [
+    539,
+    1093
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2527,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "login_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    72,
+    1021,
+    1008,
+    1165
+   ],
+   "point": [
+    539,
+    1093
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2609,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "login_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    72,
+    1021,
+    1008,
+    1165
+   ],
+   "point": [
+    539,
+    1093
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2684,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "announce_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    72,
+    1237,
+    1008,
+    1381
+   ],
+   "point": [
+    538,
+    1310
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 4849,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "announce_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    72,
+    1237,
+    1008,
+    1381
+   ],
+   "point": [
+    538,
+    1310
+   ],
+   "found": true,
+   "confidence": 0.99,
+   "hit": true,
+   "latency_ms": 3476,
+   "error": null
+  },
+  {
+   "shot_id": "login",
+   "target_id": "announce_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    72,
+    1237,
+    1008,
+    1381
+   ],
+   "point": [
+    538,
+    1308
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 3160,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "search_box",
+   "bucket": "top",
+   "kind": "input",
+   "bbox": [
+    48,
+    577,
+    1032,
+    745
+   ],
+   "point": [
+    538,
+    662
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2386,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "search_box",
+   "bucket": "top",
+   "kind": "input",
+   "bbox": [
+    48,
+    577,
+    1032,
+    745
+   ],
+   "point": [
+    538,
+    662
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2625,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "search_box",
+   "bucket": "top",
+   "kind": "input",
+   "bbox": [
+    48,
+    577,
+    1032,
+    745
+   ],
+   "point": [
+    538,
+    662
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2850,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "welcome_text",
+   "bucket": "top",
+   "kind": "text",
+   "bbox": [
+    0,
+    270,
+    1080,
+    471
+   ],
+   "point": [
+    246,
+    370
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2947,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "welcome_text",
+   "bucket": "top",
+   "kind": "text",
+   "bbox": [
+    0,
+    270,
+    1080,
+    471
+   ],
+   "point": [
+    246,
+    370
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2838,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "welcome_text",
+   "bucket": "top",
+   "kind": "text",
+   "bbox": [
+    0,
+    270,
+    1080,
+    471
+   ],
+   "point": [
+    246,
+    370
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2754,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "export_report_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    48,
+    745,
+    364,
+    889
+   ],
+   "point": [
+    201,
+    819
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2567,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "export_report_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    48,
+    745,
+    364,
+    889
+   ],
+   "point": [
+    201,
+    819
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2667,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "export_report_btn",
+   "bucket": "middle",
+   "kind": "button",
+   "bbox": [
+    48,
+    745,
+    364,
+    889
+   ],
+   "point": [
+    201,
+    819
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2847,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "list_view",
+   "bucket": "bottom",
+   "kind": "container",
+   "bbox": [
+    0,
+    913,
+    1080,
+    2214
+   ],
+   "point": [
+    539,
+    1596
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2868,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "list_view",
+   "bucket": "bottom",
+   "kind": "container",
+   "bbox": [
+    0,
+    913,
+    1080,
+    2214
+   ],
+   "point": [
+    539,
+    1572
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 3304,
+   "error": null
+  },
+  {
+   "shot_id": "list",
+   "target_id": "list_view",
+   "bucket": "bottom",
+   "kind": "container",
+   "bbox": [
+    0,
+    913,
+    1080,
+    2214
+   ],
+   "point": [
+    539,
+    1596
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2711,
+   "error": null
+  },
+  {
+   "shot_id": "detail",
+   "target_id": "detail_title",
+   "bucket": "top",
+   "kind": "text",
+   "bbox": [
+    72,
+    342,
+    1008,
+    481
+   ],
+   "point": [
+    380,
+    412
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 2326,
+   "error": null
+  },
+  {
+   "shot_id": "detail",
+   "target_id": "detail_title",
+   "bucket": "top",
+   "kind": "text",
+   "bbox": [
+    72,
+    342,
+    1008,
+    481
+   ],
+   "point": [
+    380,
+    412
+   ],
+   "found": true,
+   "confidence": 0.98,
+   "hit": true,
+   "latency_ms": 3012,
+   "error": null
+  },
+  {
+   "shot_id": "detail",
+   "target_id": "detail_title",
+   "bucket": "top",
+   "kind": "text",
+   "bbox": [
+    72,
+    342,
+    1008,
+    481
+   ],
+   "point": [
+    380,
+    417
+   ],
+   "found": true,
+   "confidence": 0.95,
+   "hit": true,
+   "latency_ms": 2474,
+   "error": null
+  }
+ ]
+}

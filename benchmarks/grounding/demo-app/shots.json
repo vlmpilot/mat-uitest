@@ -1,0 +1,185 @@
+{
+ "schema_version": 1,
+ "app": "com.insta.demo",
+ "apk_sha256": "9ffeefbf780c69b497d87896c7e163702a1058efa923099bec9f0c4384401427",
+ "device": {
+  "model": "ELE-AL00",
+  "os_version": "10",
+  "serial": "8KE5T19819001756"
+ },
+ "png_size": [
+  1080,
+  2340
+ ],
+ "note": "真值框来自 uiautomator 控件树 bounds（非人工标注）；desc 不含位置线索；判定容差在评测侧统一处理。",
+ "shots": [
+  {
+   "shot_id": "login",
+   "page": "MainActivity",
+   "png": "shots/login.png",
+   "tree": "shots/login.xml",
+   "targets": [
+    {
+     "target_id": "username",
+     "intent": "输入账号",
+     "desc": "账号输入框",
+     "bbox": [
+      72,
+      577,
+      1008,
+      745
+     ],
+     "bucket": "top",
+     "kind": "input",
+     "ui_text": "账号",
+     "ui_desc": "",
+     "clickable": true
+    },
+    {
+     "target_id": "password",
+     "intent": "输入密码",
+     "desc": "密码输入框",
+     "bbox": [
+      72,
+      781,
+      1008,
+      949
+     ],
+     "bucket": "middle",
+     "kind": "input",
+     "ui_text": "密码",
+     "ui_desc": "",
+     "clickable": true
+    },
+    {
+     "target_id": "login_btn",
+     "intent": "点击登录",
+     "desc": "「立即登录」按钮",
+     "bbox": [
+      72,
+      1021,
+      1008,
+      1165
+     ],
+     "bucket": "middle",
+     "kind": "button",
+     "ui_text": "登录",
+     "ui_desc": "",
+     "clickable": true
+    },
+    {
+     "target_id": "announce_btn",
+     "intent": "查看公告",
+     "desc": "「查看公告」按钮",
+     "bbox": [
+      72,
+      1237,
+      1008,
+      1381
+     ],
+     "bucket": "middle",
+     "kind": "button",
+     "ui_text": "查看公告",
+     "ui_desc": "",
+     "clickable": true
+    }
+   ]
+  },
+  {
+   "shot_id": "list",
+   "page": "ListActivity",
+   "png": "shots/list.png",
+   "tree": "shots/list.xml",
+   "targets": [
+    {
+     "target_id": "search_box",
+     "intent": "搜索",
+     "desc": "搜索输入框",
+     "bbox": [
+      48,
+      577,
+      1032,
+      745
+     ],
+     "bucket": "top",
+     "kind": "input",
+     "ui_text": "搜索",
+     "ui_desc": "",
+     "clickable": true
+    },
+    {
+     "target_id": "welcome_text",
+     "intent": "确认已登录",
+     "desc": "列表页顶部的欢迎文案",
+     "bbox": [
+      0,
+      270,
+      1080,
+      471
+     ],
+     "bucket": "top",
+     "kind": "text",
+     "ui_text": "欢迎，alice",
+     "ui_desc": "",
+     "clickable": false
+    },
+    {
+     "target_id": "export_report_btn",
+     "intent": "导出报表",
+     "desc": "「导出报表」按钮",
+     "bbox": [
+      48,
+      745,
+      364,
+      889
+     ],
+     "bucket": "middle",
+     "kind": "button",
+     "ui_text": "导出报表",
+     "ui_desc": "",
+     "clickable": true
+    },
+    {
+     "target_id": "list_view",
+     "intent": "查看列表",
+     "desc": "商品列表区域",
+     "bbox": [
+      0,
+      913,
+      1080,
+      2214
+     ],
+     "bucket": "bottom",
+     "kind": "container",
+     "ui_text": "",
+     "ui_desc": "",
+     "clickable": false
+    }
+   ]
+  },
+  {
+   "shot_id": "detail",
+   "page": "DetailActivity",
+   "png": "shots/detail.png",
+   "tree": "shots/detail.xml",
+   "targets": [
+    {
+     "target_id": "detail_title",
+     "intent": "确认详情页",
+     "desc": "详情页标题",
+     "bbox": [
+      72,
+      342,
+      1008,
+      481
+     ],
+     "bucket": "top",
+     "kind": "text",
+     "ui_text": "蓝牙耳机 Pro",
+     "ui_desc": "",
+     "clickable": false
+    }
+   ]
+  }
+ ]
+}
