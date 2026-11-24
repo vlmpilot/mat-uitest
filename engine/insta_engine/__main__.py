@@ -435,6 +435,22 @@ def cmd_verify(args) -> int:
     return code
 
 
+def cmd_fix_assertions(args) -> int:
+    """`mat fix-assertions`：从真机失败现场给断言提候选（默认只看不改）。
+
+    实现与 `scripts/fix_assertions_from_run.py` 是同一份（`assertion_fix`），
+    2026-11-24 转正（评审 #5：修复脚本要成为正式命令并接入 MCP）。
+    """
+    from .assertion_fix import main as fix_main
+
+    argv = list(args.runs)
+    if getattr(args, "out", None):
+        argv += ["--out", args.out]
+    if getattr(args, "json", None):
+        argv += ["--json", args.json]
+    return fix_main(argv)
+
+
 def cmd_run(args) -> int:
     if getattr(args, "fresh_install", False):
         code = _fresh_install_ios(args)
@@ -590,7 +606,9 @@ def cmd_run(args) -> int:
         artifacts = root_art
         run = Runner(driver, artifacts,
                      recorder=_make_recorder_or_warn(args, artifacts),
-                     quality_gate=not getattr(args, "no_quality_gate", False)).run(payload)
+                     quality_gate=not getattr(args, "no_quality_gate", False),
+                     capture_weak_assertions=getattr(
+                         args, "capture_weak_assertions", False)).run(payload)
         report = render_html(run, artifacts)
         if args.junit_xml:
             Path(args.junit_xml).write_text(render_junit_xml(run), encoding="utf-8")
@@ -634,7 +652,9 @@ def cmd_run(args) -> int:
         # 录屏器（`--record`，来自 feature/console-v2）：平台/设备不支持时打印可见警告并降级
         run = Runner(driver, artifacts,
                      recorder=_make_recorder_or_warn(args, artifacts),
-                     quality_gate=not getattr(args, "no_quality_gate", False)).run(case)
+                     quality_gate=not getattr(args, "no_quality_gate", False),
+                     capture_weak_assertions=getattr(
+                         args, "capture_weak_assertions", False)).run(case)
         render_html(run, artifacts)
         href = (f"{stage_slug}/{artifacts.name}/report.html" if stage_slug
                 else f"{artifacts.name}/report.html")
@@ -2547,6 +2567,7 @@ def cmd_eval(args) -> int:
             artifacts_root=Path(args.artifacts) if args.artifacts else None,
             quality_gate=args.quality_gate, platform=args.platform,
             threshold=args.threshold if "--threshold" in sys.argv else None,
+            capture_weak_assertions=getattr(args, "capture_weak_assertions", False),
             on_progress=_progress,
         )
         overall = report["overall"]
@@ -3275,6 +3296,9 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--artifacts",
                      help="产物目录（缺省：单条 artifacts/<用例名>-<UTC时间戳>；"
                           "套件 artifacts/<套件名>/<NN>_<用例名>）")
+    run.add_argument("--capture-weak-assertions", action="store_true",
+                     help="通过但断言证明不了结果（骨架/平凡/无断言）的步骤也留截图——"
+                          "事后复核这类绿灯只能靠截图")
     run.add_argument("--no-quality-gate", action="store_true",
                      help="**关闭跑前质量闸门**（默认开）：跑之前对用例做一次确定性修复"
                           "（补 launch / 剥状态后缀 / 断言缺定位时继承本步目标），"
@@ -3322,6 +3346,14 @@ def main(argv: list[str] | None = None) -> None:
                           "queued=true——这是排队不是用例失败，不要改用例")
     ver.set_defaults(func=cmd_verify)
 
+    fixa = sub.add_parser(
+        "fix-assertions",
+        help="从真机失败现场给断言提候选（默认只看不改；候选需人工确认）")
+    fixa.add_argument("runs", nargs="+", help="run.json 路径（支持 shell 通配）")
+    fixa.add_argument("--out", help="把修复后的用例写到这个目录（默认不写）")
+    fixa.add_argument("--json", help="把建议汇总写成 JSON")
+    fixa.set_defaults(func=cmd_fix_assertions)
+
     heal = sub.add_parser("heal", help="自愈提案查看与回写（回写不覆盖原用例）")
     heal_sub = heal.add_subparsers(dest="heal_cmd", required=True)
     heal_list = heal_sub.add_parser("list", help="查看某次执行的自愈提案")
@@ -3350,6 +3382,8 @@ def main(argv: list[str] | None = None) -> None:
                           help="设备平台（harmony=鸿蒙 NEXT，需 hdc；录屏与靶场指纹暂不支持）")
     eval_run.add_argument("--artifacts", help="产物根目录（默认 artifacts/eval/<套件名>）")
     eval_run.add_argument("--threshold", type=float, help="通过阈值（缺省用套件内 pass_threshold）")
+    eval_run.add_argument("--capture-weak-assertions", action="store_true",
+                          help="同 mat run：弱断言步骤也留截图（假绿复核用）")
     eval_run.add_argument("--quality-gate", action="store_true",
                           help="跑前过质量闸门（⚠️ 数字是改后通过率，对外引用须两档都写）")
     eval_run.add_argument("--save-baseline", action="store_true",

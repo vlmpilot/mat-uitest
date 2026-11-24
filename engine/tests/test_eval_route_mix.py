@@ -125,7 +125,8 @@ def test_run_eval_writes_route_mix_of_this_batch(monkeypatch, tmp_path, routes):
     (tmp_path / "s.suite.json").write_text(json.dumps(suite), encoding="utf-8")
 
     def fake_run_task(task, serial, suite, run_idx, repeat, artifacts_root,
-                      quality_gate, platform="android"):
+                      quality_gate, platform="android",
+                      capture_weak_assertions=False):  # 签名对齐真实现（2026-11-24 新增参数）
         ai_client._note_route(routes[run_idx - 1])
         return _r(task["id"], "passed", 1, 1)
 

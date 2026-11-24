@@ -283,6 +283,31 @@ def build_server(root: Path):
         return obj if code == 200 else {"error": obj}
 
     @mcp.tool()
+    def mat_fix_assertions(run_json: str) -> dict:
+        """从真机失败现场给断言提候选（只提议、不写文件）。
+
+        `run_json` 是某次执行的产物路径（相对工作区或绝对）。返回每条失败步的候选
+        断言与理由；给不出候选时说明缺什么（典型：2026-10-24 之前的跑测没有
+        `screen` 证据，重跑一次即可）。
+        """
+        from .assertion_fix import propose
+
+        p = Path(run_json)
+        if not p.is_absolute():
+            p = root / p
+        if not p.exists():
+            return {"error": f"run.json 不存在：{p}"}
+        rows = propose(p)
+        slim = [{k: v for k, v in r.items() if k != "screen_doc"} for r in rows]
+        return {
+            "run": str(p),
+            "failed_steps": len(rows),
+            "with_candidate": sum(1 for r in rows if r["proposal"]),
+            "proposals": slim[:20],
+            "note": "候选只是素材：断言还得能证明「到了目标页」，人工确认后再改用例",
+        }
+
+    @mcp.tool()
     def mat_job(job_id: str, since: int = 0) -> dict:
         """查询任务进度：状态、摘要、增量步骤事件（since=已见过的最大 seq）。"""
         code, obj = ws.api_job_events({"id": job_id, "since": since})

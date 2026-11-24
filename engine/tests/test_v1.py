@@ -2432,3 +2432,65 @@ def test_controls_context_rotation_keeps_budget_per_page():
     assert len(rid_lines) == 20
     for i in range(5):
         assert f"p{i}_0" in context, f"第 {i} 页一条都没进"
+
+
+# -- 断言层标注与弱断言证据（评审 #5，2026-11-24） ------------------------------
+
+
+def _layer_case() -> TestCase:
+    return TestCase.model_validate({
+        "caseId": "case_layer",
+        "steps": [
+            {"id": "s1", "action": "wait", "params": {"ms": 5}},          # 无断言
+            {"id": "s2", "action": "wait", "params": {"ms": 5},           # exists（弱）
+             "assertions": [{"type": "exists",
+                             "target": {"strategy": "text", "value": "某个东西"}}]},
+        ],
+    })
+
+
+def test_step_records_assertion_layer(tmp_path):
+    """每步都记断言层：run.json 里能直接看出一条绿灯证明了什么（评审 #5）。"""
+    run = Runner(FakeDriver(), tmp_path).run(_layer_case())
+    layers = [s.assertion_layer for s in run.steps]
+    assert layers == ["none", "exists"], f"断言层标注不对：{layers}"
+
+
+def test_weak_passed_captures_screenshot_only_when_opted_in(tmp_path):
+    """弱断言通过的步骤：只有显式开开关才留截图（默认不付 adb 往返）。
+
+    评审 #5 的要求是「断言被判为弱的步骤即使通过也保存证据」——证据是事后复核
+    这类绿灯的唯一依据；但默认开启会让每次跑测多几张 adb 往返，所以做成开关。
+    """
+    off = Runner(FakeDriver(), tmp_path / "off").run(_layer_case())
+    on = Runner(FakeDriver(), tmp_path / "on", capture_weak_assertions=True).run(_layer_case())
+
+    assert off.steps[0].screenshot is None, "默认不该为通过的步骤截图"
+    assert on.steps[0].screenshot is not None, "开了开关，弱断言通过也要留证据"
+    assert (tmp_path / "on" / on.steps[0].screenshot).exists()
+
+
+def test_exists_layer_passed_is_captured_when_opted_in(tmp_path):
+    """`exists` 也是弱断言（只证明屏上有东西），开关打开时要留截图。"""
+    case = TestCase.model_validate({
+        "caseId": "case_exists",
+        "steps": [{"id": "s1", "action": "wait", "params": {"ms": 5},
+                   "assertions": [{"type": "exists",
+                                   "target": {"strategy": "text", "value": "某个东西"}}]}],
+    })
+    run = Runner(FakeDriver(), tmp_path, capture_weak_assertions=True).run(case)
+    assert run.steps[0].assertion_layer == "exists"
+    assert run.steps[0].screenshot is not None
+
+
+def test_strong_assertion_passed_is_not_captured_even_when_opted_in(tmp_path):
+    """强断言通过不需要额外证据（它自己就证明了结果）——开关只针对弱断言。"""
+    case = TestCase.model_validate({
+        "caseId": "case_strong",
+        "steps": [{"id": "s1", "action": "wait", "params": {"ms": 5},
+                   "assertions": [{"type": "not-exists",
+                                   "target": {"strategy": "text", "value": "不该出现的"}}]}],
+    })
+    run = Runner(FakeDriver(), tmp_path, capture_weak_assertions=True).run(case)
+    assert run.steps[0].assertion_layer == "strong"
+    assert run.steps[0].screenshot is None

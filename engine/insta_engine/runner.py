@@ -298,6 +298,10 @@ class StepResult(BaseModel):
     api: dict | None = None
     # UI 步骤恒为 None；证据细节见 api_client.run_api 的契约。
     # 人工校准标记（发起人 2026-10-13）：只影响展示，不改 status / 成功率统计口径
+    #: 本步断言的证据强度（评审 #5，2026-11-24）：strong / exists / skeleton /
+    #: tautology / none。`strong` 才证明业务结果，`skeleton` 只证明到了某页，
+    #: `none` 什么都没证明。纯计算，每步都记——事后能直接看出一条绿灯证明了什么。
+    assertion_layer: str | None = None
     ignored: bool = False                # 失败但人工标记「可忽略」（误报/不影响产品）
     false_positive: bool = False         # 通过但人工标记「误判」（没验证到/侥幸通过）
     calibration_note: str | None = None  # 校准原因（写给后来的人）
@@ -329,8 +333,12 @@ class RunResult(BaseModel):
 class Runner:
     def __init__(self, drv, artifacts_dir: Path, cred_store=None, history_path: Path | None = None,
                  vision_client=None, index_path: Path | None = None, recorder=None,
-                 workspace_root: Path | None = None, quality_gate: bool = False):
+                 workspace_root: Path | None = None, quality_gate: bool = False,
+                 capture_weak_assertions: bool = False):
         self.drv = drv
+        #: 通过但断言证明不了结果（skeleton/tautology/none）时是否也留截图。
+        #: 默认关：每步多一次 adb 往返；评测/复核时打开（`--capture-weak-assertions`）。
+        self.capture_weak_assertions = capture_weak_assertions
         self.artifacts = Path(artifacts_dir)
         self.recorder = recorder # 录屏器：None=不录；接口 start/stop/keep/discard
         (self.artifacts / "screenshots").mkdir(parents=True, exist_ok=True)
@@ -784,6 +792,17 @@ class Runner:
             return []
         return digest_page(xml, package).get("controls") or []
 
+    def _weak_passed(self, result: StepResult) -> bool:
+        """通过、但断言本身证明不了结果（skeleton / tautology / none）。
+
+        这类绿灯事后无法复核"当时到底看到了什么"——截图是唯一可回看的证据。
+        默认关闭（每步多一次 adb 往返），`--capture-weak-assertions` 打开。
+        """
+        # `exists` 也算弱：它只证明"屏上有这个东西"，证明不了"结果对了"。
+        # 只有 `strong`（not-exists / text / selected / 状态）才不需要额外证据。
+        return (self.capture_weak_assertions and result.status == "passed"
+                and result.assertion_layer in ("exists", "skeleton", "tautology", "none"))
+
     def _note_landing(self, result: StepResult, package: str) -> None:
         """判一次「启动落点是不是首页」，写进 `result.landing` / `landing_score`。
 
@@ -1147,6 +1166,15 @@ class Runner:
                             "｜⚠️ 本用例声明的前置条件：" + "、".join(case.preconditions)
                             + "（该步失败可能源于**前置条件未满足**，而不是控件不存在）")
         finally:
+            # 每步都标断言层（纯计算）。评审 #5：只看 status 分不出「证明对了」与
+            # 「什么都没证明」——这条字段让 run.json 自带证据强度。
+            try:
+                from .assertion_strength import _case_labels, classify_step
+
+                result.assertion_layer, _why = classify_step(
+                    step.model_dump(), _case_labels([x.model_dump() for x in case.steps]))
+            except Exception:  # noqa: BLE001 —— 标注失败不影响执行
+                pass
             if result.status == "failed":
                 # logcat 仅失败步骤采集（通过步骤不付 adb 往返成本）。
                 # C2（2026-10-12 评审）：serial 未解析时裸 `adb logcat` 在多设备下直接报错
@@ -1195,8 +1223,9 @@ class Runner:
                     logcat_path.write_text(logcat_text, encoding="utf-8")
                     result.logcat_file = str(logcat_path.relative_to(self.artifacts))
             try:
-                self.drv.screenshot(str(shot))
-                result.screenshot = str(shot.relative_to(self.artifacts))
+                if result.status == "failed" or self._weak_passed(result):
+                    self.drv.screenshot(str(shot))
+                    result.screenshot = str(shot.relative_to(self.artifacts))
             except Exception:
                 pass  # 设备离线时截图失败不掩盖原始错误
             result.duration_ms = int((time.monotonic() - t0) * 1000)

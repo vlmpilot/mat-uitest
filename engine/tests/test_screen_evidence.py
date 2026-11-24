@@ -1,5 +1,5 @@
 """失败现场证据（`Runner._write_screen_evidence`）与"从现场提断言候选"
-（`scripts/fix_assertions_from_run.py`）的回归测试。
+（`insta_engine/assertion_fix.py`，2026-11-24 从 scripts 转正）的回归测试。
 
 ## 为什么要有这份证据（2026-10-24）
 
@@ -24,8 +24,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))
 
-import fix_assertions_from_run as fixer  # noqa: E402
-
+from insta_engine import assertion_fix as fixer  # noqa: E402
 from insta_engine.driver import NullDriver  # noqa: E402
 from insta_engine.dsl import Step, TestCase  # noqa: E402
 from insta_engine.page_index import digest_page  # noqa: E402

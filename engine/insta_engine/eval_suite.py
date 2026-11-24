@@ -169,7 +169,8 @@ def summarize(results: list[dict], repeat: int, threshold: float) -> dict:
 
 def _run_task(task: dict, serial: str | None, suite: dict, run_idx: int, repeat: int,
               artifacts_root: Path, quality_gate: bool,
-              platform: str = "android") -> dict:
+              platform: str = "android",
+              capture_weak_assertions: bool = False) -> dict:
     """跑一次任务（口径同 spike_check._run_task：按任务覆盖清包、设备异常就地接住、
     多遍按 r<N> 分子目录防报告覆盖、记录靶场指纹）。
 
@@ -191,7 +192,8 @@ def _run_task(task: dict, serial: str | None, suite: dict, run_idx: int, repeat:
                                   else f"r{run_idx}/{task['id']}")
     try:
         drv = connect_driver(serial, platform)
-        run = Runner(drv, artifacts, quality_gate=quality_gate).run(case)
+        run = Runner(drv, artifacts, quality_gate=quality_gate,
+                     capture_weak_assertions=capture_weak_assertions).run(case)
     except Exception as exc:  # noqa: BLE001 —— 驱动异常统一按环境问题处置（T60）
         return {"task": task["id"], "run": run_idx, "status": "device-error",
                 "passed": 0, "total": len(case.steps), "blocked": None,
@@ -233,6 +235,7 @@ def _run_task(task: dict, serial: str | None, suite: dict, run_idx: int, repeat:
 
 
 def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,
+             capture_weak_assertions: bool = False,
              artifacts_root: Path | None = None, quality_gate: bool = False,
              threshold: float | None = None, on_progress=None,
              platform: str = "android") -> dict:
@@ -260,7 +263,7 @@ def run_eval(suite_path: Path, *, repeat: int = 1, serial: str | None = None,
             break
         for task in tasks:
             r = _run_task(task, serial, suite, run_idx, repeat, artifacts_root,
-                          quality_gate, platform)
+                          quality_gate, platform, capture_weak_assertions)
             results.append(r)
             if on_progress:
                 on_progress(r)

@@ -43,9 +43,10 @@ def test_build_server_registers_all_tools(tmp_path):
     expected = {"mat_status", "mat_list_cases", "mat_get_case", "mat_generate_case",
                 "mat_run_case", "mat_run_app", "mat_explore", "mat_job",
                 "mat_cancel_job", "mat_page_graph", "mat_controls_context",
-                "mat_verify", "mat_screenshot", "mat_doctor", "mat_cred"}
+                "mat_verify", "mat_screenshot", "mat_doctor", "mat_cred",
+                "mat_fix_assertions"}
     assert expected <= names, f"缺少工具：{sorted(expected - names)}"
-    assert len(names) == 15, f"工具数变了（{len(names)}）——同步首页的「15 个 MCP 工具」"
+    assert len(names) == 16, f"工具数变了（{len(names)}）——同步手册的「16 个工具」"
 
 
 def test_mat_get_case_blocks_traversal(tmp_path):
