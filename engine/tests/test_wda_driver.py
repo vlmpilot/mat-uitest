@@ -339,7 +339,11 @@ def test_driver_factory_routes_and_defaults(monkeypatch):
 
 
 def test_explore_and_index_ios_honestly_blocked(monkeypatch, capsys):
-    """explore/index 的 iOS 适配在 P3——必须诚实拒绝而非跑一半崩。"""
+    """explore/index 在 iOS 上必须诚实拒绝，且理由是**真实原因**而非内部编号。
+
+    2026-11-24 评审 #9：文案改由 `capabilities.REASONS` 提供——旧文案里的「P3」是内部
+    里程碑编号，对用户没有信息量（而且本来就不该出现在对外提示里）。
+    """
     import types
 
     from insta_engine import __main__ as cli
@@ -348,7 +352,9 @@ def test_explore_and_index_ios_honestly_blocked(monkeypatch, capsys):
         capsys.readouterr()
         rc = cmd(types.SimpleNamespace(platform="ios", serial=None))
         assert rc == 1
-        assert "P3" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "iOS" in out and "shell 通道" in out, f"拒绝理由要说清原因：{out}"
+        assert "P3" not in out, "不要再把内部里程碑编号写进用户可见提示"
 
 
 def test_wda_node_get_text_prefers_value():

@@ -47,10 +47,25 @@ mat run cases/example-settings.json   # 跑通第一条用例
 > 真机限制：仅 USB、须保持解锁且自动锁定设为「永不」、免费证书 7 天过期、不支持录屏；
 > `index` / `explore` / `arrival` 在 iOS 上明确拦截。
 >
-> **鸿蒙（beta）**：`mat run --platform harmony`，`index` / `explore` 同样支持（要求 `hdc`
-> 在 PATH，控件树走 `uitest dumpLayout`）。当前边界：不支持 xpath 定位（请用 text / res-id）、
-> 不采集 hilog 日志、不支持录屏与最近任务；`index` / `explore` 里少数 Android 专属路径
-> （自动拉起、崩溃检测）在鸿蒙上可能不可用，探索结果仅作参考。
+> **鸿蒙（beta）**：`mat run --platform harmony`，`index` 可用、`explore` 是 beta
+> （能跑，但未采 hilog ⇒ 崩溃可能漏判）。要求 `hdc` 在 PATH，控件树走 `uitest dumpLayout`。
+
+**平台能力表**（由 `engine/insta_engine/capabilities.py` 生成；改能力只改那一处）：
+
+| 能力 | android | ios | harmony |
+|---|---|---|---|
+| 执行用例（run / verify） | ✅ | ✅ | ✅ |
+| 页面图谱（index） | ✅ | ❌ | ✅ |
+| 探索测试（explore） | ✅ | ❌ | ⚠️ beta |
+| 自动到达目标页（arrival 前置置备） | ✅ | ❌ | ❌ |
+| xpath 定位 | ✅ | ✅ | ❌ |
+| 系统日志证据（崩溃归类为 app-crash） | ✅ | ✅ | ❌ |
+| 读取被测 App 版本号 | ✅ | ✅ | ✅ |
+| 录屏 | ✅ | ❌ | ❌ |
+| 最近任务 | ✅ | ✅ | ❌ |
+| 安装 / 重装 APK | ✅ | ❌ | ❌ |
+
+> ✅ 支持且已验证 ｜ ⚠️ 能跑但已知有缺口 ｜ ❌ 不支持（命令会给出具体原因，不是干巴巴一句"不支持"）
 
 ### 接入 AI
 

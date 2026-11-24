@@ -275,12 +275,22 @@ def build_server(root: Path):
         """启动探索测试：规则驱动自主遍历 App，发现崩溃/白屏并沉淀页面图谱。
 
         返回 job_id，用 mat_job 查进度；报告在 artifacts/explore/<批次>/report.html。
-        仅 Android：iOS 的页面图谱适配在 P3（传 ios 会被诚实拒绝）。
+
+        **平台支持不写死在文档里**（2026-11-24 评审 #9：这里曾写「仅 Android」，实际会把
+        鸿蒙传下去执行）：判据在 `capabilities`——Android 完整；鸿蒙 beta（能跑，但未采
+        系统日志，崩溃可能漏判，返回里带 `note`）；iOS 拒绝（无页面图谱适配）。
         """
+        from . import capabilities
+
+        if not capabilities.supported(platform, "explore"):
+            return {"error": capabilities.reason(platform, "explore")}
         code, obj = ws.api_explore(root, {"package": package, "minutes": minutes,
                                           "steps": steps, "max_depth": max_depth,
                                           "platform": platform})
-        return obj if code == 200 else {"error": obj}
+        if code != 200:
+            return {"error": obj}
+        note = capabilities.beta_note(platform, "explore")
+        return {**obj, "note": note} if note else obj
 
     @mcp.tool()
     def mat_fix_assertions(run_json: str) -> dict:

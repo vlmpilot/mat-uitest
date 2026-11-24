@@ -46,7 +46,6 @@ import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .adb import logcat_clear, logcat_tail
 from .driver import app_version  # 单源（T76）：runner 的 run.json 也要记它
 from .page_index import (
     BACK_HOP,
@@ -815,6 +814,32 @@ def _path_of(key: str, pages: dict) -> str:
     return " → ".join(reversed(chain))
 
 
+def _start_evidence(drv) -> bool:
+    """调驱动的证据接口；没有该契约或失败时返回 False（由调用方写进报告）。
+
+    为什么不用 `hasattr` 判一下就静默跳过：缺证据源是**结论的可信度问题**，必须
+    在报告里留痕（评审 #7 治的就是"看起来在工作、实际什么都拿不到"）。
+    """
+    fn = getattr(drv, "start_evidence", None)
+    if fn is None:
+        return False
+    try:
+        fn()
+        return True
+    except Exception:  # noqa: BLE001 —— 采集失败不影响探索本身
+        return False
+
+
+def _evidence_tail(drv) -> str:
+    fn = getattr(drv, "evidence_tail", None)
+    if fn is None:
+        return ""
+    try:
+        return fn() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def explore(drv, package: str, minutes: float = 2.0, max_steps: int = 30,
             artifacts_dir: Path | None = None, on_event=None,
             max_depth: int = 3, sleep_scale: float = 1.0,
@@ -881,7 +906,12 @@ def explore(drv, package: str, minutes: float = 2.0, max_steps: int = 30,
             pass
     # **每轮清一次 logcat**（T76）：崩溃检测靠 logcat，窗口已开到整段缓冲区
     # ⇒ 上一轮的崩溃会让本轮的无关失败被误判成崩溃。清一次把时效限定在本轮。
-    logcat_clear(getattr(drv, "serial", None))
+    # 走驱动证据接口（2026-11-24 评审 #7）：此前直接调 adb 的 logcat，鸿蒙上
+    # 看起来在工作、实际什么都拿不到。契约方法两端各自实现（Android=logcat，
+    # iOS=syslog，鸿蒙=未采 hilog ⇒ 返回空，由能力表如实告知）。
+    # 返回 False = 该驱动没有这个契约（测试桩/第三方实现）⇒ 报告里如实标"无证据源"，
+    # 不静默：静默正是 #7 要治的病。
+    evidence_ready = _start_evidence(drv)
 
     artifacts_dir = Path(artifacts_dir) if artifacts_dir else Path("artifacts") / "explore" / "tmp"
     (artifacts_dir / "screenshots").mkdir(parents=True, exist_ok=True)
@@ -1183,7 +1213,7 @@ def explore(drv, package: str, minutes: float = 2.0, max_steps: int = 30,
                 "detail": f"连续 {idle_steps} 步没有发现新页面——判定**已探完**，提前结束"
                           f"（不再空转到预算耗尽；页数因此由可达集合决定，而不是设备快慢）"})
             break
-        logcat = logcat_tail(getattr(drv, "serial", None))
+        logcat = _evidence_tail(drv)
         if "FATAL EXCEPTION" in logcat and not seen_crash:
             seen_crash = True
             crash_key = stack[-1] if stack else None
@@ -1823,6 +1853,19 @@ def explore(drv, package: str, minutes: float = 2.0, max_steps: int = 30,
         "pages": list(pages.values()),
         "findings": findings,
     }
+    # 证据能力如实写进报告（2026-11-24 评审 #7）：鸿蒙未采 hilog，崩溃检测**看起来在工作、
+    # 实际什么也拿不到**。不写成字段，读报告的人会以为"没崩溃"是结论。
+    from .capabilities import state as _cap_state
+
+    _ev = _cap_state(getattr(drv, "platform", "android"), "evidence")
+    report["evidence_capability"] = _ev
+    report["evidence_available"] = bool(evidence_ready)
+    if _ev is False:
+        report["evidence_note"] = ("本平台未采集系统日志：崩溃不会被归类为 app-crash，"
+                                   "本轮「没有崩溃」不代表真的没有")
+    elif not evidence_ready:
+        report["evidence_note"] = ("该驱动未实现证据接口（start_evidence/evidence_tail）⇒ "
+                                   "本轮没有系统日志，崩溃不会被归类为 app-crash")
     (artifacts_dir / "explore.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

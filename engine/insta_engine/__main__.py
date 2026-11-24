@@ -896,11 +896,16 @@ def _print_quality(quality: dict) -> None:
 
 
 def cmd_index(args) -> int:
+    from . import capabilities
     from .page_index import load_or_crawl
 
-    if getattr(args, "platform", "android") == "ios":
-        print("iOS 平台暂不支持 index（页面图谱的 WDA 适配在 P3）——当前 iOS 可用：mat run --platform ios")
+    _platform = getattr(args, "platform", "android")
+    if not capabilities.supported(_platform, "index"):
+        print(capabilities.reason(_platform, "index"))
         return 1
+    _note = capabilities.beta_note(_platform, "index")
+    if _note:
+        print(_note)
 
     driver = _connect_driver(args.serial, getattr(args, "platform", "android"))
     if driver is None:
@@ -993,12 +998,17 @@ def _report_quality_issues(case, limit: int = 4) -> None:
 
 
 def cmd_explore(args) -> int:
+    from . import capabilities
     from .explore import explore as _explore
     from .report import render_explore_html
 
-    if getattr(args, "platform", "android") == "ios":
-        print("iOS 平台暂不支持 explore（页面图谱的 WDA 适配在 P3）——当前 iOS 可用：mat run --platform ios")
+    _platform = getattr(args, "platform", "android")
+    if not capabilities.supported(_platform, "explore"):
+        print(capabilities.reason(_platform, "explore"))
         return 1
+    _note = capabilities.beta_note(_platform, "explore")
+    if _note:
+        print(_note)
 
     driver = _connect_driver(args.serial, getattr(args, "platform", "android"))
     if driver is None:
@@ -1183,10 +1193,12 @@ def cmd_coverage(args) -> int:
 
 def cmd_arrival(args) -> int:
     """arrival 试跑验证：图谱路径重放 N 轮，通过 ≥N-1 才算可靠。"""
+    from . import capabilities
     from .arrivals import save_report, verify_arrivals
 
-    if getattr(args, "platform", "android") == "ios":
-        print("iOS 平台暂不支持 arrival（依赖页面图谱，适配在 P3）——当前 iOS 可用：mat run --platform ios")
+    _platform = getattr(args, "platform", "android")
+    if not capabilities.supported(_platform, "arrival"):
+        print(capabilities.reason(_platform, "arrival"))
         return 1
 
     driver = _connect_driver(args.serial, getattr(args, "platform", "android"))
@@ -3206,7 +3218,7 @@ def main(argv: list[str] | None = None) -> None:
     arr.add_argument("--trials", type=int, default=3, help="每条路径试跑轮数（默认 3，最小 2）")
     arr.add_argument("--max-paths", type=int, default=8, help="本次最多验证的路径数（默认 8，浅链优先）")
     arr.add_argument("--serial", help="设备 serial")
-    arr.add_argument("--platform", choices=("android", "ios"), default="android",
+    arr.add_argument("--platform", choices=("android", "ios", "harmony"), default="android",
                      help="设备平台（iOS 适配在 P3）")
     arr.set_defaults(func=cmd_arrival)
 

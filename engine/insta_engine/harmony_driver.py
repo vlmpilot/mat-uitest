@@ -285,6 +285,29 @@ class HarmonyDriver(BaseDriver):
         hdc.shell(f"aa start -b {package} -a {ability}", serial=self.serial, timeout=30)
         self._wait_foreground(package)
 
+    def app_info(self, package: str) -> dict:
+        """App 元数据（版本号等）——从 `bm dump -n` 解析。
+
+        HarmonyOS 没有 `dumpsys`/`app_info`：唯一来源是 bundle manager 的 dump
+        （评审 #7 的第三处：此前鸿蒙的版本号**永远为空**，对外数字答不出"测的是哪个
+        构建"）。取不到就返回空 dict——`driver.app_version` 会如实给空串，不猜。
+
+        ⚠️ 本机无鸿蒙设备，**字段名按 HarmonyOS 的 bundle info 结构写**，尚未真机验证；
+        首次上真机时用 `bm dump -n <bundle> | grep -i version` 核对一次。
+        """
+        try:
+            info = hdc.shell(f"bm dump -n {package}", serial=self.serial, timeout=20)
+        except RuntimeError:
+            return {}
+        out: dict = {}
+        m = re.search(r'"versionName"\s*:\s*"([^"]+)"', info)
+        if m:
+            out["versionName"] = m.group(1)
+        m2 = re.search(r'"versionCode"\s*:\s*(\d+)', info)
+        if m2:
+            out["versionCode"] = int(m2.group(1))
+        return out
+
     def _bm_abilities(self, package: str) -> list[str]:
         """`bm dump -n` 元数据里的 ability 名单(name 含 Ability 的条目,原样形态)。"""
         try:

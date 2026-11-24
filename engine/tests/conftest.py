@@ -49,14 +49,10 @@ def _unit_tests_never_call_real_adb(monkeypatch):
     危险之处在于**红灯取决于外部设备状态**：插着手机跑就红、拔了手机跑就绿。这种红灯会被
     读成「引擎回归了」，而真相是测试在偷偷依赖一个外部进程的延迟。所以在这里统一打桩。
 
-    要测崩溃检测的用例，请自己覆写期望文本，例如：
-        monkeypatch.setattr(explore, "logcat_tail", lambda *a, **k: "FATAL EXCEPTION: main")
+    explore 自 2026-11-24 起改走**驱动证据接口**（`drv.start_evidence()` /
+    `drv.evidence_tail()`，评审 #7：鸿蒙没有 shell 通道，直连 adb 在那里静默失效）。
+    所以要测崩溃检测，覆写的是**驱动的** `evidence_tail`，不是模块级函数。
     """
-    import insta_engine.explore as explore
-
-    monkeypatch.setattr(explore, "logcat_tail", lambda *a, **k: "")
-    # T76：每轮开始时清一次 logcat（限定崩溃证据的时效）——单测里同样不能打真机。
-    monkeypatch.setattr(explore, "logcat_clear", lambda *a, **k: True)
     # runner._capture_logcat 走 adb.logcat_tail（函数级 import，调用时解析→可桩）；
     # page_index.crawl 的等待走 page_index._pause——都不打真机 adb / 不真睡
     monkeypatch.setattr("insta_engine.adb.logcat_tail", lambda *a, **k: "")

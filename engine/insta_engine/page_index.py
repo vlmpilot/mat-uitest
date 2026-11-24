@@ -1252,8 +1252,10 @@ def _ensure_foreground(drv, package: str, timeout_s: float = 12.0) -> bool:
     in_package 过滤后 0 控件 ⇒ 响亮报错。产品口径（2026-10-10 起）：重建索引
     「执行期间会占用设备并打开被测 App」，拉起是引擎职责而非用户手动前置。
 
-    用 monkey 拉起（无需知道 launcher activity，通用性最好）；轮询 foreground_app
-    等就绪；期间清掉残留/新弹的系统权限弹窗。已在前台走快速路径（零 sleep）。
+    拉起走驱动的 `app_start`（跨平台契约），**不再直接发 monkey**：鸿蒙驱动没有 shell
+    通道，旧写法在那里抛异常被吞掉，于是 index 报「图谱为空」，提示却指向锁屏/崩溃/包名
+    写错——和真实原因无关（2026-11-24 评审 #7）。轮询 `foreground_app` 等就绪；期间清掉
+    残留/新弹的系统权限弹窗。已在前台走快速路径（零 sleep）。
     超时/失败返回 False 不阻断——照旧爬取，让上游的空图谱响亮报错兜底。
     """
     try:
@@ -1263,7 +1265,9 @@ def _ensure_foreground(drv, package: str, timeout_s: float = 12.0) -> bool:
         pass
     _dismiss_permission_dialog(drv)  # 残留弹窗会挡住拉起：App 在弹窗下等授权结果
     try:
-        drv.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+        # 驱动契约方法：Android=u2 app_start（内部 monkey/am），鸿蒙=aa start。
+        # 直接调 `drv.shell("monkey ...")` 在鸿蒙上必抛（没有 shell 通道）。
+        drv.app_start(package)
     except Exception:
         return False
     deadline = time.monotonic() + timeout_s

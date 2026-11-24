@@ -31,9 +31,10 @@ def api_index(root: Path, body: dict) -> tuple[int, dict]:
     pages_limit = min(max(int(body.get("pages", 15)), 5), 60)
     serial = body.get("serial") or None
     platform = str(body.get("platform") or "android")
-    if platform == "ios":
-        return 400, {"error": "iOS 平台暂不支持 index（页面图谱的 WDA 适配在 P3）"
-                              "——当前 iOS 可用：mat run --platform ios"}
+    from .. import capabilities
+
+    if not capabilities.supported(platform, "index"):
+        return 400, {"error": capabilities.reason(platform, "index")}
 
     def job(emit, cancel):
         from ..page_index import load_or_crawl

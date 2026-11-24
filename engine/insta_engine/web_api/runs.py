@@ -322,11 +322,11 @@ def api_explore(root: Path, body: dict) -> tuple[int, dict]:
         return 400, {"error": f"包名不合法: {exc}"}
     serial = body.get("serial") or None
     platform = str(body.get("platform") or "android")
-    if platform == "ios":
-        # 与 CLI 同口径的**诚实拦截**：explore 依赖页面图谱，其 WDA 适配在 P3。
-        # 不拦会在未验证路径上产出"看着正常、实际无效"的图谱（评审 I4 /）。
-        return 400, {"error": "iOS 平台暂不支持 explore（页面图谱的 WDA 适配在 P3）"
-                              "——当前 iOS 可用：mat run --platform ios"}
+    from .. import capabilities
+
+    if not capabilities.supported(platform, "explore"):
+        # 与 CLI 同一份判据（`capabilities`）：改一处生效六处，不再各写一句文案。
+        return 400, {"error": capabilities.reason(platform, "explore")}
 
     def job(emit, cancel):
         import uuid as _uuid

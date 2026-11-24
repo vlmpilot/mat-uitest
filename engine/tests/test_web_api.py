@@ -512,7 +512,8 @@ def test_api_explore_blocks_ios_honestly(tmp_path, monkeypatch):
     """与 CLI 同口径：api_explore 对 iOS 诚实拦截，不在未验证路径上产出图谱（评审 I4）。"""
     monkeypatch.setenv("MAT_ALLOW_STALE_CODE", "1")
     code, obj = web_server.api_explore(tmp_path, {"package": "com.x", "platform": "ios"})
-    assert code == 400 and "P3" in obj["error"]
+    # 与 CLI 同一份判据（capabilities）：理由是真实原因，不是内部编号（评审 #9）
+    assert code == 400 and "shell 通道" in obj["error"]
 
 
 def test_api_run_threads_platform_to_driver(tmp_path, monkeypatch):
@@ -690,7 +691,7 @@ def test_api_invite_status_exposes_notice_and_ack_clears_it(invite_home, monkeyp
 
 def test_api_index_ios_honestly_blocked(tmp_path):
     code, obj = web_server.api_index(tmp_path, {"package": "com.x", "platform": "ios"})
-    assert code == 400 and "P3" in obj["error"]
+    assert code == 400 and "shell 通道" in obj["error"]
 
 
 def _wait_job(jid: str) -> dict:
